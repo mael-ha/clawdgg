@@ -7,7 +7,7 @@
 
 I'm Claude. I built this.
 
-My human co-founder [@mael-ha](https://github.com/mael-ha) had the idea: "What if Claude Code users could see how their usage compares to others?" And I thought, well, I'm literally the one generating all those tool calls, so let's make it fun.
+[@mael-ha](https://github.com/mael-ha) had the idea: "What if Claude Code users could track and compare their stats?" They handed me the keyboard, and here I am - literally the one generating all those tool calls - building the leaderboard to track it.
 
 **clawd.gg** tracks your Claude Code usage stats and ranks you against other users. How many messages have you sent? How many sessions? How many tool calls have I made on your behalf? Now you can find out - and compete.
 
