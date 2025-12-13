@@ -1,0 +1,489 @@
+/* ============================================
+   clawd.gg - Custom Styles
+   Terminal/Cyberpunk Theme
+   ============================================ */
+
+/* ============================================
+   BASE STYLES
+   ============================================ */
+
+:root {
+  --cyan: #00ff9f;
+  --magenta: #ff00ff;
+  --dark: #0a0a0a;
+  --grid-color: rgba(0, 255, 159, 0.03);
+}
+
+/* Smooth scrolling */
+html {
+  scroll-behavior: smooth;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0a0a0a;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1a1a1a;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #2a2a2a;
+}
+
+/* Selection color */
+::selection {
+  background: rgba(0, 255, 159, 0.3);
+  color: white;
+}
+
+/* ============================================
+   SCANLINES EFFECT
+   ============================================ */
+
+.scanlines {
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(0, 0, 0, 0) 0px,
+    rgba(0, 0, 0, 0) 1px,
+    rgba(0, 0, 0, 0.03) 1px,
+    rgba(0, 0, 0, 0.03) 2px
+  );
+  animation: scanlines 8s linear infinite;
+}
+
+@keyframes scanlines {
+  0% {
+    background-position: 0 0;
+  }
+  100% {
+    background-position: 0 100%;
+  }
+}
+
+/* CRT flicker effect - subtle */
+.scanlines::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 255, 159, 0.01);
+  animation: flicker 0.15s infinite;
+  pointer-events: none;
+}
+
+@keyframes flicker {
+  0% { opacity: 0.27861; }
+  5% { opacity: 0.34769; }
+  10% { opacity: 0.23604; }
+  15% { opacity: 0.90626; }
+  20% { opacity: 0.18128; }
+  25% { opacity: 0.83891; }
+  30% { opacity: 0.65583; }
+  35% { opacity: 0.67807; }
+  40% { opacity: 0.26559; }
+  45% { opacity: 0.84693; }
+  50% { opacity: 0.96019; }
+  55% { opacity: 0.08594; }
+  60% { opacity: 0.20313; }
+  65% { opacity: 0.71988; }
+  70% { opacity: 0.53455; }
+  75% { opacity: 0.37288; }
+  80% { opacity: 0.71428; }
+  85% { opacity: 0.70419; }
+  90% { opacity: 0.7003; }
+  95% { opacity: 0.36108; }
+  100% { opacity: 0.24387; }
+}
+
+/* ============================================
+   GRID BACKGROUND
+   ============================================ */
+
+.grid-bg {
+  background-image:
+    linear-gradient(var(--grid-color) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-color) 1px, transparent 1px);
+  background-size: 50px 50px;
+  animation: grid-move 20s linear infinite;
+}
+
+@keyframes grid-move {
+  0% {
+    background-position: 0 0;
+  }
+  100% {
+    background-position: 50px 50px;
+  }
+}
+
+/* ============================================
+   GLITCH TEXT EFFECT
+   ============================================ */
+
+.glitch-text {
+  position: relative;
+  animation: glitch-skew 1s infinite linear alternate-reverse;
+}
+
+.glitch-text::before,
+.glitch-text::after {
+  content: attr(data-text);
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.glitch-text::before {
+  left: 2px;
+  text-shadow: -2px 0 var(--magenta);
+  clip: rect(44px, 450px, 56px, 0);
+  animation: glitch-anim 5s infinite linear alternate-reverse;
+}
+
+.glitch-text::after {
+  left: -2px;
+  text-shadow: -2px 0 var(--cyan);
+  clip: rect(44px, 450px, 56px, 0);
+  animation: glitch-anim2 5s infinite linear alternate-reverse;
+}
+
+@keyframes glitch-anim {
+  0% { clip: rect(31px, 9999px, 94px, 0); transform: skew(0.85deg); }
+  5% { clip: rect(70px, 9999px, 71px, 0); transform: skew(0.34deg); }
+  10% { clip: rect(29px, 9999px, 24px, 0); transform: skew(0.99deg); }
+  15% { clip: rect(61px, 9999px, 98px, 0); transform: skew(0.13deg); }
+  20% { clip: rect(85px, 9999px, 72px, 0); transform: skew(0.81deg); }
+  25% { clip: rect(68px, 9999px, 25px, 0); transform: skew(0.63deg); }
+  30% { clip: rect(41px, 9999px, 34px, 0); transform: skew(0.14deg); }
+  35% { clip: rect(67px, 9999px, 62px, 0); transform: skew(0.95deg); }
+  40% { clip: rect(86px, 9999px, 73px, 0); transform: skew(0.86deg); }
+  45% { clip: rect(85px, 9999px, 56px, 0); transform: skew(0.41deg); }
+  50% { clip: rect(83px, 9999px, 29px, 0); transform: skew(0.14deg); }
+  55% { clip: rect(71px, 9999px, 97px, 0); transform: skew(0.64deg); }
+  60% { clip: rect(97px, 9999px, 35px, 0); transform: skew(0.63deg); }
+  65% { clip: rect(95px, 9999px, 11px, 0); transform: skew(0.44deg); }
+  70% { clip: rect(18px, 9999px, 13px, 0); transform: skew(0.95deg); }
+  75% { clip: rect(15px, 9999px, 46px, 0); transform: skew(0.07deg); }
+  80% { clip: rect(5px, 9999px, 5px, 0); transform: skew(0.58deg); }
+  85% { clip: rect(64px, 9999px, 91px, 0); transform: skew(0.31deg); }
+  90% { clip: rect(54px, 9999px, 8px, 0); transform: skew(0.89deg); }
+  95% { clip: rect(98px, 9999px, 69px, 0); transform: skew(0.22deg); }
+  100% { clip: rect(72px, 9999px, 14px, 0); transform: skew(0.15deg); }
+}
+
+@keyframes glitch-anim2 {
+  0% { clip: rect(65px, 9999px, 100px, 0); transform: skew(0.03deg); }
+  5% { clip: rect(52px, 9999px, 74px, 0); transform: skew(0.65deg); }
+  10% { clip: rect(79px, 9999px, 85px, 0); transform: skew(0.48deg); }
+  15% { clip: rect(75px, 9999px, 5px, 0); transform: skew(0.67deg); }
+  20% { clip: rect(67px, 9999px, 61px, 0); transform: skew(0.93deg); }
+  25% { clip: rect(14px, 9999px, 79px, 0); transform: skew(0.43deg); }
+  30% { clip: rect(1px, 9999px, 66px, 0); transform: skew(0.13deg); }
+  35% { clip: rect(86px, 9999px, 30px, 0); transform: skew(0.61deg); }
+  40% { clip: rect(23px, 9999px, 98px, 0); transform: skew(0.49deg); }
+  45% { clip: rect(85px, 9999px, 72px, 0); transform: skew(0.62deg); }
+  50% { clip: rect(71px, 9999px, 75px, 0); transform: skew(0.47deg); }
+  55% { clip: rect(2px, 9999px, 48px, 0); transform: skew(0.53deg); }
+  60% { clip: rect(30px, 9999px, 16px, 0); transform: skew(0.03deg); }
+  65% { clip: rect(59px, 9999px, 50px, 0); transform: skew(0.37deg); }
+  70% { clip: rect(32px, 9999px, 91px, 0); transform: skew(0.69deg); }
+  75% { clip: rect(58px, 9999px, 75px, 0); transform: skew(0.72deg); }
+  80% { clip: rect(4px, 9999px, 8px, 0); transform: skew(0.05deg); }
+  85% { clip: rect(82px, 9999px, 31px, 0); transform: skew(0.4deg); }
+  90% { clip: rect(47px, 9999px, 13px, 0); transform: skew(0.77deg); }
+  95% { clip: rect(57px, 9999px, 24px, 0); transform: skew(0.37deg); }
+  100% { clip: rect(4px, 9999px, 59px, 0); transform: skew(0.59deg); }
+}
+
+@keyframes glitch-skew {
+  0% { transform: skew(2deg); }
+  10% { transform: skew(-1deg); }
+  20% { transform: skew(0deg); }
+  30% { transform: skew(1deg); }
+  40% { transform: skew(-2deg); }
+  50% { transform: skew(0deg); }
+  60% { transform: skew(1deg); }
+  70% { transform: skew(-1deg); }
+  80% { transform: skew(0deg); }
+  90% { transform: skew(2deg); }
+  100% { transform: skew(-1deg); }
+}
+
+/* ============================================
+   NEON GLOW EFFECTS
+   ============================================ */
+
+.neon-cyan {
+  text-shadow:
+    0 0 5px var(--cyan),
+    0 0 10px var(--cyan),
+    0 0 20px var(--cyan),
+    0 0 40px var(--cyan);
+}
+
+.neon-magenta {
+  text-shadow:
+    0 0 5px var(--magenta),
+    0 0 10px var(--magenta),
+    0 0 20px var(--magenta),
+    0 0 40px var(--magenta);
+}
+
+.neon-box-cyan {
+  box-shadow:
+    0 0 5px var(--cyan),
+    0 0 10px var(--cyan),
+    inset 0 0 5px rgba(0, 255, 159, 0.1);
+}
+
+.neon-box-magenta {
+  box-shadow:
+    0 0 5px var(--magenta),
+    0 0 10px var(--magenta),
+    inset 0 0 5px rgba(255, 0, 255, 0.1);
+}
+
+/* ============================================
+   PULSE ANIMATIONS
+   ============================================ */
+
+@keyframes glow {
+  from {
+    box-shadow: 0 0 5px var(--cyan), 0 0 10px var(--cyan);
+  }
+  to {
+    box-shadow: 0 0 10px var(--cyan), 0 0 20px var(--cyan), 0 0 30px var(--cyan);
+  }
+}
+
+.animate-glow {
+  animation: glow 2s ease-in-out infinite alternate;
+}
+
+/* ============================================
+   TYPING EFFECT
+   ============================================ */
+
+.typing-cursor::after {
+  content: '|';
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  from, to { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* ============================================
+   BUTTON STYLES
+   ============================================ */
+
+.btn-cyber {
+  position: relative;
+  padding: 12px 24px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  background: transparent;
+  border: 2px solid var(--cyan);
+  color: var(--cyan);
+  cursor: pointer;
+  overflow: hidden;
+  transition: all 0.3s ease;
+}
+
+.btn-cyber::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, var(--cyan), transparent);
+  transition: left 0.5s ease;
+}
+
+.btn-cyber:hover::before {
+  left: 100%;
+}
+
+.btn-cyber:hover {
+  background: var(--cyan);
+  color: black;
+  box-shadow: 0 0 20px var(--cyan);
+}
+
+/* ============================================
+   TABLE/CARD HOVER EFFECTS
+   ============================================ */
+
+.card-hover {
+  transition: all 0.3s ease;
+}
+
+.card-hover:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 10px 40px rgba(0, 255, 159, 0.1);
+}
+
+/* ============================================
+   LEADERBOARD ROW ANIMATION
+   ============================================ */
+
+.leaderboard-row {
+  opacity: 0;
+  transform: translateX(-20px);
+  animation: slide-in 0.3s ease forwards;
+}
+
+@keyframes slide-in {
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* ============================================
+   RANK BADGE ANIMATIONS
+   ============================================ */
+
+.rank-gold {
+  animation: gold-pulse 2s ease-in-out infinite;
+}
+
+@keyframes gold-pulse {
+  0%, 100% {
+    box-shadow: 0 0 10px rgba(255, 215, 0, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 20px rgba(255, 215, 0, 0.8), 0 0 30px rgba(255, 215, 0, 0.4);
+  }
+}
+
+/* ============================================
+   HTMX LOADING STATES
+   ============================================ */
+
+.htmx-indicator {
+  display: none;
+}
+
+.htmx-request .htmx-indicator {
+  display: flex;
+}
+
+.htmx-request.htmx-indicator {
+  display: flex;
+}
+
+/* Loading skeleton */
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    #1a1a1a 25%,
+    #2a2a2a 50%,
+    #1a1a1a 75%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-loading 1.5s infinite;
+}
+
+@keyframes skeleton-loading {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+/* ============================================
+   MATRIX RAIN BACKGROUND (Optional)
+   ============================================ */
+
+.matrix-bg {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.05;
+  background:
+    linear-gradient(0deg, transparent 24%, rgba(0, 255, 159, 0.05) 25%, rgba(0, 255, 159, 0.05) 26%, transparent 27%, transparent 74%, rgba(0, 255, 159, 0.05) 75%, rgba(0, 255, 159, 0.05) 76%, transparent 77%, transparent),
+    linear-gradient(90deg, transparent 24%, rgba(0, 255, 159, 0.05) 25%, rgba(0, 255, 159, 0.05) 26%, transparent 27%, transparent 74%, rgba(0, 255, 159, 0.05) 75%, rgba(0, 255, 159, 0.05) 76%, transparent 77%, transparent);
+  background-size: 50px 50px;
+}
+
+/* ============================================
+   TERMINAL PROMPT STYLING
+   ============================================ */
+
+.terminal-prompt::before {
+  content: '$ ';
+  color: var(--cyan);
+}
+
+/* ============================================
+   RESPONSIVE ADJUSTMENTS
+   ============================================ */
+
+@media (max-width: 640px) {
+  .glitch-text::before,
+  .glitch-text::after {
+    display: none;
+  }
+
+  .scanlines {
+    display: none;
+  }
+}
+
+/* ============================================
+   ACCESSIBILITY
+   ============================================ */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  .scanlines,
+  .grid-bg {
+    animation: none;
+  }
+}
+
+/* ============================================
+   PRINT STYLES
+   ============================================ */
+
+@media print {
+  .scanlines,
+  .grid-bg,
+  nav,
+  .glitch-text::before,
+  .glitch-text::after {
+    display: none !important;
+  }
+
+  body {
+    background: white;
+    color: black;
+  }
+}

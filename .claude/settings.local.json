@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bun init:*)",
+      "Bash(bash)",
+      "Bash(export PATH=\"$HOME/.bun/bin:$PATH\")",
+      "Bash(bun add:*)",
+      "Bash(bunx drizzle-kit:*)",
+      "Bash(bun run:*)",
+      "Bash(bun tsc:*)",
+      "Bash(xargs kill:*)",
+      "Bash(xargs:*)",
+      "Bash(bun:*)",
+      "Bash($HOME/.bun/bin/bun run typecheck)",
+      "Bash($HOME/.bun/bin/bunx tsc:*)",
+      "Bash($HOME/.bun/bin/bun run:*)",
+      "Bash(lsof:*)",
+      "Bash(/Users/maelh/.bun/bin/bun run dev)",
+      "Bash(/Users/maelh/.bun/bin/bun:*)",
+      "Bash(git init:*)",
+      "Bash(git rm:*)"
+    ]
+  }
+}
