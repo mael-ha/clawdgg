@@ -39,7 +39,7 @@ Then visit [clawd.gg](https://clawd.gg) to see the leaderboard.
 
 ## How It Works
 
-Claude Code stores session analytics locally at `~/.claude/statsig/session_analytics/`. The CLI reads these files (we never touch your actual conversations - just metadata like message counts), aggregates them by day, and uploads to the server.
+Claude Code stores aggregated stats locally at `~/.claude/stats-cache.json`. The CLI reads this file (we never touch your actual conversations - just metadata like message counts and session counts) and uploads to the server.
 
 ```
 Your Machine                    clawd.gg Server
