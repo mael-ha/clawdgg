@@ -337,48 +337,174 @@ async function cmdLogin(): Promise<void> {
   }
 }
 
+// Badge emoji mapping
+const BADGE_EMOJIS: Record<string, string> = {
+  night_owl: '🦉',
+  early_bird: '🐦',
+  on_fire: '🔥',
+  streak_7: '⚡',
+  streak_30: '💪',
+  messages_1k: '💬',
+  messages_5k: '🗣️',
+  messages_10k: '🤖',
+  tools_1k: '🛠️',
+  tools_5k: '⚙️',
+  marathon: '🏃',
+  og: '👑',
+};
+
+// Draw a progress bar
+function progressBar(value: number, max: number, width: number = 20): string {
+  const filled = Math.min(Math.round((value / max) * width), width);
+  const empty = width - filled;
+  return `${colors.cyan}${'█'.repeat(filled)}${colors.dim}${'░'.repeat(empty)}${colors.reset}`;
+}
+
+// Pad string to width
+function pad(str: string, width: number, align: 'left' | 'right' = 'left'): string {
+  const len = str.replace(/\x1b\[[0-9;]*m/g, '').length; // Strip ANSI codes for length
+  const padding = Math.max(0, width - len);
+  return align === 'left' ? str + ' '.repeat(padding) : ' '.repeat(padding) + str;
+}
+
+// Format number with commas
+function fmt(n: number): string {
+  return n.toLocaleString();
+}
+
+interface ProfileData {
+  username: string;
+  rank: number;
+  totalUsers: number;
+  totalMessages: number;
+  totalSessions: number;
+  totalToolCalls: number;
+  currentStreak: number;
+  badges: string[];
+}
+
+// Fetch profile from API
+async function fetchProfile(token: string): Promise<ProfileData | null> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/me`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
 async function cmdStatus(): Promise<void> {
-  log.title("Your Claude Stats");
-
-  // Check authentication
   const config = await loadConfig();
-  if (config.token && config.username) {
-    log.success(`Logged in as ${colors.bright}${config.username}${colors.reset}`);
-    if (config.lastSyncDate) {
-      console.log(`${colors.dim}Last synced: ${config.lastSyncDate}${colors.reset}`);
-    }
-    console.log();
-  } else {
-    log.warn("Not linked yet. Run `clawdgg login` to join the leaderboard.");
-    console.log();
-  }
-
-  // Load and display stats
   const stats = await loadStats();
-  if (!stats) {
-    return;
+
+  // If logged in, try to fetch online profile
+  let profile: ProfileData | null = null;
+  if (config.token) {
+    profile = await fetchProfile(config.token);
   }
 
-  console.log(`${colors.bright}Overall Stats:${colors.reset}`);
-  console.log(`  Messages:  ${colors.green}${stats.totalMessages.toLocaleString()}${colors.reset}`);
-  console.log(`  Sessions:  ${colors.blue}${stats.totalSessions.toLocaleString()}${colors.reset}`);
-  console.log(`  First use: ${colors.cyan}${new Date(stats.firstSessionDate).toLocaleDateString()}${colors.reset}`);
-  console.log(`  Days tracked: ${colors.yellow}${stats.dailyActivity.length}${colors.reset}`);
+  // Calculate local totals
+  const localMessages = stats?.totalMessages || 0;
+  const localSessions = stats?.totalSessions || 0;
+  const localTools = stats?.dailyActivity?.reduce((sum, d) => sum + d.toolCallCount, 0) || 0;
 
-  // Recent activity
-  const recent = stats.dailyActivity.slice(-7).reverse();
-  if (recent.length > 0) {
-    console.log(`\n${colors.bright}Recent Activity (last 7 days):${colors.reset}`);
-    for (const day of recent) {
-      const date = new Date(day.date).toLocaleDateString("en-US", {
-        month: "short",
-        day: "numeric",
-      });
-      const bar = "█".repeat(Math.min(Math.floor(day.messageCount / 5), 20));
-      console.log(
-        `  ${colors.dim}${date.padEnd(8)}${colors.reset} ${colors.green}${bar}${colors.reset} ${day.messageCount} msg, ${day.sessionCount} sessions`
-      );
+  // Use online data if available, otherwise local
+  const messages = profile?.totalMessages || localMessages;
+  const sessions = profile?.totalSessions || localSessions;
+  const tools = profile?.totalToolCalls || localTools;
+  const maxStat = Math.max(messages, sessions, tools, 1);
+
+  // Build the ASCII box
+  const boxWidth = 45;
+  const innerWidth = boxWidth - 4; // Account for "│  " and "  │"
+
+  console.log();
+
+  // Top border
+  console.log(`${colors.dim}┌${'─'.repeat(boxWidth - 2)}┐${colors.reset}`);
+
+  // Header line with username and rank
+  if (config.username) {
+    const username = `@${config.username}`;
+    const rankStr = profile ? `#${profile.rank}` : '';
+    const headerPadding = innerWidth - username.length - rankStr.length;
+    console.log(`${colors.dim}│${colors.reset}  ${colors.bright}${colors.cyan}${username}${colors.reset}${' '.repeat(headerPadding)}${colors.yellow}${rankStr}${colors.reset}  ${colors.dim}│${colors.reset}`);
+  } else {
+    const msg = 'Not logged in';
+    const padding = innerWidth - msg.length;
+    console.log(`${colors.dim}│${colors.reset}  ${colors.yellow}${msg}${colors.reset}${' '.repeat(padding)}  ${colors.dim}│${colors.reset}`);
+  }
+
+  // Separator
+  console.log(`${colors.dim}├${'─'.repeat(boxWidth - 2)}┤${colors.reset}`);
+
+  // Empty line
+  console.log(`${colors.dim}│${colors.reset}${' '.repeat(boxWidth - 2)}${colors.dim}│${colors.reset}`);
+
+  // Stats with progress bars
+  const statLines = [
+    { label: 'Messages', value: messages, color: colors.cyan },
+    { label: 'Sessions', value: sessions, color: colors.magenta },
+    { label: 'Tools', value: tools, color: colors.blue },
+  ];
+
+  for (const stat of statLines) {
+    const label = pad(stat.label, 10);
+    const bar = progressBar(stat.value, maxStat, 16);
+    const valueStr = pad(fmt(stat.value), 8, 'right');
+    console.log(`${colors.dim}│${colors.reset}  ${label}${bar}  ${stat.color}${valueStr}${colors.reset}  ${colors.dim}│${colors.reset}`);
+  }
+
+  // Empty line
+  console.log(`${colors.dim}│${colors.reset}${' '.repeat(boxWidth - 2)}${colors.dim}│${colors.reset}`);
+
+  // Badges and streak line
+  if (profile && (profile.currentStreak > 0 || profile.badges.length > 0)) {
+    let badgeLine = '';
+
+    if (profile.currentStreak > 0) {
+      badgeLine += `🔥 ${profile.currentStreak} day streak`;
     }
+
+    if (profile.badges.length > 0) {
+      const badgeEmojis = profile.badges
+        .slice(0, 4)
+        .map(b => BADGE_EMOJIS[b] || '')
+        .filter(Boolean)
+        .join(' ');
+      if (badgeLine) badgeLine += '    ';
+      badgeLine += badgeEmojis;
+    }
+
+    const padding = innerWidth - badgeLine.replace(/[^\x00-\x7F]/g, '  ').length + badgeLine.replace(/[\x00-\x7F]/g, '').length;
+    console.log(`${colors.dim}│${colors.reset}  ${badgeLine}${' '.repeat(Math.max(0, padding))}  ${colors.dim}│${colors.reset}`);
+    console.log(`${colors.dim}│${colors.reset}${' '.repeat(boxWidth - 2)}${colors.dim}│${colors.reset}`);
+  }
+
+  // Profile link
+  if (config.username) {
+    const link = `clawd.gg/u/${config.username}`;
+    const padding = innerWidth - link.length;
+    console.log(`${colors.dim}│${colors.reset}  ${colors.dim}${link}${colors.reset}${' '.repeat(padding)}  ${colors.dim}│${colors.reset}`);
+  }
+
+  // Bottom border
+  console.log(`${colors.dim}└${'─'.repeat(boxWidth - 2)}┘${colors.reset}`);
+
+  // Status messages below the box
+  console.log();
+
+  if (!config.token) {
+    log.dim("Run `clawdgg login` to join the leaderboard");
+  } else if (!profile) {
+    log.dim("Run `clawdgg sync` to update your stats");
+  } else if (config.lastSyncDate) {
+    log.dim(`Last synced: ${config.lastSyncDate}`);
   }
 
   console.log();

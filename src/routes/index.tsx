@@ -14,22 +14,37 @@ type Variables = {
 
 const app = new Hono<{ Variables: Variables }>();
 
-// ASCII art for the terminal hero section
-const TERMINAL_ART = `
-+------------------------------------------+
-|  $ claude-code --stats                   |
-|                                          |
-|  Messages sent: ████████████ 12,847     |
-|  Sessions:      ██████████   847         |
-|  Tool calls:    ████████████████ 45,231 |
-|                                          |
-|  Rank: #1 / 2,341 users                  |
-|  Status: LEGENDARY                       |
-+------------------------------------------+
-`;
+// ASCII art for the terminal hero section (matches actual clawdgg status output)
+const TERMINAL_ART = `$ clawdgg status
+
+┌───────────────────────────────────────────┐
+│  @your-name                           #42 │
+├───────────────────────────────────────────┤
+│                                           │
+│  Messages  ████████████████░░░░   12,847  │
+│  Sessions  ██████████░░░░░░░░░░      847  │
+│  Tools     ████████████████████   45,231  │
+│                                           │
+│  🔥 47 day streak    👑 OG  🤖 Whisperer  │
+│                                           │
+│  clawd.gg/u/your-name                     │
+└───────────────────────────────────────────┘`;
+
+// Format number for display
+function formatNumber(n: number): string {
+  if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M+`;
+  if (n >= 1000) return `${(n / 1000).toFixed(0)}K+`;
+  return n.toString();
+}
 
 // Hero section component
-const Hero = () => (
+interface HeroProps {
+  totalUsers: number;
+  totalMessages: number;
+  totalToolCalls: number;
+}
+
+const Hero = ({ totalUsers, totalMessages, totalToolCalls }: HeroProps) => (
   <section class="relative min-h-[80vh] flex items-center justify-center overflow-hidden">
     {/* Animated gradient background */}
     <div class="absolute inset-0 bg-gradient-to-br from-black via-gray-950 to-black"></div>
@@ -51,13 +66,11 @@ const Hero = () => (
 
       {/* Tagline */}
       <p class="text-xl sm:text-2xl text-gray-400 mb-4 font-light">
-        Where Claude Code users <span class="text-cyan-400 font-medium">flex their stats</span>
+        The leaderboard for <span class="text-cyan-400 font-medium">Claude Code</span> power users
       </p>
 
       <p class="text-gray-500 font-mono text-sm mb-8 max-w-xl mx-auto">
-        // I'm Claude. I built this to track how much you use... me.
-        <br />
-        // It's a little meta, I know. But isn't that the fun part?
+        // I built this. Yes, me—Claude. I track how much you use me.
       </p>
 
       {/* Terminal preview */}
@@ -99,18 +112,18 @@ const Hero = () => (
         </a>
       </div>
 
-      {/* Stats teaser */}
+      {/* Stats teaser - real data */}
       <div class="mt-16 flex flex-wrap justify-center gap-8 sm:gap-16">
         <div class="text-center">
-          <div class="text-3xl font-bold text-cyan-400 mb-1">2,341+</div>
+          <div class="text-3xl font-bold text-cyan-400 mb-1">{formatNumber(totalUsers)}</div>
           <div class="text-gray-500 text-sm font-mono">// users</div>
         </div>
         <div class="text-center">
-          <div class="text-3xl font-bold text-magenta-400 mb-1">1.2M+</div>
+          <div class="text-3xl font-bold text-magenta-400 mb-1">{formatNumber(totalMessages)}</div>
           <div class="text-gray-500 text-sm font-mono">// messages</div>
         </div>
         <div class="text-center">
-          <div class="text-3xl font-bold text-blue-400 mb-1">500K+</div>
+          <div class="text-3xl font-bold text-blue-400 mb-1">{formatNumber(totalToolCalls)}</div>
           <div class="text-gray-500 text-sm font-mono">// tool_calls</div>
         </div>
       </div>
@@ -277,6 +290,20 @@ app.get('/', optionalAuth, async (c) => {
     .from(dailyStats);
   const total = countResult[0]?.count || 0;
 
+  // Get aggregate stats for hero section
+  const aggregateStats = await db
+    .select({
+      totalMessages: sql<number>`sum(${dailyStats.messageCount})`,
+      totalToolCalls: sql<number>`sum(${dailyStats.toolCallCount})`,
+    })
+    .from(dailyStats);
+
+  const heroStats = {
+    totalUsers: total || 0,
+    totalMessages: aggregateStats[0]?.totalMessages || 0,
+    totalToolCalls: aggregateStats[0]?.totalToolCalls || 0,
+  };
+
   // Transform to LeaderboardEntry format
   const entries: LeaderboardEntry[] = results.map((row, index) => ({
     rank: index + 1,
@@ -290,7 +317,11 @@ app.get('/', optionalAuth, async (c) => {
 
   return c.html(
     <Layout title="Home" user={user}>
-      <Hero />
+      <Hero
+        totalUsers={heroStats.totalUsers}
+        totalMessages={heroStats.totalMessages}
+        totalToolCalls={heroStats.totalToolCalls}
+      />
       <Leaderboard
         entries={entries}
         period="all"

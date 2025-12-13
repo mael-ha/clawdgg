@@ -436,4 +436,85 @@ function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (char) => map[char] || char);
 }
 
+// GET /api/me - Get current user's profile data (requires auth)
+api.get('/me', requireAuth, async (c) => {
+  try {
+    const user = c.get('user');
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    // Get user data
+    const userData = await db
+      .select()
+      .from(users)
+      .where(eq(users.id, user.id))
+      .limit(1);
+
+    if (userData.length === 0) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
+    const profile = userData[0];
+
+    // Get aggregate stats
+    const statsResult = await db
+      .select({
+        totalMessages: sql<number>`sum(${dailyStats.messageCount})`,
+        totalSessions: sql<number>`sum(${dailyStats.sessionCount})`,
+        totalToolCalls: sql<number>`sum(${dailyStats.toolCallCount})`,
+      })
+      .from(dailyStats)
+      .where(eq(dailyStats.userId, user.id));
+
+    // Get user rank (by total messages)
+    const rankResult = await db
+      .select({
+        rank: sql<number>`(
+          SELECT COUNT(*) + 1 FROM (
+            SELECT user_id, SUM(message_count) as total
+            FROM daily_stats
+            GROUP BY user_id
+            HAVING total > (
+              SELECT COALESCE(SUM(message_count), 0)
+              FROM daily_stats
+              WHERE user_id = ${user.id}
+            )
+          )
+        )`,
+      })
+      .from(users)
+      .where(eq(users.id, user.id));
+
+    // Get total users count
+    const totalUsersResult = await db
+      .select({ count: sql<number>`count(distinct user_id)` })
+      .from(dailyStats);
+
+    // Parse badges
+    let badges: string[] = [];
+    try {
+      badges = profile.badges ? JSON.parse(profile.badges) : [];
+    } catch {
+      badges = [];
+    }
+
+    return c.json({
+      username: profile.githubUsername,
+      avatarUrl: profile.avatarUrl,
+      rank: rankResult[0]?.rank || 1,
+      totalUsers: totalUsersResult[0]?.count || 1,
+      totalMessages: statsResult[0]?.totalMessages || 0,
+      totalSessions: statsResult[0]?.totalSessions || 0,
+      totalToolCalls: statsResult[0]?.totalToolCalls || 0,
+      currentStreak: profile.currentStreak || 0,
+      longestStreak: profile.longestStreak || 0,
+      badges,
+    });
+  } catch (error) {
+    console.error('Error fetching user profile:', error);
+    return c.json({ error: 'Failed to fetch profile' }, 500);
+  }
+});
+
 export default api;
