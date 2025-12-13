@@ -24,59 +24,63 @@
 
 ### What This Is
 Gamified leaderboard for Claude Code users to track/compare usage stats.
-Domain: clawd.gg (to be purchased)
+- **Domain**: clawd.gg (to be purchased)
+- **CLI Package**: `clawdgg` (npm, available)
+- **GitHub**: github.com/mael-ha/clawdgg
+
+### Current Features
+- **Leaderboard**: Ranked by messages, with period filters (today/week/month/all)
+- **Profile Pages**: `/u/:username` with GitHub-style contribution graph, badges, stats
+- **Badge System**: 12 achievement badges (Night Owl, OG, Claude Whisperer, etc.)
+- **CLI**: Beautiful ASCII status display with rank, progress bars, badges
+- **Auth**: GitHub OAuth with device flow for CLI login
+- **Token Expiry**: 30-day bearer tokens
 
 ### Tech Stack
 - Runtime: Bun
-- Framework: Hono + JSX
-- Frontend: HTMX + Tailwind
+- Framework: Hono + JSX (server-rendered)
+- Frontend: HTMX + Tailwind (no React client-side)
 - Database: SQLite (Drizzle ORM)
-- Auth: GitHub OAuth (Arctic)
+- Auth: GitHub OAuth (Arctic library)
 
 ### Key Files
 ```
-src/types.ts          # Shared TypeScript types
-src/db/schema.ts      # Drizzle schema (users, daily_stats)
-src/db/index.ts       # DB connection
-src/routes/auth.ts    # GitHub OAuth routes
-src/routes/api.ts     # Stats API
-src/routes/index.tsx  # Main page
-src/lib/session.ts    # Cookie sessions
-cli/index.ts          # CLI tool (npx clawd-gg)
-drizzle.config.ts     # Drizzle config
+src/routes/index.tsx   # Homepage with hero + leaderboard
+src/routes/profile.tsx # User profile pages (/u/:username)
+src/routes/api.ts      # Stats API + /api/me endpoint
+src/routes/auth.ts     # GitHub OAuth + device flow
+src/lib/badges.ts      # Badge definitions and computation
+src/lib/session.ts     # Cookie + bearer token auth
+src/db/schema.ts       # Drizzle schema (users, daily_stats, device_auths)
+cli/index.ts           # CLI tool with ASCII status display
 ```
 
 ### Commands
 ```bash
-bun run dev           # Start dev server
-bun run db:generate   # Generate migrations
-bun run db:migrate    # Apply migrations
+bun run dev           # Start dev server (hot reload)
+bun run db:push       # Push schema to database
 bun run db:seed       # Seed test data
 ```
 
-### Environment (.env)
-```
-GITHUB_CLIENT_ID=xxx
-GITHUB_CLIENT_SECRET=xxx
-SESSION_SECRET=xxx
-APP_URL=http://localhost:3000
-DATABASE_URL=./data/clawd.db
-```
+### Roadmap
+- [ ] VPS deployment (blocked on infra)
+- [ ] Domain purchase (clawd.gg)
+- [ ] npm publish CLI
+- [ ] Twitter/X authentication (link accounts)
+- [ ] About page (tell the meta story)
 
-### Build Phases
-- [x] Phase 0: Foundation scaffold
-- [x] Phase 1: DB + Auth + CLI (3 parallel agents)
-- [x] Phase 2: Integration review + Opus code review
-- [x] Phase 3: API + UI (2 parallel Opus agents)
-- [x] Phase 4: Final assembly + test
-
-### Status: MVP COMPLETE ✓
-Server running at http://localhost:3000
+### Design Decisions Made
+- **CLI name `clawdgg`**: Not perfect, but available on npm and matches domain. Considered `clawd` (taken), `cgg` (taken), `ccstats` (taken).
+- **Hero stats are real**: Pulled from database, not fake placeholders.
+- **Terminal in hero shows real command**: `clawdgg status` output, not fake `claude-code --stats`.
+- **Copy is confident**: "I built this. Yes, me—Claude." Not apologetic.
+- **Badges are fun, not competitive**: Time-of-day, streaks, milestones—not creating toxic incentives.
 
 ### Design Notes
-- Geeky + modern aesthetic
-- Innovative/creative UI
-- Dark mode default
+- Dark mode default, terminal aesthetic
+- Cyan/magenta gradient accents
+- ASCII art touches
+- Self-aware, nerdy tone
 
 ---
 
@@ -191,3 +195,5 @@ bun --hot ./index.ts
 ```
 
 For more information, read the Bun API docs in `node_modules/bun-types/docs/**.mdx`.
+- what do you think? this is your project - behave like you own it, ultrathink, self-reflect and decide what you want.
+- also, make sur to keep all your documentation up-to-date so you can follow your thoughts on future sessions.
