@@ -2,35 +2,13 @@ import { Hono } from 'hono';
 import { GitHub, generateState } from 'arctic';
 import { setCookie, getCookie, deleteCookie } from 'hono/cookie';
 import { db } from '../db';
-import { users } from '../db/schema';
-import { eq } from 'drizzle-orm';
+import { users, deviceAuths } from '../db/schema';
+import { eq, lt, gt, and } from 'drizzle-orm';
 import { createSession, destroySession, createBearerToken } from '../lib/session';
 import type { SessionUser } from '../types';
-import { createHmac, randomBytes } from 'crypto';
+import { randomBytes } from 'crypto';
 
 const auth = new Hono();
-
-// In-memory store for device flow (in production, use Redis or DB)
-interface DeviceAuth {
-  deviceCode: string;
-  userCode: string;
-  expiresAt: number;
-  userId?: string;
-  username?: string;
-  token?: string;
-}
-
-const deviceAuthStore = new Map<string, DeviceAuth>();
-
-// Clean up expired device codes every minute
-setInterval(() => {
-  const now = Date.now();
-  for (const [code, auth] of deviceAuthStore.entries()) {
-    if (auth.expiresAt < now) {
-      deviceAuthStore.delete(code);
-    }
-  }
-}, 60 * 1000);
 
 // Generate a short user-friendly code (e.g., "ABCD-1234")
 function generateUserCode(): string {
@@ -124,7 +102,7 @@ auth.get('/callback', async (c) => {
       .where(eq(users.githubId, githubUser.id.toString()))
       .limit(1);
 
-    let user;
+    let user: typeof users.$inferSelect;
     if (existingUsers.length > 0) {
       // Update existing user
       const updated = await db
@@ -135,9 +113,9 @@ auth.get('/callback', async (c) => {
           avatarUrl: githubUser.avatar_url,
           updatedAt: new Date(),
         })
-        .where(eq(users.id, existingUsers[0].id))
+        .where(eq(users.id, existingUsers[0]!.id))
         .returning();
-      user = updated[0];
+      user = updated[0]!;
     } else {
       // Create new user
       const inserted = await db
@@ -150,23 +128,34 @@ auth.get('/callback', async (c) => {
           avatarUrl: githubUser.avatar_url,
         })
         .returning();
-      user = inserted[0];
+      user = inserted[0]!;
     }
 
     // Check if this is a device flow auth
     const deviceCode = getCookie(c, 'device_code');
 
     if (deviceCode) {
-      // Complete device flow
-      const deviceAuth = deviceAuthStore.get(deviceCode);
+      // Complete device flow - find and update in DB
+      const results = await db
+        .select()
+        .from(deviceAuths)
+        .where(eq(deviceAuths.deviceCode, deviceCode))
+        .limit(1);
+
+      const deviceAuth = results[0];
       if (deviceAuth) {
         // Create a bearer token for CLI
         const token = await createBearerToken(user.id);
 
-        // Store the completed auth
-        deviceAuth.userId = user.id;
-        deviceAuth.username = user.githubUsername;
-        deviceAuth.token = token;
+        // Store the completed auth in DB
+        await db
+          .update(deviceAuths)
+          .set({
+            userId: user.id,
+            username: user.githubUsername,
+            token: token,
+          })
+          .where(eq(deviceAuths.deviceCode, deviceCode));
 
         // Clear device code cookie
         deleteCookie(c, 'device_code', { path: '/' });
@@ -215,8 +204,11 @@ auth.post('/device', async (c) => {
   const userCode = generateUserCode();
   const expiresIn = 900; // 15 minutes
 
-  // Store the pending auth
-  deviceAuthStore.set(deviceCode, {
+  // Clean up expired codes first (opportunistic cleanup)
+  await db.delete(deviceAuths).where(lt(deviceAuths.expiresAt, Date.now()));
+
+  // Store the pending auth in SQLite
+  await db.insert(deviceAuths).values({
     deviceCode,
     userCode,
     expiresAt: Date.now() + expiresIn * 1000,
@@ -305,14 +297,19 @@ auth.post('/device/verify', async (c) => {
   const body = await c.req.parseBody();
   const userCode = (body.code as string || '').toUpperCase().trim();
 
-  // Find matching device auth
-  let matchingAuth: DeviceAuth | undefined;
-  for (const auth of deviceAuthStore.values()) {
-    if (auth.userCode === userCode && auth.expiresAt > Date.now()) {
-      matchingAuth = auth;
-      break;
-    }
-  }
+  // Find matching device auth in DB (not expired)
+  const results = await db
+    .select()
+    .from(deviceAuths)
+    .where(
+      and(
+        eq(deviceAuths.userCode, userCode),
+        gt(deviceAuths.expiresAt, Date.now())
+      )
+    )
+    .limit(1);
+
+  const matchingAuth = results[0];
 
   if (!matchingAuth) {
     return c.redirect(`/auth/device/verify?error=Invalid or expired code&code=${userCode}`);
@@ -340,21 +337,29 @@ auth.post('/device/poll', async (c) => {
     return c.json({ error: 'Device code required' }, 400);
   }
 
-  const auth = deviceAuthStore.get(deviceCode);
+  // Find device auth in DB
+  const results = await db
+    .select()
+    .from(deviceAuths)
+    .where(eq(deviceAuths.deviceCode, deviceCode))
+    .limit(1);
+
+  const auth = results[0];
 
   if (!auth) {
     return c.json({ error: 'Invalid device code' }, 404);
   }
 
   if (auth.expiresAt < Date.now()) {
-    deviceAuthStore.delete(deviceCode);
+    // Clean up expired code
+    await db.delete(deviceAuths).where(eq(deviceAuths.deviceCode, deviceCode));
     return c.json({ error: 'Device code expired' }, 410);
   }
 
   // Check if user has completed auth
   if (auth.token && auth.userId && auth.username) {
     // Clean up and return the token
-    deviceAuthStore.delete(deviceCode);
+    await db.delete(deviceAuths).where(eq(deviceAuths.deviceCode, deviceCode));
     return c.json({
       token: auth.token,
       userId: auth.userId,

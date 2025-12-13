@@ -29,10 +29,16 @@
 - [ ] Publish CLI to npm (`npm install -g clawdgg`)
 
 ### Medium Priority
-- [ ] User profile pages (`/u/:username`)
+- [ ] User profile pages (`/u/:username`) with creative design
+  - [ ] GitHub-style contribution graph for coding activity
+  - [ ] Personal stats visualization (not just tables)
 - [ ] Stats history charts
 - [ ] Model usage breakdown (Sonnet vs Opus)
 - [ ] Weekly/monthly summaries
+- [ ] Twitter/X authentication
+  - [ ] Link X account alongside GitHub
+  - [ ] Show X avatar/handle on leaderboard
+  - [ ] Optional: tweet achievements
 - [ ] Use system keychain for CLI token storage (keytar) ⏱️ 1-2hrs | 🟡 Medium impact
 
 ### Nice to Have

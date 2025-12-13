@@ -92,19 +92,31 @@ export function destroySession(c: Context): void {
   });
 }
 
+// Token expiry: 30 days
+const TOKEN_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
 // Create a bearer token for API access (CLI auth)
 export async function createBearerToken(userId: string): Promise<string> {
-  const payload = JSON.stringify({ userId, iat: Date.now() });
+  const iat = Date.now();
+  const exp = iat + TOKEN_MAX_AGE_MS;
+  const payload = JSON.stringify({ userId, iat, exp });
   return sign(payload);
 }
 
 // Verify a bearer token and return the user ID
+// Returns null if token is invalid, expired, or malformed
 export async function verifyBearerToken(token: string): Promise<string | null> {
   const payload = await unsign(token);
   if (!payload) return null;
 
   try {
-    const { userId } = JSON.parse(payload);
+    const { userId, exp } = JSON.parse(payload);
+
+    // Check expiry (if exp exists - old tokens without exp still work temporarily)
+    if (exp && Date.now() > exp) {
+      return null; // Token expired
+    }
+
     return userId || null;
   } catch {
     return null;

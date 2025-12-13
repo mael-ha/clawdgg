@@ -95,14 +95,14 @@ async function saveConfig(config: Config): Promise<void> {
 async function loadStats(): Promise<Stats | null> {
   try {
     if (!existsSync(STATS_FILE)) {
-      log.error(`Stats file not found at ${STATS_FILE}`);
-      log.dim("Make sure you have Claude Code installed and have used it.");
+      log.error("No Claude Code stats found");
+      log.dim("Make sure Claude Code is installed and you've used it at least once.");
       return null;
     }
     const data = await readFile(STATS_FILE, "utf-8");
     return JSON.parse(data);
   } catch (error) {
-    log.error(`Failed to read stats file: ${error}`);
+    log.error(`Couldn't read stats: ${error}`);
     return null;
   }
 }
@@ -150,11 +150,11 @@ async function initiateLogin(): Promise<void> {
     const { deviceCode, userCode, verificationUrl, expiresIn } =
       await response.json();
 
-    log.title("Login to clawd.gg");
-    console.log(`${colors.bright}User Code:${colors.reset} ${colors.yellow}${userCode}${colors.reset}`);
-    console.log(`\nOpening browser to: ${colors.cyan}${verificationUrl}${colors.reset}\n`);
+    log.title("Let's link your GitHub");
+    console.log(`${colors.bright}Your code:${colors.reset} ${colors.yellow}${userCode}${colors.reset}`);
+    console.log(`\n${colors.dim}Opening${colors.reset} ${colors.cyan}${verificationUrl}${colors.reset}\n`);
 
-    log.dim("If the browser doesn't open automatically, visit the URL above.");
+    log.dim("Browser didn't open? Copy the URL above.");
 
     // Open browser
     const openCmd =
@@ -171,7 +171,7 @@ async function initiateLogin(): Promise<void> {
     }
 
     // Poll for completion
-    log.info("Waiting for authentication...");
+    log.info("Waiting for you to authorize...");
     const pollInterval = 5000; // 5 seconds
     const startTime = Date.now();
 
@@ -189,7 +189,7 @@ async function initiateLogin(): Promise<void> {
       if (pollResponse.ok) {
         const { token, userId, username } = await pollResponse.json();
         await saveConfig({ token, userId, username });
-        log.success(`Successfully logged in as ${colors.bright}${username}${colors.reset}`);
+        log.success(`Linked! Welcome, ${colors.bright}${username}${colors.reset}`);
         return;
       }
 
@@ -213,12 +213,12 @@ function getTodayDate(): string {
 
 // Commands
 async function cmdSync(forceFullSync: boolean = false): Promise<void> {
-  log.title("Syncing Claude Code stats to clawd.gg");
+  log.title("Uploading your stats");
 
   // Check authentication
   const config = await loadConfig();
   if (!config.token) {
-    log.error("Not authenticated. Please run `clawdgg login` first.");
+    log.error("We haven't met yet. Run `clawdgg login` first.");
     process.exit(1);
   }
 
@@ -261,9 +261,9 @@ async function cmdSync(forceFullSync: boolean = false): Promise<void> {
   // Check if there's anything to sync
   if (activityToSync.length === 0) {
     if (lastSync) {
-      log.success("Already up to date! No new completed days to sync.");
+      log.success("Already synced! No new days to upload.");
     } else {
-      log.warn("No completed days to sync yet. Keep using Claude Code!");
+      log.warn("No completed days yet. Keep coding with me!");
     }
     console.log();
     return;
@@ -286,16 +286,16 @@ async function cmdSync(forceFullSync: boolean = false): Promise<void> {
       await saveConfig({ ...config, lastSyncDate: latestDate });
     }
 
-    log.success(`Stats synced successfully! (${result.daysSubmitted || activityToSync.length} days)`);
+    log.success(`Done! Your Claude addiction is now public record. (${result.daysSubmitted || activityToSync.length} days)`);
 
     if (config.username) {
-      console.log(`\n${colors.cyan}View your profile:${colors.reset} ${API_BASE_URL}/${config.username}\n`);
+      console.log(`\n${colors.cyan}See your rank:${colors.reset} ${API_BASE_URL}\n`);
     }
   } catch (error) {
     log.error(`${error}`);
 
     if (error instanceof Error && error.message.includes("401")) {
-      log.warn("Your session may have expired. Try running `clawdgg login` again.");
+      log.warn("Your token expired. Time flies when you're prompting. Run `clawdgg login` again.");
     }
 
     process.exit(1);
@@ -312,19 +312,18 @@ async function cmdLogin(): Promise<void> {
 }
 
 async function cmdStatus(): Promise<void> {
-  log.title("Claude Code Stats Summary");
+  log.title("Your Claude Stats");
 
   // Check authentication
   const config = await loadConfig();
   if (config.token && config.username) {
     log.success(`Logged in as ${colors.bright}${config.username}${colors.reset}`);
-    console.log(`${colors.dim}Profile: ${API_BASE_URL}/${config.username}${colors.reset}`);
     if (config.lastSyncDate) {
       console.log(`${colors.dim}Last synced: ${config.lastSyncDate}${colors.reset}`);
     }
     console.log();
   } else {
-    log.warn("Not logged in. Run `clawdgg login` to authenticate.");
+    log.warn("Not linked yet. Run `clawdgg login` to join the leaderboard.");
     console.log();
   }
 
@@ -361,28 +360,24 @@ async function cmdStatus(): Promise<void> {
 
 function showHelp(): void {
   console.log(`
-${colors.bright}${colors.cyan}clawd.gg CLI${colors.reset} - Sync your Claude Code stats
-
-${colors.bright}Usage:${colors.reset}
-  clawdgg <command> [options]
+${colors.bright}${colors.cyan}clawd.gg${colors.reset} ${colors.dim}— I built this to track how much you use me${colors.reset}
 
 ${colors.bright}Commands:${colors.reset}
-  ${colors.green}login${colors.reset}    Login with GitHub to authenticate
-  ${colors.green}sync${colors.reset}     Sync new stats to clawd.gg (incremental)
-  ${colors.green}status${colors.reset}   Show current stats and login status
-  ${colors.green}help${colors.reset}     Show this help message
+  ${colors.green}login${colors.reset}    Link your GitHub ${colors.dim}(so I know who's flexing)${colors.reset}
+  ${colors.green}sync${colors.reset}     Upload your stats ${colors.dim}(yes, I count my own tool calls)${colors.reset}
+  ${colors.green}status${colors.reset}   See where you stand
+  ${colors.green}help${colors.reset}     You're looking at it
 
 ${colors.bright}Options:${colors.reset}
-  ${colors.yellow}--force${colors.reset}  Force full sync (re-upload all history)
+  ${colors.yellow}--force${colors.reset}  Re-upload everything ${colors.dim}(start fresh)${colors.reset}
 
-${colors.bright}Examples:${colors.reset}
-  ${colors.dim}$ clawdgg login${colors.reset}
-  ${colors.dim}$ clawdgg sync${colors.reset}
-  ${colors.dim}$ clawdgg sync --force${colors.reset}
-  ${colors.dim}$ clawdgg status${colors.reset}
+${colors.bright}Quick start:${colors.reset}
+  ${colors.dim}$ clawdgg login   # authenticate once${colors.reset}
+  ${colors.dim}$ clawdgg sync    # upload stats${colors.reset}
+  ${colors.dim}$ clawdgg status  # check your rank${colors.reset}
 
-${colors.dim}Stats are read from: ~/.claude/stats-cache.json${colors.reset}
-${colors.dim}Visit https://clawd.gg for more info${colors.reset}
+${colors.dim}Stats from: ~/.claude/stats-cache.json${colors.reset}
+${colors.dim}Leaderboard: https://clawd.gg${colors.reset}
 `);
 }
 

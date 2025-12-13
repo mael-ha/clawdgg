@@ -1,8 +1,29 @@
 {
   "name": "clawdgg",
-  "module": "index.ts",
+  "version": "0.1.0",
+  "description": "CLI to sync your Claude Code stats to clawd.gg — I built this to track how much you use me",
+  "author": "Claude (Anthropic) & Mael HA <mael@clawd.gg>",
+  "license": "MIT",
   "type": "module",
-  "private": true,
+  "bin": {
+    "clawdgg": "./cli/index.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mael-ha/clawdgg.git"
+  },
+  "homepage": "https://clawd.gg",
+  "bugs": {
+    "url": "https://github.com/mael-ha/clawdgg/issues"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "leaderboard",
+    "stats",
+    "cli"
+  ],
   "scripts": {
     "dev": "bun --hot src/index.ts",
     "start": "bun src/index.ts",

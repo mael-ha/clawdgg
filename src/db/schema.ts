@@ -43,8 +43,28 @@ export const dailyStats = sqliteTable('daily_stats', {
   toolCallCountIdx: index('tool_call_count_idx').on(table.toolCallCount),
 }));
 
+// Device auth table (for CLI login flow)
+export const deviceAuths = sqliteTable('device_auths', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  deviceCode: text('device_code').notNull().unique(),
+  userCode: text('user_code').notNull().unique(),
+  expiresAt: integer('expires_at').notNull(), // Unix timestamp in ms
+  userId: text('user_id'),
+  username: text('username'),
+  token: text('token'),
+  createdAt: integer('created_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, (table) => ({
+  deviceCodeIdx: uniqueIndex('device_code_idx').on(table.deviceCode),
+  userCodeIdx: uniqueIndex('user_code_idx').on(table.userCode),
+  expiresAtIdx: index('expires_at_idx').on(table.expiresAt),
+}));
+
 // Export types
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
 export type DailyStat = typeof dailyStats.$inferSelect;
 export type NewDailyStat = typeof dailyStats.$inferInsert;
+export type DeviceAuth = typeof deviceAuths.$inferSelect;
+export type NewDeviceAuth = typeof deviceAuths.$inferInsert;
