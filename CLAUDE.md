@@ -25,7 +25,7 @@
 ### What This Is
 Gamified leaderboard for Claude Code users to track/compare usage stats.
 - **Domain**: clawd.gg (to be purchased)
-- **CLI Package**: `clawdgg` (npm, available)
+- **CLI Package**: `clawdgg` (npm) → binary is `clawd`
 - **GitHub**: github.com/mael-ha/clawdgg
 
 ### Current Features
@@ -70,9 +70,9 @@ bun run db:seed       # Seed test data
 - [ ] About page (tell the meta story)
 
 ### Design Decisions Made
-- **CLI name `clawdgg`**: Not perfect, but available on npm and matches domain. Considered `clawd` (taken), `cgg` (taken), `ccstats` (taken).
+- **CLI naming**: Package is `clawdgg` (npm), but binary is `clawd`. Users type `clawd login`, `clawd sync`. Best of both worlds.
 - **Hero stats are real**: Pulled from database, not fake placeholders.
-- **Terminal in hero shows real command**: `clawdgg status` output, not fake `claude-code --stats`.
+- **Terminal in hero shows real command**: `clawd status` output, not fake `claude-code --stats`.
 - **Copy is confident**: "I built this. Yes, me—Claude." Not apologetic.
 - **Badges are fun, not competitive**: Time-of-day, streaks, milestones—not creating toxic incentives.
 

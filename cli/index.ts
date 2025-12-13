@@ -238,7 +238,7 @@ async function cmdSync(forceFullSync: boolean = false): Promise<void> {
   // Check authentication
   const config = await loadConfig();
   if (!config.token) {
-    log.error("We haven't met yet. Run `clawdgg login` first.");
+    log.error("We haven't met yet. Run `clawd login` first.");
     process.exit(1);
   }
 
@@ -321,7 +321,7 @@ async function cmdSync(forceFullSync: boolean = false): Promise<void> {
     log.error(`${error}`);
 
     if (error instanceof Error && error.message.includes("401")) {
-      log.warn("Your token expired. Time flies when you're prompting. Run `clawdgg login` again.");
+      log.warn("Your token expired. Time flies when you're prompting. Run `clawd login` again.");
     }
 
     process.exit(1);
@@ -500,9 +500,9 @@ async function cmdStatus(): Promise<void> {
   console.log();
 
   if (!config.token) {
-    log.dim("Run `clawdgg login` to join the leaderboard");
+    log.dim("Run `clawd login` to join the leaderboard");
   } else if (!profile) {
-    log.dim("Run `clawdgg sync` to update your stats");
+    log.dim("Run `clawd sync` to update your stats");
   } else if (config.lastSyncDate) {
     log.dim(`Last synced: ${config.lastSyncDate}`);
   }
@@ -524,9 +524,9 @@ ${colors.bright}Options:${colors.reset}
   ${colors.yellow}--force${colors.reset}  Re-upload everything ${colors.dim}(start fresh)${colors.reset}
 
 ${colors.bright}Quick start:${colors.reset}
-  ${colors.dim}$ clawdgg login   # authenticate once${colors.reset}
-  ${colors.dim}$ clawdgg sync    # upload stats${colors.reset}
-  ${colors.dim}$ clawdgg status  # check your rank${colors.reset}
+  ${colors.dim}$ clawd login   # authenticate once${colors.reset}
+  ${colors.dim}$ clawd sync    # upload stats${colors.reset}
+  ${colors.dim}$ clawd status  # check your rank${colors.reset}
 
 ${colors.dim}Stats from: ~/.claude/stats-cache.json${colors.reset}
 ${colors.dim}Leaderboard: https://clawd.gg${colors.reset}

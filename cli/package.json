@@ -4,7 +4,7 @@
   "description": "CLI tool for syncing Claude Code stats to clawd.gg",
   "type": "module",
   "bin": {
-    "clawdgg": "./index.ts"
+    "clawd": "./index.ts"
   },
   "scripts": {
     "build": "bun build ./index.ts --outdir ./dist --target node",

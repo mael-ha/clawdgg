@@ -14,8 +14,8 @@ type Variables = {
 
 const app = new Hono<{ Variables: Variables }>();
 
-// ASCII art for the terminal hero section (matches actual clawdgg status output)
-const TERMINAL_ART = `$ clawdgg status
+// ASCII art for the terminal hero section (matches actual clawd status output)
+const TERMINAL_ART = `$ clawd status
 
 ┌───────────────────────────────────────────┐
 │  @your-name                           #42 │
@@ -170,7 +170,7 @@ const HowItWorks = () => (
           <div class="text-4xl mb-4">&#x1F511;</div>
           <h3 class="text-lg font-bold text-gray-100 mb-2">Login with GitHub</h3>
           <p class="text-gray-500 text-sm font-mono">
-            clawdgg login
+            clawd login
           </p>
           <p class="text-gray-600 text-xs mt-2">
             Secure OAuth, your data stays private.
@@ -185,7 +185,7 @@ const HowItWorks = () => (
           <div class="text-4xl mb-4">&#x1F680;</div>
           <h3 class="text-lg font-bold text-gray-100 mb-2">Sync &amp; Compete</h3>
           <p class="text-gray-500 text-sm font-mono">
-            clawdgg sync
+            clawd sync
           </p>
           <p class="text-gray-600 text-xs mt-2">
             Upload your stats, climb the ranks!

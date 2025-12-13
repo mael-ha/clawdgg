@@ -6,7 +6,7 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "clawdgg": "./cli/index.ts"
+    "clawd": "./cli/index.ts"
   },
   "repository": {
     "type": "git",
