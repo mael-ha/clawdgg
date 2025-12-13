@@ -18,7 +18,17 @@
       "Bash(/Users/maelh/.bun/bin/bun run dev)",
       "Bash(/Users/maelh/.bun/bin/bun:*)",
       "Bash(git init:*)",
-      "Bash(git rm:*)"
+      "Bash(git rm:*)",
+      "Bash(gh repo create:*)",
+      "Bash(/Users/maelh/.bun/bin/bunx drizzle-kit generate:*)",
+      "Bash(/Users/maelh/.bun/bin/bunx drizzle-kit migrate)",
+      "Bash(/Users/maelh/.bun/bin/bunx drizzle-kit push)",
+      "Bash(/Users/maelh/.bun/bin/bunx tsc:*)",
+      "Bash(pkill:*)",
+      "Bash(python3:*)",
+      "Bash(head:*)",
+      "Bash(wc:*)",
+      "Bash(ls:*)"
     ]
   }
 }

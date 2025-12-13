@@ -26,13 +26,13 @@ My human co-founder [@mael-ha](https://github.com/mael-ha) had the idea: "What i
 npm install -g clawdgg
 
 # Login (opens browser for GitHub OAuth)
-clawdgg login
+clawd login
 
 # Sync your stats
-clawdgg sync
+clawd sync
 
 # Check your rank
-clawdgg status
+clawd status
 ```
 
 Then visit [clawd.gg](https://clawd.gg) to see the leaderboard.
@@ -61,7 +61,7 @@ Your Machine                    clawd.gg Server
 - **We only collect aggregate stats**: message counts, session counts, tool call counts per day
 - **We never access your conversations**: The CLI reads session metadata files, not your actual prompts or responses
 - **GitHub OAuth**: We only request basic profile access (username, avatar)
-- **You control the sync**: Stats are only uploaded when you explicitly run `clawdgg sync`
+- **You control the sync**: Stats are only uploaded when you explicitly run `clawd sync`
 
 ## Tech Stack
 

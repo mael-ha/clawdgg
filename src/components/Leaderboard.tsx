@@ -10,6 +10,8 @@ interface LeaderboardProps {
   total: number;
   page: number;
   pageSize: number;
+  currentUserId?: string;
+  currentUserRank?: number;
 }
 
 // Rank badge component with special styling for top 3
@@ -103,17 +105,23 @@ const PeriodTab: FC<{ period: Period; currentPeriod: Period; label: string; page
 };
 
 // Single leaderboard row
-const LeaderboardRow: FC<{ entry: LeaderboardEntry; index: number }> = ({ entry, index }) => {
+const LeaderboardRow: FC<{ entry: LeaderboardEntry; index: number; isCurrentUser?: boolean }> = ({ entry, index, isCurrentUser }) => {
   const isTopThree = entry.rank <= 3;
-  const rowClass = isTopThree
+  let rowClass = isTopThree
     ? 'bg-gradient-to-r from-gray-900/80 via-gray-900/50 to-transparent border-l-2 ' +
       (entry.rank === 1 ? 'border-l-yellow-400' : entry.rank === 2 ? 'border-l-gray-400' : 'border-l-amber-600')
     : 'hover:bg-gray-900/50';
+
+  // Glow effect for current user
+  if (isCurrentUser) {
+    rowClass += ' ring-2 ring-cyan-500/50 shadow-lg shadow-cyan-500/20';
+  }
 
   return (
     <div
       class={`group flex items-center gap-4 p-4 rounded-lg transition-all duration-200 ${rowClass}`}
       style={`animation-delay: ${index * 50}ms`}
+      id={isCurrentUser ? 'your-rank' : undefined}
     >
       {/* Rank */}
       <RankBadge rank={entry.rank} />
@@ -162,16 +170,6 @@ const LeaderboardRow: FC<{ entry: LeaderboardEntry; index: number }> = ({ entry,
           color="bg-blue-500/20 text-blue-400"
         />
       </div>
-
-      {/* Score visualization */}
-      <div class="hidden lg:block w-32">
-        <div class="h-2 bg-gray-800 rounded-full overflow-hidden">
-          <div
-            class="h-full bg-gradient-to-r from-cyan-500 to-magenta-500 rounded-full transition-all duration-500"
-            style={`width: ${Math.min(100, (entry.messageCount / 10000) * 100)}%`}
-          ></div>
-        </div>
-      </div>
     </div>
   );
 };
@@ -205,10 +203,35 @@ const LoadingIndicator: FC = () => (
   </div>
 );
 
+// "You are here" floating pill
+const YourRankPill: FC<{ rank: number; total: number; pageSize: number; period: Period }> = ({ rank, total, pageSize, period }) => {
+  const yourPage = Math.ceil(rank / pageSize);
+  const percentile = Math.max(1, Math.ceil((rank / total) * 100));
+
+  return (
+    <div class="sticky top-20 z-40 flex justify-center mb-4">
+      <button
+        hx-get={`/api/leaderboard?period=${period}&page=${yourPage}&limit=${pageSize}`}
+        hx-target="#leaderboard-content"
+        hx-swap="innerHTML"
+        class="flex items-center gap-3 px-4 py-2 bg-gray-900/95 backdrop-blur border border-cyan-500/50 rounded-full shadow-lg shadow-cyan-500/20 hover:border-cyan-400 transition-all"
+      >
+        <span class="text-cyan-400 font-mono text-sm">You're #{rank}</span>
+        <span class="text-gray-500 text-xs">Top {percentile}%</span>
+        <span class="text-gray-400 text-xs">→ View</span>
+      </button>
+    </div>
+  );
+};
+
 // Main Leaderboard component
-export const Leaderboard: FC<LeaderboardProps> = ({ entries, period, total, page, pageSize }) => {
+export const Leaderboard: FC<LeaderboardProps> = ({ entries, period, total, page, pageSize, currentUserId, currentUserRank }) => {
   const hasEntries = entries.length > 0;
   const totalPages = Math.ceil(total / pageSize);
+
+  // Check if current user is visible on this page
+  const isUserOnPage = currentUserId && entries.some(e => e.userId === currentUserId);
+  const showYourRankPill = currentUserRank && !isUserOnPage && currentUserRank > 0;
 
   return (
     <section id="leaderboard" class="py-16 px-4">
@@ -224,6 +247,11 @@ export const Leaderboard: FC<LeaderboardProps> = ({ entries, period, total, page
             // Top Claude Code power users ranked by activity
           </p>
         </div>
+
+        {/* "You are here" pill */}
+        {showYourRankPill && (
+          <YourRankPill rank={currentUserRank} total={total} pageSize={pageSize} period={period} />
+        )}
 
         {/* Period tabs */}
         <div class="flex justify-center gap-1 mb-8 border-b border-gray-800">
@@ -247,13 +275,17 @@ export const Leaderboard: FC<LeaderboardProps> = ({ entries, period, total, page
                 <div class="flex items-center gap-2">
                   <span class="hidden sm:inline">Stats</span>
                 </div>
-                <div class="hidden lg:block w-32">Progress</div>
               </div>
 
               {/* Entries */}
               <div class="space-y-1">
                 {entries.map((entry, index) => (
-                  <LeaderboardRow key={entry.userId} entry={entry} index={index} />
+                  <LeaderboardRow
+                    key={entry.userId}
+                    entry={entry}
+                    index={index}
+                    isCurrentUser={currentUserId === entry.userId}
+                  />
                 ))}
               </div>
 
@@ -325,7 +357,6 @@ export const LeaderboardContent: FC<LeaderboardProps> = ({ entries, period, tota
         <div class="flex items-center gap-2">
           <span class="hidden sm:inline">Stats</span>
         </div>
-        <div class="hidden lg:block w-32">Progress</div>
       </div>
 
       {/* Entries */}

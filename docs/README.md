@@ -40,7 +40,7 @@ src/
 ├── routes/index.tsx   # UI pages
 ├── components/        # Hono JSX components
 cli/
-└── index.ts           # CLI tool (npx clawd-gg)
+└── index.ts           # CLI tool (clawd)
 ```
 
 ## Domain

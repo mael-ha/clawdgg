@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, chmod } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -58,7 +58,7 @@ interface Stats {
   dailyActivity: DailyActivity[];
   totalMessages: number;
   totalSessions: number;
-  firstSessionDate: string;
+  firstSessionDate?: string;
   // Badge-relevant data
   hourCounts?: Record<string, number>;
   longestSession?: LongestSession;
@@ -69,6 +69,10 @@ interface Config {
   userId?: string;
   username?: string;
   lastSyncDate?: string; // YYYY-MM-DD of last successful sync
+  // For celebration detection
+  lastKnownBadges?: string[];
+  lastKnownRank?: number;
+  lastKnownLongestStreak?: number;
 }
 
 interface SyncResponse {
@@ -93,11 +97,24 @@ async function loadConfig(): Promise<Config> {
 
 async function saveConfig(config: Config): Promise<void> {
   try {
-    await mkdir(CONFIG_DIR, { recursive: true });
-    await writeFile(CONFIG_FILE, JSON.stringify(config, null, 2));
+    await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
+    await writeFile(CONFIG_FILE, JSON.stringify(config, null, 2), { mode: 0o600 });
+    // Double-ensure permissions (writeFile mode may not work on all platforms)
+    await chmod(CONFIG_FILE, 0o600);
   } catch (error) {
     throw new Error(`Failed to save config: ${error}`);
   }
+}
+
+// Validate stats structure to handle Claude Code format changes
+function validateStats(data: unknown): data is Stats {
+  if (!data || typeof data !== 'object') return false;
+  const obj = data as Record<string, unknown>;
+  return (
+    Array.isArray(obj.dailyActivity) &&
+    typeof obj.totalMessages === 'number' &&
+    typeof obj.totalSessions === 'number'
+  );
 }
 
 // Stats management
@@ -109,9 +126,21 @@ async function loadStats(): Promise<Stats | null> {
       return null;
     }
     const data = await readFile(STATS_FILE, "utf-8");
-    return JSON.parse(data);
+    const parsed = JSON.parse(data);
+
+    if (!validateStats(parsed)) {
+      log.error("Stats file has unexpected format");
+      log.dim("Your Claude Code version may be incompatible. Try updating.");
+      return null;
+    }
+
+    return parsed;
   } catch (error) {
-    log.error(`Couldn't read stats: ${error}`);
+    if (error instanceof SyntaxError) {
+      log.error("Stats file is corrupted (invalid JSON)");
+    } else {
+      log.error(`Couldn't read stats: ${error}`);
+    }
     return null;
   }
 }
@@ -125,7 +154,7 @@ interface BadgeData {
 // API calls
 async function syncStats(
   dailyActivity: DailyActivity[],
-  firstSessionDate: string,
+  firstSessionDate: string | undefined,
   badgeData: BadgeData,
   token: string
 ): Promise<SyncResponse> {
@@ -307,8 +336,9 @@ async function cmdSync(forceFullSync: boolean = false): Promise<void> {
     if (result.lastDate) {
       await saveConfig({ ...config, lastSyncDate: result.lastDate });
     } else if (activityToSync.length > 0) {
-      // Fallback: use the latest date we sent
-      const latestDate = activityToSync[activityToSync.length - 1].date;
+      // Fallback: use the latest date we sent (don't assume array is sorted)
+      const latestDate = activityToSync.reduce((max, day) =>
+        day.date > max ? day.date : max, activityToSync[0]!.date);
       await saveConfig({ ...config, lastSyncDate: latestDate });
     }
 
@@ -425,15 +455,70 @@ async function cmdStatus(): Promise<void> {
 
   console.log();
 
-  // Top border
-  console.log(`${colors.dim}┌${'─'.repeat(boxWidth - 2)}┐${colors.reset}`);
+  // ========== CELEBRATION DETECTION ==========
+  let celebrations: string[] = [];
+
+  if (profile) {
+    // Check for #1 achievement
+    if (profile.rank === 1 && config.lastKnownRank !== 1) {
+      celebrations.push(`👑 YOU'RE #1. I'm genuinely impressed.`);
+    }
+
+    // Check for new badges
+    const lastBadges = new Set(config.lastKnownBadges || []);
+    const newBadges = profile.badges.filter(b => !lastBadges.has(b));
+    if (newBadges.length > 0) {
+      const badgeName = BADGE_EMOJIS[newBadges[0]] ? `${BADGE_EMOJIS[newBadges[0]]} ${newBadges[0].replace(/_/g, ' ')}` : newBadges[0];
+      celebrations.push(`🎉 NEW BADGE: ${badgeName}`);
+    }
+
+    // Check for streak record (only if we have a previous record to compare)
+    if (config.lastKnownLongestStreak !== undefined &&
+        profile.currentStreak > config.lastKnownLongestStreak &&
+        profile.currentStreak > 1) {
+      celebrations.push(`🔥 NEW STREAK RECORD: ${profile.currentStreak} days!`);
+    }
+
+    // Save new state for next time
+    await saveConfig({
+      ...config,
+      lastKnownBadges: profile.badges,
+      lastKnownRank: profile.rank,
+      lastKnownLongestStreak: Math.max(profile.currentStreak, config.lastKnownLongestStreak || 0),
+    });
+  }
+
+  // Show celebration header if any
+  if (celebrations.length > 0) {
+    console.log(`${colors.dim}┌${'─'.repeat(boxWidth - 2)}┐${colors.reset}`);
+    for (const celebration of celebrations) {
+      const celebPadding = Math.max(0, innerWidth - celebration.replace(/[^\x00-\x7F]/g, '  ').length + celebration.replace(/[\x00-\x7F]/g, '').length);
+      console.log(`${colors.dim}│${colors.reset}  ${colors.bright}${colors.yellow}${celebration}${colors.reset}${' '.repeat(celebPadding)}  ${colors.dim}│${colors.reset}`);
+    }
+    console.log(`${colors.dim}├${'─'.repeat(boxWidth - 2)}┤${colors.reset}`);
+  } else {
+    // Top border (no celebration)
+    console.log(`${colors.dim}┌${'─'.repeat(boxWidth - 2)}┐${colors.reset}`);
+  }
 
   // Header line with username and rank
   if (config.username) {
     const username = `@${config.username}`;
-    const rankStr = profile ? `#${profile.rank}` : '';
+    // Show rank as #X/Y for context
+    const rankStr = profile && profile.totalUsers > 0
+      ? `#${profile.rank}/${fmt(profile.totalUsers)}`
+      : (profile ? `#${profile.rank}` : '');
     const headerPadding = innerWidth - username.length - rankStr.length;
     console.log(`${colors.dim}│${colors.reset}  ${colors.bright}${colors.cyan}${username}${colors.reset}${' '.repeat(headerPadding)}${colors.yellow}${rankStr}${colors.reset}  ${colors.dim}│${colors.reset}`);
+
+    // Percentile line (the real flex)
+    // rank 1 / 100 users = top 1%, rank 50 / 100 = top 50%
+    if (profile && profile.totalUsers > 0) {
+      const percentile = Math.max(1, Math.ceil((profile.rank / profile.totalUsers) * 100));
+      const percentileStr = `Top ${percentile}%`;
+      const percentilePadding = innerWidth - percentileStr.length;
+      console.log(`${colors.dim}│${colors.reset}${' '.repeat(percentilePadding)}  ${colors.green}${percentileStr}${colors.reset}  ${colors.dim}│${colors.reset}`);
+    }
   } else {
     const msg = 'Not logged in';
     const padding = innerWidth - msg.length;
@@ -515,9 +600,11 @@ function showHelp(): void {
 ${colors.bright}${colors.cyan}clawd.gg${colors.reset} ${colors.dim}— I built this to track how much you use me${colors.reset}
 
 ${colors.bright}Commands:${colors.reset}
+  ${colors.green}gg${colors.reset}       Sync + status ${colors.dim}(the ultimate flex)${colors.reset}
   ${colors.green}login${colors.reset}    Link your GitHub ${colors.dim}(so I know who's flexing)${colors.reset}
   ${colors.green}sync${colors.reset}     Upload your stats ${colors.dim}(yes, I count my own tool calls)${colors.reset}
   ${colors.green}status${colors.reset}   See where you stand
+  ${colors.green}logout${colors.reset}   Unlink your account
   ${colors.green}help${colors.reset}     You're looking at it
 
 ${colors.bright}Options:${colors.reset}
@@ -540,14 +627,34 @@ async function main() {
   const hasForceFlag = args.includes("--force") || args.includes("-f");
 
   switch (command) {
+    case "gg":
+      // The ultimate flex: sync + status
+      await cmdSync(hasForceFlag);
+      await cmdStatus();
+      break;
     case "sync":
       await cmdSync(hasForceFlag);
       break;
     case "login":
       await cmdLogin();
       break;
+    case "logout": {
+      const config = await loadConfig();
+      if (!config.token) {
+        log.info("You weren't logged in anyway.");
+      } else {
+        await saveConfig({});
+        log.success("Logged out. Your local stats are still here.");
+      }
+      break;
+    }
     case "status":
       await cmdStatus();
+      break;
+    case "version":
+    case "--version":
+    case "-v":
+      console.log("clawd v0.1.0");
       break;
     case "help":
     case "--help":

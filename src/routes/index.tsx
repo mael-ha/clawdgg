@@ -304,6 +304,29 @@ app.get('/', optionalAuth, async (c) => {
     totalToolCalls: aggregateStats[0]?.totalToolCalls || 0,
   };
 
+  // Get current user's rank if logged in
+  let currentUserRank: number | undefined;
+  if (user) {
+    const rankResult = await db
+      .select({
+        rank: sql<number>`(
+          SELECT COUNT(*) + 1 FROM (
+            SELECT user_id, SUM(message_count) as total
+            FROM daily_stats
+            GROUP BY user_id
+            HAVING total > (
+              SELECT COALESCE(SUM(message_count), 0)
+              FROM daily_stats
+              WHERE user_id = (SELECT id FROM users WHERE github_username = ${user.githubUsername})
+            )
+          )
+        )`,
+      })
+      .from(users)
+      .where(eq(users.githubUsername, user.githubUsername));
+    currentUserRank = rankResult[0]?.rank;
+  }
+
   // Transform to LeaderboardEntry format
   const entries: LeaderboardEntry[] = results.map((row, index) => ({
     rank: index + 1,
@@ -328,6 +351,8 @@ app.get('/', optionalAuth, async (c) => {
         total={total}
         page={1}
         pageSize={pageSize}
+        currentUserId={user?.id}
+        currentUserRank={currentUserRank}
       />
       <HowItWorks />
       <Footer />

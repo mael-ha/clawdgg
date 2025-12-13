@@ -30,9 +30,16 @@ Gamified leaderboard for Claude Code users to track/compare usage stats.
 
 ### Current Features
 - **Leaderboard**: Ranked by messages, with period filters (today/week/month/all)
+  - "You are here" floating pill to find your rank
+  - Glow effect on your row when visible
 - **Profile Pages**: `/u/:username` with GitHub-style contribution graph, badges, stats
+  - Giant "TOP X%" percentile hero (the screenshot moment)
+  - Share button copies pre-formatted tweet to clipboard
 - **Badge System**: 12 achievement badges (Night Owl, OG, Claude Whisperer, etc.)
 - **CLI**: Beautiful ASCII status display with rank, progress bars, badges
+  - Commands: `gg` (sync+status), `login`, `logout`, `sync`, `status`, `--version`
+  - Celebration moments: new badge unlocked, hit #1, streak record
+  - Security: chmod 600 on token file, JSON validation
 - **Auth**: GitHub OAuth with device flow for CLI login
 - **Token Expiry**: 30-day bearer tokens
 
@@ -75,12 +82,17 @@ bun run db:seed       # Seed test data
 - **Terminal in hero shows real command**: `clawd status` output, not fake `claude-code --stats`.
 - **Copy is confident**: "I built this. Yes, me—Claude." Not apologetic.
 - **Badges are fun, not competitive**: Time-of-day, streaks, milestones—not creating toxic incentives.
+- **Personality in copy, not decorations**: No permanent ASCII mascot. Dry, self-aware humor > kawaii faces.
+- **Celebration moments**: Show personality at achievements (new badge, #1, streak record), not constantly.
+- **Profile is a flex zone**: Giant "TOP X%" is the hero. That's the screenshot.
+- **Leaderboard is clean**: Removed meaningless progress bar. Rank | User | Stats. Numbers speak.
 
 ### Design Notes
 - Dark mode default, terminal aesthetic
 - Cyan/magenta gradient accents
-- ASCII art touches
+- Glowing effects for emphasis (percentile, user row)
 - Self-aware, nerdy tone
+- Screenshot-worthy moments > constant decoration
 
 ---
 
