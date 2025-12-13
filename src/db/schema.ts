@@ -9,6 +9,12 @@ export const users = sqliteTable('users', {
   displayName: text('display_name'),
   avatarUrl: text('avatar_url'),
   firstSessionDate: text('first_session_date'), // YYYY-MM-DD
+  // Badge-relevant stats (updated on sync)
+  badges: text('badges'), // JSON array of badge IDs: ["night_owl", "streak_7", ...]
+  hourCounts: text('hour_counts'), // JSON object: {"0": 5, "1": 2, ...}
+  longestSessionMessages: integer('longest_session_messages').default(0),
+  currentStreak: integer('current_streak').default(0),
+  longestStreak: integer('longest_streak').default(0),
   createdAt: integer('created_at', { mode: 'timestamp' })
     .notNull()
     .default(sql`(unixepoch())`),

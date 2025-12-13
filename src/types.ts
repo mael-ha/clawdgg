@@ -49,6 +49,9 @@ export interface StatsSubmission {
   totalMessages: number;
   totalSessions: number;
   firstSessionDate?: string;
+  // Badge-relevant data
+  hourCounts?: Record<string, number>;
+  longestSessionMessages?: number;
 }
 
 export interface LeaderboardEntry {
@@ -59,6 +62,7 @@ export interface LeaderboardEntry {
   messageCount: number;
   sessionCount: number;
   toolCallCount: number;
+  badges?: string[];  // Badge IDs
 }
 
 export interface LeaderboardResponse {

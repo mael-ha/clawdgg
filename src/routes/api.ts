@@ -1,11 +1,64 @@
 import { Hono } from 'hono';
 import { db } from '../db';
 import { dailyStats, users } from '../db/schema';
-import { eq, sql, desc, and, gte } from 'drizzle-orm';
+import { eq, sql, desc, and, gte, asc } from 'drizzle-orm';
 import { requireAuth, optionalAuth } from '../lib/auth-middleware';
 import type { StatsSubmission, LeaderboardEntry, LeaderboardResponse } from '../types';
+import { computeBadges, formatBadgesCompact, type BadgeInput } from '../lib/badges';
 
 const api = new Hono();
+
+// Helper to calculate streak from sorted dates
+function calculateStreaks(dates: string[]): { currentStreak: number; longestStreak: number } {
+  if (dates.length === 0) return { currentStreak: 0, longestStreak: 0 };
+
+  const today = new Date().toISOString().split('T')[0]!;
+  const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0]!;
+
+  let currentStreak = 0;
+  let longestStreak = 0;
+  let streak = 1;
+
+  // Check if the most recent date is today or yesterday (for current streak)
+  const lastDate = dates[dates.length - 1]!;
+  const isActive = lastDate === today || lastDate === yesterday;
+
+  for (let i = 1; i < dates.length; i++) {
+    const prevDateStr = dates[i - 1]!;
+    const currDateStr = dates[i]!;
+    const prevDate = new Date(prevDateStr);
+    const currDate = new Date(currDateStr);
+    const diffDays = (currDate.getTime() - prevDate.getTime()) / 86400000;
+
+    if (diffDays === 1) {
+      streak++;
+    } else {
+      longestStreak = Math.max(longestStreak, streak);
+      streak = 1;
+    }
+  }
+  longestStreak = Math.max(longestStreak, streak);
+
+  // Current streak: count backwards from today/yesterday
+  if (isActive) {
+    currentStreak = 1;
+    for (let i = dates.length - 2; i >= 0; i--) {
+      const currDateStr = dates[i + 1]!;
+      const prevDateStr = dates[i]!;
+      const currDate = new Date(currDateStr);
+      const prevDate = new Date(prevDateStr);
+      const diffDays = (currDate.getTime() - prevDate.getTime()) / 86400000;
+
+      if (diffDays === 1) {
+        currentStreak++;
+      } else {
+        break;
+      }
+    }
+  }
+
+  return { currentStreak, longestStreak };
+}
 
 // POST /api/stats - Submit daily stats (requires auth)
 api.post('/stats', requireAuth, async (c) => {
@@ -69,11 +122,72 @@ api.post('/stats', requireAuth, async (c) => {
       }
     }
 
+    // Compute badges based on all user stats
+    const userStats = await db
+      .select({
+        totalMessages: sql<number>`sum(${dailyStats.messageCount})`,
+        totalToolCalls: sql<number>`sum(${dailyStats.toolCallCount})`,
+      })
+      .from(dailyStats)
+      .where(eq(dailyStats.userId, user.id));
+
+    // Get all dates for streak calculation
+    const allDates = await db
+      .select({ date: dailyStats.date })
+      .from(dailyStats)
+      .where(eq(dailyStats.userId, user.id))
+      .orderBy(asc(dailyStats.date));
+
+    // Calculate streaks
+    const { currentStreak, longestStreak } = calculateStreaks(
+      allDates.map((d) => d.date)
+    );
+
+    // Get user count for OG badge
+    const userCountResult = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(users);
+    const totalUsers = userCountResult[0]?.count || 0;
+
+    // Get this user's rank (by signup order)
+    const userRankResult = await db
+      .select({ rank: sql<number>`(SELECT COUNT(*) FROM users u2 WHERE u2.created_at <= users.created_at)` })
+      .from(users)
+      .where(eq(users.id, user.id));
+    const userRank = userRankResult[0]?.rank || totalUsers;
+
+    // Compute badges
+    const badgeInput: BadgeInput = {
+      totalMessages: userStats[0]?.totalMessages || 0,
+      totalToolCalls: userStats[0]?.totalToolCalls || 0,
+      currentStreak,
+      longestStreak,
+      longestSessionMessages: body.longestSessionMessages || 0,
+      hourCounts: body.hourCounts || {},
+      userRank,
+    };
+
+    const badges = computeBadges(badgeInput);
+
+    // Update user with badge data
+    await db
+      .update(users)
+      .set({
+        badges: JSON.stringify(badges),
+        hourCounts: body.hourCounts ? JSON.stringify(body.hourCounts) : null,
+        longestSessionMessages: body.longestSessionMessages || 0,
+        currentStreak,
+        longestStreak,
+        updatedAt: new Date(),
+      })
+      .where(eq(users.id, user.id));
+
     return c.json({
       success: true,
       message: `Submitted stats for ${daysSubmitted} days`,
       lastDate,
       daysSubmitted,
+      badges,
     });
   } catch (error) {
     console.error('Error submitting stats:', error);
@@ -136,6 +250,7 @@ api.get('/leaderboard', optionalAuth, async (c) => {
         userId: users.id,
         githubUsername: users.githubUsername,
         avatarUrl: users.avatarUrl,
+        badges: users.badges,
         messageCount: sql<number>`sum(${dailyStats.messageCount})`.as('total_messages'),
         sessionCount: sql<number>`sum(${dailyStats.sessionCount})`.as('total_sessions'),
         toolCallCount: sql<number>`sum(${dailyStats.toolCallCount})`.as('total_tools'),
@@ -156,7 +271,7 @@ api.get('/leaderboard', optionalAuth, async (c) => {
         : 'total_messages';
 
     const results = await queryWithFilter
-      .groupBy(users.id, users.githubUsername, users.avatarUrl)
+      .groupBy(users.id, users.githubUsername, users.avatarUrl, users.badges)
       .orderBy(desc(sql.raw(sortColumnName)))
       .limit(limit)
       .offset(offset);
@@ -174,15 +289,24 @@ api.get('/leaderboard', optionalAuth, async (c) => {
     const total = countResult[0]?.count || 0;
 
     // Transform results to LeaderboardEntry format with ranks
-    const entries: LeaderboardEntry[] = results.map((row, index) => ({
-      rank: offset + index + 1,
-      userId: row.userId,
-      githubUsername: row.githubUsername,
-      avatarUrl: row.avatarUrl,
-      messageCount: row.messageCount || 0,
-      sessionCount: row.sessionCount || 0,
-      toolCallCount: row.toolCallCount || 0,
-    }));
+    const entries: LeaderboardEntry[] = results.map((row, index) => {
+      let badges: string[] = [];
+      try {
+        badges = row.badges ? JSON.parse(row.badges) : [];
+      } catch {
+        badges = [];
+      }
+      return {
+        rank: offset + index + 1,
+        userId: row.userId,
+        githubUsername: row.githubUsername,
+        avatarUrl: row.avatarUrl,
+        messageCount: row.messageCount || 0,
+        sessionCount: row.sessionCount || 0,
+        toolCallCount: row.toolCallCount || 0,
+        badges,
+      };
+    });
 
     const response: LeaderboardResponse = {
       entries,
@@ -224,7 +348,9 @@ function renderLeaderboardHtml(
     `;
   }
 
-  const rows = entries.map((entry) => `
+  const rows = entries.map((entry) => {
+    const badgeEmojis = entry.badges ? formatBadgesCompact(entry.badges) : '';
+    return `
     <tr class="border-b border-gray-100 hover:bg-gray-50">
       <td class="py-3 px-4 text-center font-medium">${entry.rank}</td>
       <td class="py-3 px-4">
@@ -239,13 +365,15 @@ function renderLeaderboardHtml(
              class="font-medium text-blue-600 hover:underline">
             ${escapeHtml(entry.githubUsername)}
           </a>
+          ${badgeEmojis ? `<span class="text-sm" title="Badges">${badgeEmojis}</span>` : ''}
         </div>
       </td>
       <td class="py-3 px-4 text-center">${entry.messageCount.toLocaleString()}</td>
       <td class="py-3 px-4 text-center">${entry.sessionCount.toLocaleString()}</td>
       <td class="py-3 px-4 text-center">${entry.toolCallCount.toLocaleString()}</td>
     </tr>
-  `).join('');
+  `;
+  }).join('');
 
   const totalPages = Math.ceil(total / pageSize);
   const hasPrev = page > 1;

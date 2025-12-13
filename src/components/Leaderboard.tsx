@@ -1,5 +1,6 @@
 import type { FC } from 'hono/jsx';
 import type { LeaderboardEntry } from '../types';
+import { formatBadgesCompact } from '../lib/badges';
 
 type Period = 'today' | 'week' | 'month' | 'all';
 
@@ -121,14 +122,21 @@ const LeaderboardRow: FC<{ entry: LeaderboardEntry; index: number }> = ({ entry,
       <div class="flex items-center gap-3 flex-1 min-w-0">
         <UserAvatar url={entry.avatarUrl} username={entry.githubUsername} rank={entry.rank} />
         <div class="min-w-0">
-          <a
-            href={`https://github.com/${entry.githubUsername}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            class="text-gray-100 font-medium hover:text-cyan-400 transition-colors truncate block"
-          >
-            @{entry.githubUsername}
-          </a>
+          <div class="flex items-center gap-2">
+            <a
+              href={`https://github.com/${entry.githubUsername}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              class="text-gray-100 font-medium hover:text-cyan-400 transition-colors truncate"
+            >
+              @{entry.githubUsername}
+            </a>
+            {entry.badges && entry.badges.length > 0 && (
+              <span class="text-sm" title={`${entry.badges.length} badge${entry.badges.length > 1 ? 's' : ''}`}>
+                {formatBadgesCompact(entry.badges)}
+              </span>
+            )}
+          </div>
           <div class="text-gray-600 text-xs font-mono">
             ID: {entry.userId.slice(0, 8)}...
           </div>

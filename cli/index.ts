@@ -48,11 +48,20 @@ interface DailyActivity {
   toolCallCount: number;
 }
 
+interface LongestSession {
+  messageCount: number;
+  duration: number;
+  timestamp: string;
+}
+
 interface Stats {
   dailyActivity: DailyActivity[];
   totalMessages: number;
   totalSessions: number;
   firstSessionDate: string;
+  // Badge-relevant data
+  hourCounts?: Record<string, number>;
+  longestSession?: LongestSession;
 }
 
 interface Config {
@@ -107,10 +116,17 @@ async function loadStats(): Promise<Stats | null> {
   }
 }
 
+// Badge-relevant data to send with sync
+interface BadgeData {
+  hourCounts?: Record<string, number>;
+  longestSessionMessages?: number;
+}
+
 // API calls
 async function syncStats(
   dailyActivity: DailyActivity[],
   firstSessionDate: string,
+  badgeData: BadgeData,
   token: string
 ): Promise<SyncResponse> {
   try {
@@ -120,7 +136,11 @@ async function syncStats(
         "Content-Type": "application/json",
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({ dailyActivity, firstSessionDate }),
+      body: JSON.stringify({
+        dailyActivity,
+        firstSessionDate,
+        ...badgeData,
+      }),
     });
 
     if (!response.ok) {
@@ -274,8 +294,14 @@ async function cmdSync(forceFullSync: boolean = false): Promise<void> {
   // Sync
   log.info("Uploading to clawd.gg...");
 
+  // Extract badge-relevant data
+  const badgeData: BadgeData = {
+    hourCounts: stats.hourCounts,
+    longestSessionMessages: stats.longestSession?.messageCount,
+  };
+
   try {
-    const result = await syncStats(activityToSync, stats.firstSessionDate, config.token);
+    const result = await syncStats(activityToSync, stats.firstSessionDate, badgeData, config.token);
 
     // Update lastSyncDate in config
     if (result.lastDate) {
