@@ -359,9 +359,7 @@ function renderLeaderboardHtml(
             ? `<img src="${escapeHtml(entry.avatarUrl)}" alt="" class="w-8 h-8 rounded-full" />`
             : `<div class="w-8 h-8 rounded-full bg-gray-200"></div>`
           }
-          <a href="https://github.com/${escapeHtml(entry.githubUsername)}"
-             target="_blank"
-             rel="noopener noreferrer"
+          <a href="/u/${escapeHtml(entry.githubUsername)}"
              class="font-medium text-blue-600 hover:underline">
             ${escapeHtml(entry.githubUsername)}
           </a>

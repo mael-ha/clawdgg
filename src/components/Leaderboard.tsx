@@ -124,9 +124,7 @@ const LeaderboardRow: FC<{ entry: LeaderboardEntry; index: number }> = ({ entry,
         <div class="min-w-0">
           <div class="flex items-center gap-2">
             <a
-              href={`https://github.com/${entry.githubUsername}`}
-              target="_blank"
-              rel="noopener noreferrer"
+              href={`/u/${entry.githubUsername}`}
               class="text-gray-100 font-medium hover:text-cyan-400 transition-colors truncate"
             >
               @{entry.githubUsername}

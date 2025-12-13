@@ -5,6 +5,7 @@ import { serveStatic } from 'hono/bun';
 import auth from './routes/auth';
 import api from './routes/api';
 import pages from './routes/index';
+import profile from './routes/profile';
 import { rateLimit } from './lib/rate-limit';
 import { optionalAuth } from './lib/auth-middleware';
 
@@ -33,6 +34,7 @@ app.use('/public/*', serveStatic({ root: './' }));
 // Mount routes
 app.route('/auth', auth);
 app.route('/api', api);
+app.route('/u', profile);
 app.route('/', pages);
 
 // Health check endpoint
