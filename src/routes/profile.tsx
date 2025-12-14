@@ -5,6 +5,7 @@ import { db } from '../db';
 import { dailyStats, users } from '../db/schema';
 import { eq, sql, asc, desc } from 'drizzle-orm';
 import { getBadges, BADGES } from '../lib/badges';
+import { getTokenComparison, getPromptsComparison, getLinesComparison } from '../lib/comparisons';
 import type { SessionUser } from '../types';
 
 type Variables = {
@@ -170,6 +171,14 @@ const StatCard: FC<{ label: string; value: string | number; icon: string; color:
   </div>
 );
 
+// Format tokens with K/M/B suffix
+function formatTokens(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
+  return n.toString();
+}
+
 // Profile page component
 interface ProfileProps {
   profile: {
@@ -179,6 +188,12 @@ interface ProfileProps {
     badges: string[];
     currentStreak: number;
     longestStreak: number;
+    // New primary metrics
+    totalPrompts: number;
+    totalLinesWritten: number;
+    totalCommits: number;
+    totalTokens: number;
+    // Legacy (kept for backward compat)
     totalMessages: number;
     totalSessions: number;
     totalToolCalls: number;
@@ -200,14 +215,20 @@ const Profile: FC<ProfileProps> = ({ profile, contributions, currentUser }) => {
     ? Math.max(1, Math.ceil((profile.rank / profile.totalUsers) * 100))
     : 100;
 
-  // Generate share text
+  // Get fun comparison
+  const funComparison = getTokenComparison(profile.totalTokens);
+
+  // Generate share text with new metrics
   const shareText = `I'm #${profile.rank} on clawd.gg — Top ${percentile}% of Claude Code users 🤖
 
-📊 ${profile.totalMessages.toLocaleString()} messages
+📨 ${profile.totalPrompts.toLocaleString()} prompts sent
+📝 ${formatTokens(profile.totalLinesWritten)} lines written
+⚡ ${formatTokens(profile.totalTokens)} tokens
 🔥 ${profile.currentStreak} day streak
-🏆 ${profile.badges.length} badges earned
 
-How addicted are you? clawd.gg/u/${profile.username}`;
+${funComparison}
+
+clawd.gg/u/${profile.username}`;
 
   return (
     <div class="min-h-screen bg-black">
@@ -301,31 +322,66 @@ How addicted are you? clawd.gg/u/${profile.username}`;
           </div>
         </div>
 
-        {/* Stats cards */}
+        {/* Stats cards - New metrics */}
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+          <StatCard
+            label="Prompts Sent"
+            value={profile.totalPrompts}
+            icon="📨"
+            color="text-cyan-400"
+          />
+          <StatCard
+            label="Lines Written"
+            value={profile.totalLinesWritten}
+            icon="📝"
+            color="text-green-400"
+          />
+          <StatCard
+            label="Tokens"
+            value={formatTokens(profile.totalTokens)}
+            icon="⚡"
+            color="text-yellow-400"
+          />
+          <StatCard
+            label="Commits"
+            value={profile.totalCommits}
+            icon="📦"
+            color="text-purple-400"
+          />
+        </div>
+
+        {/* Fun comparison */}
+        <div class="mb-12 p-4 bg-gray-900/50 border border-gray-800 rounded-lg text-center">
+          <p class="text-gray-400 font-mono text-sm">
+            <span class="text-cyan-400">// fun fact:</span> You've exchanged {funComparison}
+          </p>
+        </div>
+
+        {/* Additional stats row */}
         <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-12">
+          <StatCard
+            label="Current Streak"
+            value={`${profile.currentStreak} days`}
+            icon="🔥"
+            color="text-orange-400"
+          />
+          <StatCard
+            label="Best Streak"
+            value={`${profile.longestStreak} days`}
+            icon="🏆"
+            color="text-amber-400"
+          />
           <StatCard
             label="Messages"
             value={profile.totalMessages}
             icon=">_"
-            color="text-cyan-400"
-          />
-          <StatCard
-            label="Sessions"
-            value={profile.totalSessions}
-            icon="[]"
-            color="text-magenta-400"
+            color="text-gray-400"
           />
           <StatCard
             label="Tool Calls"
             value={profile.totalToolCalls}
             icon="()"
-            color="text-blue-400"
-          />
-          <StatCard
-            label="Best Streak"
-            value={`${profile.longestStreak} days`}
-            icon="🔥"
-            color="text-orange-400"
+            color="text-gray-400"
           />
         </div>
 
@@ -399,18 +455,22 @@ app.get('/:username', async (c) => {
   // Fetch aggregate stats
   const statsResult = await db
     .select({
+      totalPrompts: sql<number>`sum(${dailyStats.promptCount})`,
+      totalLinesWritten: sql<number>`sum(${dailyStats.linesWritten})`,
+      totalCommits: sql<number>`sum(${dailyStats.commitCount})`,
       totalMessages: sql<number>`sum(${dailyStats.messageCount})`,
       totalSessions: sql<number>`sum(${dailyStats.sessionCount})`,
       totalToolCalls: sql<number>`sum(${dailyStats.toolCallCount})`,
+      totalTokens: sql<number>`sum(${dailyStats.tokenCount})`,
     })
     .from(dailyStats)
     .where(eq(dailyStats.userId, userData.id));
 
-  // Fetch daily activity for contribution graph
+  // Fetch daily activity for contribution graph (uses prompts for activity level)
   const dailyActivity = await db
     .select({
       date: dailyStats.date,
-      count: dailyStats.messageCount,
+      count: dailyStats.promptCount,
     })
     .from(dailyStats)
     .where(eq(dailyStats.userId, userData.id))
@@ -430,16 +490,16 @@ app.get('/:username', async (c) => {
     return { date: d.date, count: d.count, level };
   });
 
-  // Get user rank
+  // Get user rank (by prompts now, not messages)
   const rankResult = await db
     .select({
       rank: sql<number>`(
         SELECT COUNT(*) + 1 FROM (
-          SELECT user_id, SUM(message_count) as total
+          SELECT user_id, SUM(prompt_count) as total
           FROM daily_stats
           GROUP BY user_id
           HAVING total > (
-            SELECT COALESCE(SUM(message_count), 0)
+            SELECT COALESCE(SUM(prompt_count), 0)
             FROM daily_stats
             WHERE user_id = ${userData.id}
           )
@@ -469,6 +529,12 @@ app.get('/:username', async (c) => {
     badges,
     currentStreak: userData.currentStreak || 0,
     longestStreak: userData.longestStreak || 0,
+    // New primary metrics
+    totalPrompts: statsResult[0]?.totalPrompts || 0,
+    totalLinesWritten: statsResult[0]?.totalLinesWritten || 0,
+    totalCommits: statsResult[0]?.totalCommits || 0,
+    totalTokens: statsResult[0]?.totalTokens || 0,
+    // Legacy metrics
     totalMessages: statsResult[0]?.totalMessages || 0,
     totalSessions: statsResult[0]?.totalSessions || 0,
     totalToolCalls: statsResult[0]?.totalToolCalls || 0,

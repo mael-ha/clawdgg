@@ -1,11 +1,14 @@
 // Shared types for clawd.gg
 
-// Stats from ~/.claude/stats-cache.json
+// Stats submitted from CLI (raw parsed data)
 export interface DailyActivity {
   date: string;  // YYYY-MM-DD
-  messageCount: number;
-  sessionCount: number;
+  promptCount: number;      // User messages only (YOUR engagement)
+  messageCount: number;     // All messages (for backward compat)
   toolCallCount: number;
+  linesWritten: number;     // Lines of code written
+  commitCount: number;      // Git commits
+  sessionCount: number;     // Legacy, kept for backward compat
 }
 
 export interface DailyModelTokens {
@@ -46,6 +49,7 @@ export interface StatsCache {
 // API types
 export interface StatsSubmission {
   dailyActivity: DailyActivity[];
+  dailyModelTokens?: DailyModelTokens[];  // Token data per day
   totalMessages: number;
   totalSessions: number;
   firstSessionDate?: string;
@@ -59,10 +63,17 @@ export interface LeaderboardEntry {
   userId: string;
   githubUsername: string;
   avatarUrl: string | null;
+  // Primary metrics
+  promptCount: number;      // User messages (YOUR engagement) - THE primary metric
+  tokenCount: number;       // Total tokens (the flex stat)
+  // Code metrics
+  linesWritten: number;     // Lines of code written
+  commitCount: number;      // Git commits
+  // Legacy (kept for backward compat)
   messageCount: number;
-  sessionCount: number;
   toolCallCount: number;
-  badges?: string[];  // Badge IDs
+  sessionCount: number;
+  badges?: string[];
 }
 
 export interface LeaderboardResponse {

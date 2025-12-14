@@ -1,8 +1,10 @@
 #!/usr/bin/env bun
-import { readFile, writeFile, mkdir, chmod } from "node:fs/promises";
+import { readFile, writeFile, mkdir, chmod, stat, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 
 // ANSI color codes
 const colors = {
@@ -33,8 +35,13 @@ const log = {
 
 // File paths
 const STATS_FILE = join(homedir(), ".claude", "stats-cache.json");
-const CONFIG_DIR = join(homedir(), ".clawd-gg");
+const CLAUDE_PROJECTS_DIR = join(homedir(), ".claude", "projects");
+const CONFIG_DIR = join(homedir(), ".config", "clawd");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
+const CACHE_FILE = join(CONFIG_DIR, "cache.json");
+// Legacy config location (for migration)
+const LEGACY_CONFIG_DIR = join(homedir(), ".clawd-gg");
+const LEGACY_CONFIG_FILE = join(LEGACY_CONFIG_DIR, "config.json");
 
 // API configuration
 const API_BASE_URL =
@@ -48,14 +55,28 @@ interface DailyActivity {
   toolCallCount: number;
 }
 
+interface DailyModelTokens {
+  date: string;
+  tokensByModel: Record<string, number>;
+}
+
 interface LongestSession {
   messageCount: number;
   duration: number;
   timestamp: string;
 }
 
+interface ModelUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+}
+
 interface Stats {
   dailyActivity: DailyActivity[];
+  dailyModelTokens?: DailyModelTokens[];  // Token data per day
+  modelUsage?: Record<string, ModelUsage>;  // Lifetime totals by model
   totalMessages: number;
   totalSessions: number;
   firstSessionDate?: string;
@@ -75,6 +96,447 @@ interface Config {
   lastKnownLongestStreak?: number;
 }
 
+// ============= RAW FILE PARSING =============
+// Parse raw .jsonl session files instead of relying on stats-cache.json
+// stats-cache.json misses ~50% of usage (agent sessions excluded!)
+
+interface DailyParsedStats {
+  // Core metrics
+  promptCount: number;      // User messages only (YOUR engagement)
+  messageCount: number;     // All messages (user + assistant) - kept for backward compat
+  toolCallCount: number;
+
+  // Token metrics
+  inputTokens: number;
+  outputTokens: number;
+  tokensByModel: Record<string, number>;  // model -> tokens
+
+  // Code metrics (from Edit/Write tools)
+  linesWritten: number;     // Lines of code written
+  filesEdited: Set<string>; // Unique file paths edited (stored as Set, serialized as count)
+  commitCount: number;      // Git commits detected
+}
+
+interface ParsedStatsCache {
+  version: number;
+  lastParsedAt: string; // ISO timestamp
+  dailyStats: Record<string, DailyParsedStats>; // date -> stats
+  hourCounts: Record<string, number>; // hour -> message count (for badges)
+  longestSessionMessages: number;
+  firstSessionDate?: string;
+
+  // Aggregate stats (computed across all days)
+  totalFilesEdited: number;  // Unique files across all time
+  languageBreakdown: Record<string, number>;  // extension -> lines written
+}
+
+// Find all .jsonl session files
+async function findSessionFiles(): Promise<string[]> {
+  const files: string[] = [];
+
+  if (!existsSync(CLAUDE_PROJECTS_DIR)) {
+    return files;
+  }
+
+  // Recursively find all .jsonl files
+  async function walkDir(dir: string): Promise<void> {
+    try {
+      const entries = await readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walkDir(fullPath);
+        } else if (entry.name.endsWith('.jsonl')) {
+          files.push(fullPath);
+        }
+      }
+    } catch {
+      // Skip inaccessible directories
+    }
+  }
+
+  await walkDir(CLAUDE_PROJECTS_DIR);
+  return files;
+}
+
+// Check if any file is newer than the cache
+async function anyFileModifiedSince(files: string[], since: string | undefined): Promise<boolean> {
+  if (!since) return true; // No cache, need full parse
+
+  const sinceTime = new Date(since).getTime();
+
+  for (const file of files) {
+    try {
+      const fileStat = await stat(file);
+      if (fileStat.mtimeMs > sinceTime) {
+        return true;
+      }
+    } catch {
+      // Skip inaccessible files
+    }
+  }
+
+  return false;
+}
+
+// Helper: Count lines in a string
+function countLines(str: string): number {
+  if (!str) return 0;
+  return str.split('\n').length;
+}
+
+// Helper: Get file extension from path
+function getExtension(filepath: string): string {
+  const match = filepath.match(/\.([a-zA-Z0-9]+)$/);
+  return match ? match[1].toLowerCase() : 'unknown';
+}
+
+// Helper: Initialize empty daily stats
+function emptyDailyStats(): DailyParsedStats {
+  return {
+    promptCount: 0,
+    messageCount: 0,
+    toolCallCount: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    tokensByModel: {},
+    linesWritten: 0,
+    filesEdited: new Set(),
+    commitCount: 0,
+  };
+}
+
+// Parse a single .jsonl file
+async function parseSessionFile(filepath: string): Promise<{
+  dailyStats: Record<string, DailyParsedStats>;
+  hourCounts: Record<string, number>;
+  sessionMessages: number;
+  firstDate?: string;
+  allFilesEdited: Set<string>;
+  languageLines: Record<string, number>;
+}> {
+  const dailyStats: Record<string, DailyParsedStats> = {};
+  const hourCounts: Record<string, number> = {};
+  const allFilesEdited = new Set<string>();
+  const languageLines: Record<string, number> = {};
+  let sessionMessages = 0;
+  let firstDate: string | undefined;
+
+  try {
+    const fileStream = createReadStream(filepath);
+    const rl = createInterface({ input: fileStream, crlfDelay: Infinity });
+
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+
+      try {
+        const entry = JSON.parse(line);
+        const timestamp = entry.timestamp;
+        if (!timestamp) continue;
+
+        const date = timestamp.slice(0, 10); // "2025-12-12"
+        const hour = timestamp.slice(11, 13); // "14" from "14:30:00"
+
+        // Track first date
+        if (!firstDate || date < firstDate) {
+          firstDate = date;
+        }
+
+        // Get message info
+        const msg = entry.message || {};
+        const role = msg.role;
+        const model = msg.model || '';
+
+        // Initialize daily stats if needed
+        if (!dailyStats[date]) {
+          dailyStats[date] = emptyDailyStats();
+        }
+
+        const dayStats = dailyStats[date];
+
+        // Count prompts (user messages only) and all messages
+        if (role === 'user') {
+          dayStats.promptCount++;
+          dayStats.messageCount++;
+          sessionMessages++;
+          hourCounts[hour] = (hourCounts[hour] || 0) + 1;
+        } else if (role === 'assistant') {
+          dayStats.messageCount++;
+          sessionMessages++;
+          hourCounts[hour] = (hourCounts[hour] || 0) + 1;
+        }
+
+        // Process assistant messages for tool calls and code metrics
+        if (role === 'assistant') {
+          const content = msg.content;
+          if (Array.isArray(content)) {
+            for (const item of content) {
+              if (item && typeof item === 'object' && item.type === 'tool_use') {
+                dayStats.toolCallCount++;
+                const toolName = item.name;
+                const input = item.input || {};
+
+                // Track Edit tool - lines of code written
+                if (toolName === 'Edit' && input.new_string && input.old_string) {
+                  const newLines = countLines(input.new_string);
+                  const oldLines = countLines(input.old_string);
+                  const linesAdded = Math.max(0, newLines - oldLines);
+                  dayStats.linesWritten += linesAdded;
+
+                  if (input.file_path) {
+                    dayStats.filesEdited.add(input.file_path);
+                    allFilesEdited.add(input.file_path);
+                    const ext = getExtension(input.file_path);
+                    languageLines[ext] = (languageLines[ext] || 0) + linesAdded;
+                  }
+                }
+
+                // Track Write tool - new files
+                if (toolName === 'Write' && input.content) {
+                  const lines = countLines(input.content);
+                  dayStats.linesWritten += lines;
+
+                  if (input.file_path) {
+                    dayStats.filesEdited.add(input.file_path);
+                    allFilesEdited.add(input.file_path);
+                    const ext = getExtension(input.file_path);
+                    languageLines[ext] = (languageLines[ext] || 0) + lines;
+                  }
+                }
+
+                // Track git commits from Bash
+                if (toolName === 'Bash' && input.command) {
+                  const cmd = input.command as string;
+                  if (cmd.includes('git commit')) {
+                    dayStats.commitCount++;
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // Extract token usage (only on assistant messages with usage)
+        const usage = msg.usage;
+        if (usage) {
+          const inputTok = usage.input_tokens || 0;
+          const outputTok = usage.output_tokens || 0;
+          dayStats.inputTokens += inputTok;
+          dayStats.outputTokens += outputTok;
+
+          // Track by model
+          if (model) {
+            dayStats.tokensByModel[model] = (dayStats.tokensByModel[model] || 0) + inputTok + outputTok;
+          }
+        }
+      } catch {
+        // Skip malformed lines
+      }
+    }
+  } catch {
+    // Skip inaccessible files
+  }
+
+  return { dailyStats, hourCounts, sessionMessages, firstDate, allFilesEdited, languageLines };
+}
+
+// Parse all session files and aggregate
+async function parseAllSessionFiles(files: string[]): Promise<ParsedStatsCache> {
+  const aggregated: Record<string, DailyParsedStats> = {};
+  const hourCounts: Record<string, number> = {};
+  const allFilesEdited = new Set<string>();
+  const languageBreakdown: Record<string, number> = {};
+  let longestSessionMessages = 0;
+  let firstSessionDate: string | undefined;
+
+  // Parse files in parallel (batched to avoid too many open files)
+  const BATCH_SIZE = 50;
+  for (let i = 0; i < files.length; i += BATCH_SIZE) {
+    const batch = files.slice(i, i + BATCH_SIZE);
+    const results = await Promise.all(batch.map(f => parseSessionFile(f)));
+
+    for (const result of results) {
+      // Track longest session
+      if (result.sessionMessages > longestSessionMessages) {
+        longestSessionMessages = result.sessionMessages;
+      }
+
+      // Track first date
+      if (result.firstDate && (!firstSessionDate || result.firstDate < firstSessionDate)) {
+        firstSessionDate = result.firstDate;
+      }
+
+      // Aggregate all files edited (across all time)
+      for (const file of result.allFilesEdited) {
+        allFilesEdited.add(file);
+      }
+
+      // Aggregate language breakdown
+      for (const [ext, lines] of Object.entries(result.languageLines)) {
+        languageBreakdown[ext] = (languageBreakdown[ext] || 0) + lines;
+      }
+
+      // Aggregate daily stats
+      for (const [date, stats] of Object.entries(result.dailyStats)) {
+        if (!aggregated[date]) {
+          aggregated[date] = emptyDailyStats();
+        }
+        const agg = aggregated[date];
+        agg.promptCount += stats.promptCount;
+        agg.messageCount += stats.messageCount;
+        agg.toolCallCount += stats.toolCallCount;
+        agg.inputTokens += stats.inputTokens;
+        agg.outputTokens += stats.outputTokens;
+        agg.linesWritten += stats.linesWritten;
+        agg.commitCount += stats.commitCount;
+
+        // Merge files edited sets
+        for (const file of stats.filesEdited) {
+          agg.filesEdited.add(file);
+        }
+
+        // Merge tokensByModel
+        for (const [model, tokens] of Object.entries(stats.tokensByModel)) {
+          agg.tokensByModel[model] = (agg.tokensByModel[model] || 0) + tokens;
+        }
+      }
+
+      // Aggregate hour counts
+      for (const [hour, count] of Object.entries(result.hourCounts)) {
+        hourCounts[hour] = (hourCounts[hour] || 0) + count;
+      }
+    }
+  }
+
+  return {
+    version: 2, // Bumped version for new format
+    lastParsedAt: new Date().toISOString(),
+    dailyStats: aggregated,
+    hourCounts,
+    longestSessionMessages,
+    firstSessionDate,
+    totalFilesEdited: allFilesEdited.size,
+    languageBreakdown,
+  };
+}
+
+// Serializable version of DailyParsedStats (Sets converted to counts)
+interface SerializedDailyStats {
+  promptCount: number;
+  messageCount: number;
+  toolCallCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  tokensByModel: Record<string, number>;
+  linesWritten: number;
+  filesEditedCount: number;  // Set converted to count
+  commitCount: number;
+}
+
+interface SerializedCache {
+  version: number;
+  lastParsedAt: string;
+  dailyStats: Record<string, SerializedDailyStats>;
+  hourCounts: Record<string, number>;
+  longestSessionMessages: number;
+  firstSessionDate?: string;
+  totalFilesEdited: number;
+  languageBreakdown: Record<string, number>;
+}
+
+// Load our parsed stats cache
+async function loadParsedCache(): Promise<ParsedStatsCache | null> {
+  try {
+    if (!existsSync(CACHE_FILE)) {
+      return null;
+    }
+    const data = await readFile(CACHE_FILE, 'utf-8');
+    const serialized: SerializedCache = JSON.parse(data);
+
+    // Check version - force re-parse if old format
+    if (serialized.version < 2) {
+      return null;
+    }
+
+    // Convert back to ParsedStatsCache (recreate Sets)
+    const dailyStats: Record<string, DailyParsedStats> = {};
+    for (const [date, stats] of Object.entries(serialized.dailyStats)) {
+      dailyStats[date] = {
+        ...stats,
+        filesEdited: new Set(), // Can't restore actual files, but that's ok
+      };
+    }
+
+    return {
+      ...serialized,
+      dailyStats,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Save our parsed stats cache
+async function saveParsedCache(cache: ParsedStatsCache): Promise<void> {
+  // Convert Sets to counts for JSON serialization
+  const serializedDailyStats: Record<string, SerializedDailyStats> = {};
+  for (const [date, stats] of Object.entries(cache.dailyStats)) {
+    serializedDailyStats[date] = {
+      promptCount: stats.promptCount,
+      messageCount: stats.messageCount,
+      toolCallCount: stats.toolCallCount,
+      inputTokens: stats.inputTokens,
+      outputTokens: stats.outputTokens,
+      tokensByModel: stats.tokensByModel,
+      linesWritten: stats.linesWritten,
+      filesEditedCount: stats.filesEdited.size,
+      commitCount: stats.commitCount,
+    };
+  }
+
+  const serialized: SerializedCache = {
+    version: cache.version,
+    lastParsedAt: cache.lastParsedAt,
+    dailyStats: serializedDailyStats,
+    hourCounts: cache.hourCounts,
+    longestSessionMessages: cache.longestSessionMessages,
+    firstSessionDate: cache.firstSessionDate,
+    totalFilesEdited: cache.totalFilesEdited,
+    languageBreakdown: cache.languageBreakdown,
+  };
+
+  await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  await writeFile(CACHE_FILE, JSON.stringify(serialized, null, 2), { mode: 0o600 });
+}
+
+// Main function to get stats (uses cache if fresh, re-parses if needed)
+async function getRawStats(): Promise<ParsedStatsCache | null> {
+  const files = await findSessionFiles();
+
+  if (files.length === 0) {
+    log.error("No Claude Code session files found");
+    log.dim("Make sure Claude Code is installed and you've used it at least once.");
+    return null;
+  }
+
+  const cache = await loadParsedCache();
+  const needsReparse = await anyFileModifiedSince(files, cache?.lastParsedAt);
+
+  if (!needsReparse && cache) {
+    log.dim(`Using cached stats (${files.length} files unchanged)`);
+    return cache;
+  }
+
+  log.info(`Parsing ${files.length} session files...`);
+  const startTime = Date.now();
+  const parsed = await parseAllSessionFiles(files);
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  log.dim(`Parsed in ${elapsed}s`);
+
+  await saveParsedCache(parsed);
+  return parsed;
+}
+
 interface SyncResponse {
   success: boolean;
   message: string;
@@ -85,11 +547,23 @@ interface SyncResponse {
 // Configuration management
 async function loadConfig(): Promise<Config> {
   try {
-    if (!existsSync(CONFIG_FILE)) {
-      return {};
+    // Check new location first
+    if (existsSync(CONFIG_FILE)) {
+      const data = await readFile(CONFIG_FILE, "utf-8");
+      return JSON.parse(data);
     }
-    const data = await readFile(CONFIG_FILE, "utf-8");
-    return JSON.parse(data);
+
+    // Fall back to legacy location and migrate if found
+    if (existsSync(LEGACY_CONFIG_FILE)) {
+      const data = await readFile(LEGACY_CONFIG_FILE, "utf-8");
+      const config = JSON.parse(data);
+      // Migrate to new location
+      await saveConfig(config);
+      log.dim("Migrated config from ~/.clawd-gg to ~/.config/clawd");
+      return config;
+    }
+
+    return {};
   } catch (error) {
     return {};
   }
@@ -154,6 +628,7 @@ interface BadgeData {
 // API calls
 async function syncStats(
   dailyActivity: DailyActivity[],
+  dailyModelTokens: DailyModelTokens[] | undefined,
   firstSessionDate: string | undefined,
   badgeData: BadgeData,
   token: string
@@ -167,6 +642,7 @@ async function syncStats(
       },
       body: JSON.stringify({
         dailyActivity,
+        dailyModelTokens,
         firstSessionDate,
         ...badgeData,
       }),
@@ -271,10 +747,9 @@ async function cmdSync(forceFullSync: boolean = false): Promise<void> {
     process.exit(1);
   }
 
-  // Load stats
-  log.info("Reading stats from ~/.claude/stats-cache.json...");
-  const stats = await loadStats();
-  if (!stats) {
+  // Load stats from raw session files (not stats-cache.json which misses ~50%!)
+  const rawStats = await getRawStats();
+  if (!rawStats) {
     process.exit(1);
   }
 
@@ -285,23 +760,34 @@ async function cmdSync(forceFullSync: boolean = false): Promise<void> {
     log.warn("Force sync: re-uploading all historical data...");
   }
 
+  // Convert parsed stats to daily activity format (with new metrics)
+  const allDays = Object.entries(rawStats.dailyStats).map(([date, stats]) => ({
+    date,
+    promptCount: stats.promptCount,
+    messageCount: stats.messageCount,
+    toolCallCount: stats.toolCallCount,
+    linesWritten: stats.linesWritten,
+    commitCount: stats.commitCount,
+    sessionCount: 1, // Legacy, kept for backward compat
+  }));
+
   // Filter out today (incomplete) and already-synced days (unless force)
-  let activityToSync = stats.dailyActivity.filter(day => {
-    // Exclude today's date (incomplete data)
-    if (day.date === today) {
-      return false;
-    }
-    // If we have a last sync date, only include newer days
-    if (lastSync && day.date <= lastSync) {
-      return false;
-    }
+  const activityToSync = allDays.filter(day => {
+    if (day.date === today) return false;
+    if (lastSync && day.date <= lastSync) return false;
     return true;
   });
 
+  // Calculate totals
+  const totalPrompts = Object.values(rawStats.dailyStats).reduce((sum, d) => sum + d.promptCount, 0);
+  const totalTokens = Object.values(rawStats.dailyStats).reduce((sum, d) => sum + d.inputTokens + d.outputTokens, 0);
+  const totalLines = Object.values(rawStats.dailyStats).reduce((sum, d) => sum + d.linesWritten, 0);
+
   // Show summary
-  console.log(`${colors.dim}Total messages: ${stats.totalMessages.toLocaleString()}${colors.reset}`);
-  console.log(`${colors.dim}Total sessions: ${stats.totalSessions.toLocaleString()}${colors.reset}`);
-  console.log(`${colors.dim}Days in local stats: ${stats.dailyActivity.length}${colors.reset}`);
+  console.log(`${colors.dim}Total prompts: ${totalPrompts.toLocaleString()}${colors.reset}`);
+  console.log(`${colors.dim}Total tokens: ${formatTokens(totalTokens)} (input + output)${colors.reset}`);
+  console.log(`${colors.dim}Lines written: ${totalLines.toLocaleString()}${colors.reset}`);
+  console.log(`${colors.dim}Days tracked: ${Object.keys(rawStats.dailyStats).length}${colors.reset}`);
 
   if (lastSync) {
     console.log(`${colors.dim}Last synced: ${lastSync}${colors.reset}`);
@@ -325,18 +811,26 @@ async function cmdSync(forceFullSync: boolean = false): Promise<void> {
 
   // Extract badge-relevant data
   const badgeData: BadgeData = {
-    hourCounts: stats.hourCounts,
-    longestSessionMessages: stats.longestSession?.messageCount,
+    hourCounts: rawStats.hourCounts,
+    longestSessionMessages: rawStats.longestSessionMessages,
   };
 
+  // Build token data per day (for the API)
+  const datesToSync = new Set(activityToSync.map(d => d.date));
+  const tokensToSync: DailyModelTokens[] = Object.entries(rawStats.dailyStats)
+    .filter(([date]) => datesToSync.has(date))
+    .map(([date, stats]) => ({
+      date,
+      tokensByModel: { 'raw-parsed': stats.inputTokens + stats.outputTokens },
+    }));
+
   try {
-    const result = await syncStats(activityToSync, stats.firstSessionDate, badgeData, config.token);
+    const result = await syncStats(activityToSync, tokensToSync, rawStats.firstSessionDate, badgeData, config.token);
 
     // Update lastSyncDate in config
     if (result.lastDate) {
       await saveConfig({ ...config, lastSyncDate: result.lastDate });
     } else if (activityToSync.length > 0) {
-      // Fallback: use the latest date we sent (don't assume array is sorted)
       const latestDate = activityToSync.reduce((max, day) =>
         day.date > max ? day.date : max, activityToSync[0]!.date);
       await saveConfig({ ...config, lastSyncDate: latestDate });
@@ -402,6 +896,14 @@ function fmt(n: number): string {
   return n.toLocaleString();
 }
 
+// Format tokens with K/M/B suffix
+function formatTokens(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
+  return n.toString();
+}
+
 interface ProfileData {
   username: string;
   rank: number;
@@ -409,6 +911,7 @@ interface ProfileData {
   totalMessages: number;
   totalSessions: number;
   totalToolCalls: number;
+  totalTokens: number;
   currentStreak: number;
   badges: string[];
 }
@@ -430,7 +933,6 @@ async function fetchProfile(token: string): Promise<ProfileData | null> {
 
 async function cmdStatus(): Promise<void> {
   const config = await loadConfig();
-  const stats = await loadStats();
 
   // If logged in, try to fetch online profile
   let profile: ProfileData | null = null;
@@ -438,16 +940,36 @@ async function cmdStatus(): Promise<void> {
     profile = await fetchProfile(config.token);
   }
 
-  // Calculate local totals
-  const localMessages = stats?.totalMessages || 0;
-  const localSessions = stats?.totalSessions || 0;
-  const localTools = stats?.dailyActivity?.reduce((sum, d) => sum + d.toolCallCount, 0) || 0;
+  // Get local stats from raw files (accurate, includes agent sessions)
+  const rawStats = await getRawStats();
 
-  // Use online data if available, otherwise local
-  const messages = profile?.totalMessages || localMessages;
-  const sessions = profile?.totalSessions || localSessions;
-  const tools = profile?.totalToolCalls || localTools;
-  const maxStat = Math.max(messages, sessions, tools, 1);
+  // Calculate local totals from raw parsed data
+  let localPrompts = 0;
+  let localMessages = 0;
+  let localTokens = 0;
+  let localLines = 0;
+  let localCommits = 0;
+
+  if (rawStats) {
+    for (const stats of Object.values(rawStats.dailyStats)) {
+      localPrompts += stats.promptCount;
+      localMessages += stats.messageCount;
+      localTokens += stats.inputTokens + stats.outputTokens;
+      localLines += stats.linesWritten;
+      localCommits += stats.commitCount;
+    }
+  }
+
+  // Use local data (more accurate than server for now)
+  const prompts = localPrompts;
+  const tokens = localTokens;
+  const lines = localLines;
+  const commits = localCommits;
+  const filesEdited = rawStats?.totalFilesEdited || 0;
+  const tokensPerPrompt = prompts > 0 ? Math.round(tokens / prompts) : 0;
+
+  // For progress bars, scale based on prompts and lines
+  const maxStat = Math.max(prompts, lines, 1);
 
   // Build the ASCII box
   const boxWidth = 45;
@@ -531,18 +1053,47 @@ async function cmdStatus(): Promise<void> {
   // Empty line
   console.log(`${colors.dim}│${colors.reset}${' '.repeat(boxWidth - 2)}${colors.dim}│${colors.reset}`);
 
-  // Stats with progress bars
-  const statLines = [
-    { label: 'Messages', value: messages, color: colors.cyan },
-    { label: 'Sessions', value: sessions, color: colors.magenta },
-    { label: 'Tools', value: tools, color: colors.blue },
-  ];
+  // Primary stat: Prompts sent (YOUR engagement)
+  const promptsLabel = pad('Prompts', 10);
+  const promptsBar = progressBar(prompts, maxStat, 16);
+  const promptsValue = pad(fmt(prompts), 8, 'right');
+  console.log(`${colors.dim}│${colors.reset}  ${promptsLabel}${promptsBar}  ${colors.cyan}${promptsValue}${colors.reset}  ${colors.dim}│${colors.reset}`);
 
-  for (const stat of statLines) {
-    const label = pad(stat.label, 10);
-    const bar = progressBar(stat.value, maxStat, 16);
-    const valueStr = pad(fmt(stat.value), 8, 'right');
-    console.log(`${colors.dim}│${colors.reset}  ${label}${bar}  ${stat.color}${valueStr}${colors.reset}  ${colors.dim}│${colors.reset}`);
+  // Lines of code (if any)
+  if (lines > 0) {
+    const linesLabel = pad('Lines', 10);
+    const linesBar = progressBar(lines, maxStat, 16);
+    const linesValue = pad(fmt(lines), 8, 'right');
+    console.log(`${colors.dim}│${colors.reset}  ${linesLabel}${linesBar}  ${colors.green}${linesValue}${colors.reset}  ${colors.dim}│${colors.reset}`);
+  }
+
+  // Tokens line - the flex stat
+  const tokensLabel = pad('Tokens', 10);
+  const tokensValue = formatTokens(tokens);
+  const tokensPadding = 16 + 2 + 8 - tokensValue.length - 2;
+  console.log(`${colors.dim}│${colors.reset}  ${tokensLabel}${' '.repeat(tokensPadding)}${colors.yellow}${tokensValue} ⚡${colors.reset}  ${colors.dim}│${colors.reset}`);
+
+  // Tokens per prompt (conversation depth)
+  if (tokensPerPrompt > 0) {
+    const tppLabel = pad('', 10);  // No label, it's a sub-stat
+    const tppValue = `${fmt(tokensPerPrompt)} tok/prompt`;
+    const tppPadding = 16 + 2 + 8 - tppValue.length;
+    console.log(`${colors.dim}│${colors.reset}  ${tppLabel}${' '.repeat(tppPadding)}${colors.dim}${tppValue}${colors.reset}  ${colors.dim}│${colors.reset}`);
+  }
+
+  // Secondary stats: Commits, Files (if any)
+  if (commits > 0 || filesEdited > 0) {
+    console.log(`${colors.dim}│${colors.reset}${' '.repeat(boxWidth - 2)}${colors.dim}│${colors.reset}`);
+    let secondaryLine = '  ';
+    if (commits > 0) {
+      secondaryLine += `📦 ${commits} commits`;
+      if (filesEdited > 0) secondaryLine += '  ';
+    }
+    if (filesEdited > 0) {
+      secondaryLine += `📁 ${filesEdited} files`;
+    }
+    const secondaryPadding = innerWidth - secondaryLine.length + 2;
+    console.log(`${colors.dim}│${colors.reset}${secondaryLine}${' '.repeat(Math.max(0, secondaryPadding))}  ${colors.dim}│${colors.reset}`);
   }
 
   // Empty line
@@ -615,7 +1166,8 @@ ${colors.bright}Quick start:${colors.reset}
   ${colors.dim}$ clawd sync    # upload stats${colors.reset}
   ${colors.dim}$ clawd status  # check your rank${colors.reset}
 
-${colors.dim}Stats from: ~/.claude/stats-cache.json${colors.reset}
+${colors.dim}Stats from: ~/.claude/projects/*/*.jsonl (raw session files)${colors.reset}
+${colors.dim}Cache: ~/.config/clawd/cache.json${colors.reset}
 ${colors.dim}Leaderboard: https://clawd.gg${colors.reset}
 `);
 }

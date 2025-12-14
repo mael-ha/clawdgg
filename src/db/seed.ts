@@ -129,31 +129,44 @@ async function seed() {
 
       // Varying activity levels
       const activityLevel = Math.random();
-      let messageCount, sessionCount, toolCallCount;
+      let promptCount, messageCount, toolCallCount, tokenCount, linesWritten, commitCount;
 
       if (activityLevel < 0.2) {
         // Light day
-        messageCount = randomInt(5, 20);
-        sessionCount = randomInt(1, 3);
+        promptCount = randomInt(3, 10);
+        messageCount = promptCount * 2; // Claude responds to each prompt
         toolCallCount = randomInt(10, 50);
+        tokenCount = randomInt(10000, 100000); // 10K - 100K tokens
+        linesWritten = randomInt(0, 200);
+        commitCount = randomInt(0, 2);
       } else if (activityLevel < 0.6) {
         // Medium day
-        messageCount = randomInt(20, 100);
-        sessionCount = randomInt(3, 8);
+        promptCount = randomInt(10, 50);
+        messageCount = promptCount * 2;
         toolCallCount = randomInt(50, 200);
+        tokenCount = randomInt(100000, 500000); // 100K - 500K tokens
+        linesWritten = randomInt(200, 1000);
+        commitCount = randomInt(1, 5);
       } else {
         // Heavy day
-        messageCount = randomInt(100, 500);
-        sessionCount = randomInt(8, 20);
+        promptCount = randomInt(50, 250);
+        messageCount = promptCount * 2;
         toolCallCount = randomInt(200, 1000);
+        tokenCount = randomInt(500000, 2000000); // 500K - 2M tokens
+        linesWritten = randomInt(1000, 5000);
+        commitCount = randomInt(3, 15);
       }
 
       statsToInsert.push({
         userId: user.id,
         date: statDate,
+        promptCount,
         messageCount,
-        sessionCount,
         toolCallCount,
+        tokenCount,
+        linesWritten,
+        commitCount,
+        sessionCount: randomInt(1, 10), // Legacy
         submittedAt: new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000),
       });
     }

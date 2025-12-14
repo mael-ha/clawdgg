@@ -28,6 +28,12 @@
 - [x] CLI celebration moments (new badge, #1, streak record)
 - [x] Leaderboard "You are here" pill + row highlighting
 - [x] CLI commands: `gg`, `logout`, `--version`
+- [x] Token count display (replaced Sessions with Tokens)
+  - [x] Added tokenCount to database schema
+  - [x] CLI parses dailyModelTokens from stats-cache.json
+  - [x] Leaderboard shows Messages | Tools | Tokens
+  - [x] Profile shows token stats
+  - [x] Formatted as K/M/B with ⚡ icon
 
 ### Still Needed
 - [ ] Production deployment setup (VPS)
@@ -84,6 +90,54 @@
 - [ ] Error tracking (Sentry)
 - [ ] Uptime monitoring
 - [ ] Analytics (privacy-respecting)
+
+## Token Data Investigation (2025-12-13)
+
+### What We Discovered
+
+Claude Code has TWO data sources:
+1. **`~/.claude/stats-cache.json`** - Computed periodically (STALE!)
+2. **`~/.claude/projects/<project>/*.jsonl`** - Real-time session data
+
+### The Problem
+
+`stats-cache.json` is NOT real-time:
+- Example: Last computed at 01:06 AM
+- By 4:16 PM, user had 1.3M MORE tokens not in cache
+- Users may see outdated data until Claude Code refreshes the cache
+
+### Token Types
+
+| Type | Description | In dailyModelTokens? |
+|------|-------------|---------------------|
+| inputTokens | Your prompts | ✅ Yes |
+| outputTokens | Claude's responses | ✅ Yes |
+| cacheReadInputTokens | Reused context | ❌ No (aggregate only) |
+| cacheCreationInputTokens | New context cached | ❌ No (aggregate only) |
+
+**We show input+output (not cache)** because cache is repeated context, not new usage.
+
+### Open Questions (Need Investigation)
+
+- [ ] When exactly does stats-cache.json refresh? App start? Background timer?
+- [ ] Compare yesterday's data: stats-cache vs raw .jsonl - are they consistent?
+- [ ] Are agent-*.jsonl sessions included in stats?
+- [ ] Are there gaps in data collection?
+- [ ] Can we trigger a cache refresh from CLI?
+
+### Current Decision
+
+Using `stats-cache.json` because:
+- Official format from Claude Code
+- Simple to parse
+- "Sync at end of day" UX is acceptable (like fitness apps)
+- Parsing raw .jsonl is complex and format may change
+
+### No Cost/Spend Data
+
+There is NO `costUSD` field in any Claude Code data file. Cannot show money spent.
+
+---
 
 ## Known Issues
 

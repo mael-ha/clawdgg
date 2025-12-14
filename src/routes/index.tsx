@@ -263,10 +263,148 @@ const Footer = () => (
   </footer>
 );
 
-// Main page route
+// Dedicated leaderboard page
+app.get('/leaderboard', optionalAuth, async (c) => {
+  const user = c.get('user');
+  const pageSize = 50;
+  const page = parseInt(c.req.query('page') || '1', 10);
+  const period = (c.req.query('period') || 'all') as 'today' | 'week' | 'month' | 'all';
+  const offset = (page - 1) * pageSize;
+
+  // Build date filter
+  let dateFilter = '';
+  const now = new Date();
+  if (period === 'today') {
+    dateFilter = now.toISOString().split('T')[0];
+  } else if (period === 'week') {
+    const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    dateFilter = weekAgo.toISOString().split('T')[0];
+  } else if (period === 'month') {
+    const monthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    dateFilter = monthAgo.toISOString().split('T')[0];
+  }
+
+  // Build query with optional date filter
+  const baseQuery = dateFilter
+    ? sql`${dailyStats.date} >= ${dateFilter}`
+    : sql`1=1`;
+
+  // Fetch leaderboard data
+  const results = await db
+    .select({
+      userId: users.id,
+      githubUsername: users.githubUsername,
+      avatarUrl: users.avatarUrl,
+      promptCount: sql<number>`sum(${dailyStats.promptCount})`.as('total_prompts'),
+      messageCount: sql<number>`sum(${dailyStats.messageCount})`.as('total_messages'),
+      toolCallCount: sql<number>`sum(${dailyStats.toolCallCount})`.as('total_tools'),
+      tokenCount: sql<number>`sum(${dailyStats.tokenCount})`.as('total_tokens'),
+      linesWritten: sql<number>`sum(${dailyStats.linesWritten})`.as('total_lines'),
+      commitCount: sql<number>`sum(${dailyStats.commitCount})`.as('total_commits'),
+      sessionCount: sql<number>`sum(${dailyStats.sessionCount})`.as('total_sessions'),
+    })
+    .from(dailyStats)
+    .innerJoin(users, eq(dailyStats.userId, users.id))
+    .where(baseQuery)
+    .groupBy(users.id, users.githubUsername, users.avatarUrl)
+    .orderBy(desc(sql.raw('total_prompts')))
+    .limit(pageSize)
+    .offset(offset);
+
+  // Get total count
+  const countResult = await db
+    .select({ count: sql<number>`count(distinct ${dailyStats.userId})` })
+    .from(dailyStats)
+    .where(baseQuery);
+  const total = countResult[0]?.count || 0;
+
+  // Get current user's rank if logged in
+  let currentUserRank: number | undefined;
+  if (user) {
+    const userTotalResult = await db
+      .select({
+        total: sql<number>`sum(${dailyStats.promptCount})`,
+      })
+      .from(dailyStats)
+      .where(sql`${dailyStats.userId} = (SELECT id FROM users WHERE github_username = ${user.githubUsername}) AND ${baseQuery}`);
+
+    const userTotal = userTotalResult[0]?.total || 0;
+
+    const rankResult = await db
+      .select({
+        rank: sql<number>`(
+          SELECT COUNT(*) + 1 FROM (
+            SELECT user_id, SUM(prompt_count) as total
+            FROM daily_stats
+            WHERE ${baseQuery}
+            GROUP BY user_id
+            HAVING total > ${userTotal}
+          )
+        )`,
+      })
+      .from(users)
+      .where(eq(users.githubUsername, user.githubUsername));
+    currentUserRank = rankResult[0]?.rank;
+  }
+
+  // Transform to LeaderboardEntry format with correct rank offset
+  const entries: LeaderboardEntry[] = results.map((row, index) => ({
+    rank: offset + index + 1,
+    userId: row.userId,
+    githubUsername: row.githubUsername,
+    avatarUrl: row.avatarUrl,
+    promptCount: row.promptCount || 0,
+    tokenCount: row.tokenCount || 0,
+    linesWritten: row.linesWritten || 0,
+    commitCount: row.commitCount || 0,
+    messageCount: row.messageCount || 0,
+    toolCallCount: row.toolCallCount || 0,
+    sessionCount: row.sessionCount || 0,
+  }));
+
+  return c.html(
+    <Layout title="Leaderboard - clawd.gg" user={user}>
+      <div class="min-h-screen bg-black">
+        {/* Header */}
+        <header class="border-b border-gray-800 py-6 px-4">
+          <div class="max-w-5xl mx-auto flex justify-between items-center">
+            <a href="/" class="text-xl font-bold">
+              <span class="text-gray-100">clawd</span>
+              <span class="text-cyan-400">.gg</span>
+            </a>
+            {user ? (
+              <a href={`/u/${user.githubUsername}`} class="flex items-center gap-2 text-gray-400 hover:text-cyan-400 transition-colors">
+                {user.avatarUrl && <img src={user.avatarUrl} alt={user.githubUsername} class="w-8 h-8 rounded-full" />}
+                <span class="font-mono text-sm">@{user.githubUsername}</span>
+              </a>
+            ) : (
+              <a href="/auth/github" class="text-cyan-400 hover:text-cyan-300 font-mono text-sm">
+                Login with GitHub
+              </a>
+            )}
+          </div>
+        </header>
+
+        <main class="max-w-5xl mx-auto px-4 py-8">
+          <Leaderboard
+            entries={entries}
+            period={period}
+            total={total}
+            page={page}
+            pageSize={pageSize}
+            currentUserId={user?.id}
+            currentUserRank={currentUserRank}
+          />
+        </main>
+      </div>
+    </Layout>
+  );
+});
+
+// Main page route (homepage with preview)
 app.get('/', optionalAuth, async (c) => {
   const user = c.get('user');
-  const pageSize = 42;
+  const pageSize = 10; // Show top 10 preview on homepage
 
   // Fetch real leaderboard data from database
   const results = await db
@@ -274,14 +412,18 @@ app.get('/', optionalAuth, async (c) => {
       userId: users.id,
       githubUsername: users.githubUsername,
       avatarUrl: users.avatarUrl,
+      promptCount: sql<number>`sum(${dailyStats.promptCount})`.as('total_prompts'),
       messageCount: sql<number>`sum(${dailyStats.messageCount})`.as('total_messages'),
-      sessionCount: sql<number>`sum(${dailyStats.sessionCount})`.as('total_sessions'),
       toolCallCount: sql<number>`sum(${dailyStats.toolCallCount})`.as('total_tools'),
+      tokenCount: sql<number>`sum(${dailyStats.tokenCount})`.as('total_tokens'),
+      linesWritten: sql<number>`sum(${dailyStats.linesWritten})`.as('total_lines'),
+      commitCount: sql<number>`sum(${dailyStats.commitCount})`.as('total_commits'),
+      sessionCount: sql<number>`sum(${dailyStats.sessionCount})`.as('total_sessions'),
     })
     .from(dailyStats)
     .innerJoin(users, eq(dailyStats.userId, users.id))
     .groupBy(users.id, users.githubUsername, users.avatarUrl)
-    .orderBy(desc(sql.raw('total_messages')))
+    .orderBy(desc(sql.raw('total_prompts')))
     .limit(pageSize);
 
   // Get total user count
@@ -333,9 +475,13 @@ app.get('/', optionalAuth, async (c) => {
     userId: row.userId,
     githubUsername: row.githubUsername,
     avatarUrl: row.avatarUrl,
+    promptCount: row.promptCount || 0,
+    tokenCount: row.tokenCount || 0,
+    linesWritten: row.linesWritten || 0,
+    commitCount: row.commitCount || 0,
     messageCount: row.messageCount || 0,
-    sessionCount: row.sessionCount || 0,
     toolCallCount: row.toolCallCount || 0,
+    sessionCount: row.sessionCount || 0,
   }));
 
   return c.html(
@@ -345,15 +491,119 @@ app.get('/', optionalAuth, async (c) => {
         totalMessages={heroStats.totalMessages}
         totalToolCalls={heroStats.totalToolCalls}
       />
-      <Leaderboard
-        entries={entries}
-        period="all"
-        total={total}
-        page={1}
-        pageSize={pageSize}
-        currentUserId={user?.id}
-        currentUserRank={currentUserRank}
-      />
+      {/* Leaderboard Preview */}
+      <section id="leaderboard" class="py-16 px-4">
+        <div class="max-w-5xl mx-auto">
+          <div class="text-center mb-8">
+            <h2 class="text-3xl font-bold mb-2">
+              <span class="text-gray-400">[</span>
+              <span class="text-cyan-400">Top 10</span>
+              <span class="text-gray-400">]</span>
+            </h2>
+            <p class="text-gray-500 font-mono text-sm">
+              // The most active Claude Code users
+            </p>
+          </div>
+
+          {/* Leaderboard rows */}
+          <div id="leaderboard-content" class="space-y-2 mb-8">
+            {entries.length > 0 ? (
+              <>
+                <div class="flex items-center gap-4 px-4 py-2 text-gray-500 text-xs font-mono uppercase tracking-wider">
+                  <div class="w-10">Rank</div>
+                  <div class="flex-1">User</div>
+                  <div class="flex items-center gap-2">
+                    <span class="hidden sm:inline">Stats</span>
+                  </div>
+                </div>
+                {entries.map((entry, index) => (
+                  <div
+                    class={`group flex items-center gap-4 p-4 rounded-lg transition-all duration-200 ${
+                      entry.rank <= 3
+                        ? 'bg-gradient-to-r from-gray-900/80 via-gray-900/50 to-transparent border-l-2 ' +
+                          (entry.rank === 1 ? 'border-l-yellow-400' : entry.rank === 2 ? 'border-l-gray-400' : 'border-l-amber-600')
+                        : 'hover:bg-gray-900/50'
+                    } ${user?.id === entry.userId ? 'ring-2 ring-cyan-500/50 shadow-lg shadow-cyan-500/20' : ''}`}
+                  >
+                    {/* Rank badge */}
+                    <div class={`flex items-center justify-center w-10 h-10 rounded-lg ${
+                      entry.rank === 1 ? 'bg-gradient-to-br from-yellow-400 to-amber-600' :
+                      entry.rank === 2 ? 'bg-gradient-to-br from-gray-300 to-gray-500' :
+                      entry.rank === 3 ? 'bg-gradient-to-br from-amber-600 to-amber-800' :
+                      'border border-gray-700'
+                    }`}>
+                      <span class={`font-bold ${entry.rank <= 3 ? 'text-black' : 'text-gray-500 font-mono text-sm'}`}>
+                        {entry.rank}
+                      </span>
+                    </div>
+
+                    {/* User info */}
+                    <div class="flex items-center gap-3 flex-1 min-w-0">
+                      <div class="w-10 h-10 rounded-full bg-gray-800 overflow-hidden">
+                        {entry.avatarUrl ? (
+                          <img src={entry.avatarUrl} alt={entry.githubUsername} class="w-full h-full object-cover" />
+                        ) : (
+                          <div class="w-full h-full flex items-center justify-center text-gray-500 font-mono text-sm">
+                            {entry.githubUsername.slice(0, 2).toUpperCase()}
+                          </div>
+                        )}
+                      </div>
+                      <a href={`/u/${entry.githubUsername}`} class="text-gray-100 font-medium hover:text-cyan-400 transition-colors truncate">
+                        @{entry.githubUsername}
+                      </a>
+                    </div>
+
+                    {/* Stats */}
+                    <div class="flex items-center gap-2 flex-wrap justify-end">
+                      <div class="flex items-center gap-1.5 px-2 py-1 rounded bg-cyan-500/20 text-cyan-400 text-xs font-mono" title="Prompts">
+                        <span>📨</span>
+                        <span>{entry.promptCount.toLocaleString()}</span>
+                      </div>
+                      {entry.linesWritten > 0 && (
+                        <div class="flex items-center gap-1.5 px-2 py-1 rounded bg-green-500/20 text-green-400 text-xs font-mono" title="Lines">
+                          <span>📝</span>
+                          <span>{formatNumber(entry.linesWritten)}</span>
+                        </div>
+                      )}
+                      <div class="flex items-center gap-1.5 px-2 py-1 rounded bg-yellow-500/20 text-yellow-400 text-xs font-mono" title="Tokens">
+                        <span>⚡</span>
+                        <span>{formatNumber(entry.tokenCount)}</span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </>
+            ) : (
+              <div class="text-center py-16">
+                <div class="text-6xl mb-4">🤖</div>
+                <h3 class="text-xl font-bold text-gray-400 mb-2">No data yet...</h3>
+                <p class="text-gray-600 font-mono text-sm">Be the first to climb the leaderboard!</p>
+              </div>
+            )}
+          </div>
+
+          {/* View Full Leaderboard CTA */}
+          {total > 10 && (
+            <div class="text-center">
+              <a
+                href="/leaderboard"
+                class="inline-flex items-center gap-2 px-6 py-3 text-cyan-400 hover:text-cyan-300 border border-cyan-500/30 hover:border-cyan-500/50 rounded-lg font-mono transition-all duration-200 hover:shadow-lg hover:shadow-cyan-500/10"
+              >
+                View Full Leaderboard
+                <span class="text-gray-500">({total} users)</span>
+                <span>&rarr;</span>
+              </a>
+            </div>
+          )}
+
+          {/* Stats footer */}
+          {entries.length > 0 && (
+            <div class="mt-8 pt-6 border-t border-gray-800 flex justify-center gap-8 text-gray-500 text-sm font-mono">
+              <div>Total Users: <span class="text-cyan-400">{total}</span></div>
+            </div>
+          )}
+        </div>
+      </section>
       <HowItWorks />
       <Footer />
     </Layout>

@@ -28,7 +28,14 @@
       "Bash(python3:*)",
       "Bash(head:*)",
       "Bash(wc:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(/Users/maelh/.bun/bin/bunx drizzle-kit push:*)",
+      "Bash(CLAWD_API_URL=\"http://localhost:3001\" /Users/maelh/.bun/bin/bun run:*)",
+      "Bash(# Check when stats were last computed echo \"\"=== Stats file modified ===\"\" ls -la ~/.claude/stats-cache.json echo \"\"\"\" echo \"\"=== Today is ===\"\" date echo \"\"\"\" echo \"\"=== Looking for other data sources ===\"\" find ~/.claude -name \"\"*.json\"\" -type f -newer ~/.claude/stats-cache.json)",
+      "Bash(# Look inside a project folder for session data ls -la ~/.claude/projects/-Users-maelh-code-mael-ha-nomadz-clawdgg/)",
+      "Bash(__NEW_LINE__ echo \"\")",
+      "Bash(# Calculate TODAY''s token usage from raw session files echo \"\"=== Today''s (Dec 13) session files ===\"\" find ~/.claude/projects -name \"\"*.jsonl\"\" -newer ~/.claude/stats-cache.json)",
+      "Bash(echo:*)"
     ]
   }
 }

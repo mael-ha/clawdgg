@@ -2,6 +2,14 @@ import type { FC } from 'hono/jsx';
 import type { LeaderboardEntry } from '../types';
 import { formatBadgesCompact } from '../lib/badges';
 
+// Format tokens with K/M/B suffix
+function formatTokens(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
+  return n.toString();
+}
+
 type Period = 'today' | 'week' | 'month' | 'all';
 
 interface LeaderboardProps {
@@ -151,24 +159,25 @@ const LeaderboardRow: FC<{ entry: LeaderboardEntry; index: number; isCurrentUser
 
       {/* Stats */}
       <div class="flex items-center gap-2 flex-wrap justify-end">
+        {/* Prompts - YOUR engagement */}
         <StatPill
-          label="Messages"
-          value={entry.messageCount}
-          icon="&gt;_"
+          label="Prompts"
+          value={entry.promptCount}
+          icon="📨"
           color="bg-cyan-500/20 text-cyan-400"
         />
-        <StatPill
-          label="Sessions"
-          value={entry.sessionCount}
-          icon="[]"
-          color="bg-magenta-500/20 text-magenta-400"
-        />
-        <StatPill
-          label="Tool Calls"
-          value={entry.toolCallCount}
-          icon="()"
-          color="bg-blue-500/20 text-blue-400"
-        />
+        {/* Lines of code (if any) */}
+        {entry.linesWritten > 0 && (
+          <div class="flex items-center gap-1.5 px-2 py-1 rounded bg-green-500/20 text-green-400 text-xs font-mono" title="Lines Written">
+            <span>📝</span>
+            <span>{formatTokens(entry.linesWritten)}</span>
+          </div>
+        )}
+        {/* Tokens - the flex stat */}
+        <div class="flex items-center gap-1.5 px-2 py-1 rounded bg-yellow-500/20 text-yellow-400 text-xs font-mono" title="Tokens">
+          <span>⚡</span>
+          <span>{formatTokens(entry.tokenCount)}</span>
+        </div>
       </div>
     </div>
   );

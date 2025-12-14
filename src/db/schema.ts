@@ -33,9 +33,20 @@ export const dailyStats = sqliteTable('daily_stats', {
     .notNull()
     .references(() => users.id, { onDelete: 'cascade' }),
   date: text('date').notNull(), // YYYY-MM-DD
-  messageCount: integer('message_count').notNull().default(0),
-  sessionCount: integer('session_count').notNull().default(0),
+
+  // Core metrics
+  promptCount: integer('prompt_count').notNull().default(0),     // User messages only (YOUR engagement)
+  messageCount: integer('message_count').notNull().default(0),   // All messages (kept for backward compat)
   toolCallCount: integer('tool_call_count').notNull().default(0),
+  tokenCount: integer('token_count').notNull().default(0),
+
+  // Code metrics
+  linesWritten: integer('lines_written').notNull().default(0),   // Lines of code written
+  commitCount: integer('commit_count').notNull().default(0),     // Git commits
+
+  // Legacy (kept for backward compat)
+  sessionCount: integer('session_count').notNull().default(0),
+
   submittedAt: integer('submitted_at', { mode: 'timestamp' })
     .notNull()
     .default(sql`(unixepoch())`),
@@ -44,9 +55,12 @@ export const dailyStats = sqliteTable('daily_stats', {
   dateIdx: index('date_idx').on(table.date),
   userIdIdx: index('user_id_idx').on(table.userId),
   // Indexes for leaderboard queries
+  promptCountIdx: index('prompt_count_idx').on(table.promptCount),
   messageCountIdx: index('message_count_idx').on(table.messageCount),
-  sessionCountIdx: index('session_count_idx').on(table.sessionCount),
   toolCallCountIdx: index('tool_call_count_idx').on(table.toolCallCount),
+  tokenCountIdx: index('token_count_idx').on(table.tokenCount),
+  linesWrittenIdx: index('lines_written_idx').on(table.linesWritten),
+  commitCountIdx: index('commit_count_idx').on(table.commitCount),
 }));
 
 // Device auth table (for CLI login flow)

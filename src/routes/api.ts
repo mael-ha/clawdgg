@@ -86,6 +86,15 @@ api.post('/stats', requireAuth, async (c) => {
         .where(eq(users.id, user.id));
     }
 
+    // Build a map of token counts by date from dailyModelTokens
+    const tokensByDate = new Map<string, number>();
+    if (body.dailyModelTokens) {
+      for (const tokenDay of body.dailyModelTokens) {
+        const totalTokens = Object.values(tokenDay.tokensByModel).reduce((a, b) => a + b, 0);
+        tokensByDate.set(tokenDay.date, totalTokens);
+      }
+    }
+
     // UPSERT daily stats for each day in dailyActivity
     let lastDate: string | null = null;
     let daysSubmitted = 0;
@@ -96,21 +105,31 @@ api.post('/stats', requireAuth, async (c) => {
         continue; // Skip invalid dates
       }
 
+      const tokenCount = tokensByDate.get(day.date) || 0;
+
       await db
         .insert(dailyStats)
         .values({
           userId: user.id,
           date: day.date,
+          promptCount: day.promptCount || 0,
           messageCount: day.messageCount || 0,
-          sessionCount: day.sessionCount || 0,
           toolCallCount: day.toolCallCount || 0,
+          tokenCount,
+          linesWritten: day.linesWritten || 0,
+          commitCount: day.commitCount || 0,
+          sessionCount: day.sessionCount || 0,
         })
         .onConflictDoUpdate({
           target: [dailyStats.userId, dailyStats.date],
           set: {
+            promptCount: sql`excluded.prompt_count`,
             messageCount: sql`excluded.message_count`,
-            sessionCount: sql`excluded.session_count`,
             toolCallCount: sql`excluded.tool_call_count`,
+            tokenCount: sql`excluded.token_count`,
+            linesWritten: sql`excluded.lines_written`,
+            commitCount: sql`excluded.commit_count`,
+            sessionCount: sql`excluded.session_count`,
             submittedAt: sql`(unixepoch())`,
           },
         });
@@ -251,9 +270,13 @@ api.get('/leaderboard', optionalAuth, async (c) => {
         githubUsername: users.githubUsername,
         avatarUrl: users.avatarUrl,
         badges: users.badges,
+        promptCount: sql<number>`sum(${dailyStats.promptCount})`.as('total_prompts'),
         messageCount: sql<number>`sum(${dailyStats.messageCount})`.as('total_messages'),
-        sessionCount: sql<number>`sum(${dailyStats.sessionCount})`.as('total_sessions'),
         toolCallCount: sql<number>`sum(${dailyStats.toolCallCount})`.as('total_tools'),
+        tokenCount: sql<number>`sum(${dailyStats.tokenCount})`.as('total_tokens'),
+        linesWritten: sql<number>`sum(${dailyStats.linesWritten})`.as('total_lines'),
+        commitCount: sql<number>`sum(${dailyStats.commitCount})`.as('total_commits'),
+        sessionCount: sql<number>`sum(${dailyStats.sessionCount})`.as('total_sessions'),
       })
       .from(dailyStats)
       .innerJoin(users, eq(dailyStats.userId, users.id));
@@ -301,9 +324,13 @@ api.get('/leaderboard', optionalAuth, async (c) => {
         userId: row.userId,
         githubUsername: row.githubUsername,
         avatarUrl: row.avatarUrl,
+        promptCount: row.promptCount || 0,
+        tokenCount: row.tokenCount || 0,
+        linesWritten: row.linesWritten || 0,
+        commitCount: row.commitCount || 0,
         messageCount: row.messageCount || 0,
-        sessionCount: row.sessionCount || 0,
         toolCallCount: row.toolCallCount || 0,
+        sessionCount: row.sessionCount || 0,
         badges,
       };
     });
@@ -350,6 +377,8 @@ function renderLeaderboardHtml(
 
   const rows = entries.map((entry) => {
     const badgeEmojis = entry.badges ? formatBadgesCompact(entry.badges) : '';
+    const formattedTokens = formatTokensCompact(entry.tokenCount);
+    const formattedLines = entry.linesWritten > 0 ? formatTokensCompact(entry.linesWritten) : '—';
     return `
     <tr class="border-b border-gray-100 hover:bg-gray-50">
       <td class="py-3 px-4 text-center font-medium">${entry.rank}</td>
@@ -366,9 +395,9 @@ function renderLeaderboardHtml(
           ${badgeEmojis ? `<span class="text-sm" title="Badges">${badgeEmojis}</span>` : ''}
         </div>
       </td>
-      <td class="py-3 px-4 text-center">${entry.messageCount.toLocaleString()}</td>
-      <td class="py-3 px-4 text-center">${entry.sessionCount.toLocaleString()}</td>
-      <td class="py-3 px-4 text-center">${entry.toolCallCount.toLocaleString()}</td>
+      <td class="py-3 px-4 text-center">${entry.promptCount.toLocaleString()}</td>
+      <td class="py-3 px-4 text-center">${formattedLines}</td>
+      <td class="py-3 px-4 text-center">${formattedTokens}</td>
     </tr>
   `;
   }).join('');
@@ -383,9 +412,9 @@ function renderLeaderboardHtml(
         <tr class="border-b-2 border-gray-200 text-left">
           <th class="py-3 px-4 text-center w-16">#</th>
           <th class="py-3 px-4">User</th>
-          <th class="py-3 px-4 text-center">Messages</th>
-          <th class="py-3 px-4 text-center">Sessions</th>
-          <th class="py-3 px-4 text-center">Tool Calls</th>
+          <th class="py-3 px-4 text-center">Prompts</th>
+          <th class="py-3 px-4 text-center">Lines</th>
+          <th class="py-3 px-4 text-center">Tokens</th>
         </tr>
       </thead>
       <tbody>
@@ -436,6 +465,14 @@ function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (char) => map[char] || char);
 }
 
+// Helper function to format tokens with K/M/B suffix
+function formatTokensCompact(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
+  return n.toString();
+}
+
 // GET /api/me - Get current user's profile data (requires auth)
 api.get('/me', requireAuth, async (c) => {
   try {
@@ -460,9 +497,13 @@ api.get('/me', requireAuth, async (c) => {
     // Get aggregate stats
     const statsResult = await db
       .select({
+        totalPrompts: sql<number>`sum(${dailyStats.promptCount})`,
         totalMessages: sql<number>`sum(${dailyStats.messageCount})`,
-        totalSessions: sql<number>`sum(${dailyStats.sessionCount})`,
         totalToolCalls: sql<number>`sum(${dailyStats.toolCallCount})`,
+        totalTokens: sql<number>`sum(${dailyStats.tokenCount})`,
+        totalLines: sql<number>`sum(${dailyStats.linesWritten})`,
+        totalCommits: sql<number>`sum(${dailyStats.commitCount})`,
+        totalSessions: sql<number>`sum(${dailyStats.sessionCount})`,
       })
       .from(dailyStats)
       .where(eq(dailyStats.userId, user.id));
@@ -504,9 +545,17 @@ api.get('/me', requireAuth, async (c) => {
       avatarUrl: profile.avatarUrl,
       rank: rankResult[0]?.rank || 1,
       totalUsers: totalUsersResult[0]?.count || 1,
+      // Primary metrics
+      totalPrompts: statsResult[0]?.totalPrompts || 0,
+      totalTokens: statsResult[0]?.totalTokens || 0,
+      // Code metrics
+      totalLines: statsResult[0]?.totalLines || 0,
+      totalCommits: statsResult[0]?.totalCommits || 0,
+      // Legacy (kept for backward compat)
       totalMessages: statsResult[0]?.totalMessages || 0,
-      totalSessions: statsResult[0]?.totalSessions || 0,
       totalToolCalls: statsResult[0]?.totalToolCalls || 0,
+      totalSessions: statsResult[0]?.totalSessions || 0,
+      // Streaks and badges
       currentStreak: profile.currentStreak || 0,
       longestStreak: profile.longestStreak || 0,
       badges,
