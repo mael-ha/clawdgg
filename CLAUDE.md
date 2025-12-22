@@ -1,8 +1,8 @@
 # clawd.gg
 
 ## Now (sync with now.md at session end)
-🟢 HTTP | Blocked: domain | Next: profile UX (token display), then domain
-Last: Updated pricing from official docs, fixed cost display. TODO: "10.9M" feels small—consider showing 2.1B context.
+🟢 HTTP | Blocked: domain | Next: Dashboard V2 Phase 1 (archetype system, hero redesign)
+Last: Deep planning for Dashboard V2. Full plan in `.claude/memento/knowledge/dashboard-v2-plan.md`
 
 ## Deploy
 ```bash

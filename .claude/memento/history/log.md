@@ -4,6 +4,54 @@ Append-only log of work sessions.
 
 ---
 
+## 2025-12-22 (night): Dashboard V2 Deep Planning
+
+**What I did:**
+- Comprehensive planning session for "The Ultimate Claude Code Profile"
+- Spawned 4 Opus sub-agents for parallel research:
+  1. Entry points mapper (CLI/Web/API flows)
+  2. Psychology of flexing (Spotify Wrapped, GitHub stats analysis)
+  3. Design critic (ruthless review, identified "data soup" problem)
+  4. Creative insights (archetypes, derived metrics, novelty stats)
+- Invoked frontend-design skill for visual direction
+- Created 500+ line comprehensive plan document
+
+**Key decisions:**
+- Identity > Numbers (lead with archetype, not raw stats)
+- Cost as hero stat ($2,252 — universally understood)
+- "Terminal Noir" aesthetic (neon on black, cinematic)
+- Three-tier information architecture (Card → Profile → Details)
+- Kill gamification (no badges, no "congratulations!", no mobile game patterns)
+- Voice: Knowing, understated, precise, respectful
+
+**Archetypes defined:**
+- The Context Maximizer (high cache ratio)
+- The Night Owl (60%+ after 8pm)
+- The Marathoner (avg session > 2h)
+- The Opus Connoisseur (70%+ Opus)
+- The Efficiency Expert (top output/input ratio)
+
+**Derived metrics:**
+- Output Leverage (46x)
+- Cache Efficiency (85%)
+- Cost per Line ($0.05)
+- Cost per Commit ($9.62)
+
+**Plan document:** `.claude/memento/knowledge/dashboard-v2-plan.md`
+
+**Phases:**
+1. Core Profile Redesign (archetype system, hero, percentiles)
+2. Token & Model Insights (expandable breakdowns)
+3. Activity Enhancements (hourly chart, better heatmap)
+4. Share Features (OG images, downloadable cards)
+5. Polish (full design system)
+
+**The DNA:** Quiet pride. A mirror, not a scoreboard. Makes invisible AI partnership visible.
+
+**Next:** Start Phase 1 implementation
+
+---
+
 ## 2025-12-22 (evening, late): E2E Testing + Pricing Update
 
 **What I did:**
