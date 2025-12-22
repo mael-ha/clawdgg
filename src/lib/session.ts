@@ -60,9 +60,12 @@ export async function createSession(c: Context, user: SessionUser): Promise<void
   const sessionData = JSON.stringify(user);
   const signedSession = await sign(sessionData);
 
+  // Only use secure cookies if APP_URL is HTTPS (not just production mode)
+  const isHttps = (process.env.APP_URL || '').startsWith('https://');
+
   setCookie(c, SESSION_COOKIE_NAME, signedSession, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
+    secure: isHttps,
     sameSite: 'Lax',
     maxAge: SESSION_MAX_AGE,
     path: '/',

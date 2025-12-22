@@ -1,0 +1,21 @@
+<clickhouse>
+    <!-- Memory settings optimized for 4GB VPS -->
+    <max_server_memory_usage_to_ram_ratio>0.5</max_server_memory_usage_to_ram_ratio>
+
+    <!-- Logging -->
+    <logger>
+        <level>warning</level>
+        <console>true</console>
+    </logger>
+
+    <!-- Listen on all interfaces -->
+    <listen_host>0.0.0.0</listen_host>
+
+    <!-- Disable unnecessary features for resource savings -->
+    <mark_cache_size>536870912</mark_cache_size>
+    <uncompressed_cache_size>536870912</uncompressed_cache_size>
+
+    <!-- Query settings -->
+    <max_concurrent_queries>50</max_concurrent_queries>
+    <max_connections>100</max_connections>
+</clickhouse>

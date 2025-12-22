@@ -4,13 +4,21 @@ import { logger } from 'hono/logger';
 import { serveStatic } from 'hono/bun';
 import auth from './routes/auth';
 import api from './routes/api';
+import otel from './routes/otel';
 import pages from './routes/index';
 import profile from './routes/profile';
+import about from './routes/about';
 import { rateLimit } from './lib/rate-limit';
 import { optionalAuth } from './lib/auth-middleware';
+import { startSyncJob, stopSyncJob } from './jobs/sync-clickhouse';
+import { healthCheck as clickhouseHealthCheck } from './db/clickhouse';
 
 // Create the main Hono app
 const app = new Hono();
+
+// Server state
+let isReady = false;
+let clickhouseHealthy = false;
 
 // Global middleware
 app.use('*', logger());
@@ -21,6 +29,10 @@ app.use(
     credentials: true,
   })
 );
+
+// OTel routes - mounted first with their own auth (no session auth needed)
+// OTel has its own rate limiting built into Claude Code (metrics/60s, logs/5s)
+app.route('/otel', otel);
 
 // Apply optional auth to all routes (so user is available in context)
 app.use('*', optionalAuth);
@@ -35,11 +47,19 @@ app.use('/public/*', serveStatic({ root: './' }));
 app.route('/auth', auth);
 app.route('/api', api);
 app.route('/u', profile);
+app.route('/about', about);
 app.route('/', pages);
 
 // Health check endpoint
 app.get('/health', (c) => {
-  return c.json({ status: 'ok', timestamp: new Date().toISOString() });
+  return c.json({
+    status: isReady ? (clickhouseHealthy ? 'ok' : 'degraded') : 'starting',
+    services: {
+      api: 'ok',
+      clickhouse: clickhouseHealthy ? 'ok' : 'unavailable',
+    },
+    timestamp: new Date().toISOString()
+  });
 });
 
 // 404 handler
@@ -53,8 +73,8 @@ app.onError((err, c) => {
   return c.json({ error: 'Internal Server Error' }, 500);
 });
 
-// Export the app for testing
-export default app;
+// Export the app for testing (not as default to avoid double server start)
+export { app };
 
 // Start the server with Bun
 const port = parseInt(process.env.PORT || '3000', 10);
@@ -67,3 +87,32 @@ Bun.serve({
 });
 
 console.log(`Server running at http://localhost:${port}`);
+
+// Start background sync job (ClickHouse → SQLite) if ClickHouse is available
+(async () => {
+  try {
+    clickhouseHealthy = await clickhouseHealthCheck();
+    if (clickhouseHealthy) {
+      console.log('[startup] ClickHouse is available, starting sync job');
+      startSyncJob();
+    } else {
+      console.log('[startup] ClickHouse not available, sync job disabled');
+      console.log('[startup] To enable: docker compose -f docker-compose.dev.yml up -d');
+    }
+  } catch (error) {
+    console.error('[startup] Failed to initialize background services:', error);
+  } finally {
+    isReady = true;
+  }
+})();
+
+// Graceful shutdown handlers
+async function gracefulShutdown(signal: string) {
+  console.log(`[shutdown] Received ${signal}, shutting down gracefully...`);
+  stopSyncJob();
+  console.log('[shutdown] Shutdown complete');
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));

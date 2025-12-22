@@ -9,12 +9,40 @@ export const users = sqliteTable('users', {
   displayName: text('display_name'),
   avatarUrl: text('avatar_url'),
   firstSessionDate: text('first_session_date'), // YYYY-MM-DD
+
   // Badge-relevant stats (updated on sync)
   badges: text('badges'), // JSON array of badge IDs: ["night_owl", "streak_7", ...]
   hourCounts: text('hour_counts'), // JSON object: {"0": 5, "1": 2, ...}
   longestSessionMessages: integer('longest_session_messages').default(0),
   currentStreak: integer('current_streak').default(0),
   longestStreak: integer('longest_streak').default(0),
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // OTel V2: Cached totals (synced from ClickHouse every 5 min)
+  // ═══════════════════════════════════════════════════════════════════════
+  totalPrompts: integer('total_prompts').default(0),
+  totalTokens: integer('total_tokens').default(0),          // input + output (bigint in practice)
+  totalInputTokens: integer('total_input_tokens').default(0),
+  totalOutputTokens: integer('total_output_tokens').default(0),
+  totalCacheReadTokens: integer('total_cache_read_tokens').default(0),
+  totalCacheCreationTokens: integer('total_cache_creation_tokens').default(0),
+  totalCostUsd: integer('total_cost_usd').default(0),       // Stored as cents (multiply by 100)
+  totalLinesAdded: integer('total_lines_added').default(0),
+  totalCommits: integer('total_commits').default(0),
+  totalPrs: integer('total_prs').default(0),
+  totalActiveSeconds: integer('total_active_seconds').default(0),
+  avgPromptLength: integer('avg_prompt_length').default(0), // Average chars per prompt
+
+  // OTel status
+  otelEnabled: integer('otel_enabled', { mode: 'boolean' }).default(false),
+  otelSetupAt: integer('otel_setup_at', { mode: 'timestamp' }), // When user ran `clawd setup`
+
+  // Token management (extended to 1 year for OTel)
+  tokenExpiresAt: integer('token_expires_at', { mode: 'timestamp' }),
+
+  // Potential future: Anthropic account linking
+  anthropicAccountUuid: text('anthropic_account_uuid'),
+
   createdAt: integer('created_at', { mode: 'timestamp' })
     .notNull()
     .default(sql`(unixepoch())`),
@@ -38,7 +66,16 @@ export const dailyStats = sqliteTable('daily_stats', {
   promptCount: integer('prompt_count').notNull().default(0),     // User messages only (YOUR engagement)
   messageCount: integer('message_count').notNull().default(0),   // All messages (kept for backward compat)
   toolCallCount: integer('tool_call_count').notNull().default(0),
-  tokenCount: integer('token_count').notNull().default(0),
+  tokenCount: integer('token_count').notNull().default(0),       // Legacy: input + output (for backwards compat)
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // V2 Token Breakdown (all 4 types for accurate cost calculation)
+  // ═══════════════════════════════════════════════════════════════════════
+  inputTokens: integer('input_tokens').notNull().default(0),           // New input (billable at full rate)
+  outputTokens: integer('output_tokens').notNull().default(0),         // Responses (billable at output rate)
+  cacheReadTokens: integer('cache_read_tokens').notNull().default(0),  // Cached context reused (0.1x rate)
+  cacheCreationTokens: integer('cache_creation_tokens').notNull().default(0), // New cache (1.25x rate)
+  costUsdCents: integer('cost_usd_cents').notNull().default(0),        // Calculated cost in cents
 
   // Code metrics
   linesWritten: integer('lines_written').notNull().default(0),   // Lines of code written

@@ -240,7 +240,8 @@ clawd.gg/u/${profile.username}`;
           </a>
           {isOwnProfile && (
             <button
-              onclick={`navigator.clipboard.writeText(\`${shareText.replace(/`/g, '\\`')}\`).then(() => { this.textContent = '✓ Copied!'; setTimeout(() => this.textContent = '📋 Share Stats', 2000); })`}
+              data-share-text={shareText}
+              onclick="navigator.clipboard.writeText(this.dataset.shareText).then(() => { this.textContent = '✓ Copied!'; setTimeout(() => this.textContent = '📋 Share Stats', 2000); }).catch(err => console.error('Copy failed:', err));"
               class="flex items-center gap-2 px-4 py-2 bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/30 rounded-lg text-cyan-400 font-mono text-sm transition-colors"
             >
               📋 Share Stats
@@ -430,6 +431,7 @@ const NotFound: FC<{ username: string }> = ({ username }) => (
 );
 
 // Profile route
+// V2: Supports both OTel users (users.total_*) and legacy users (daily_stats)
 app.get('/:username', async (c) => {
   const username = c.req.param('username');
   const currentUser = c.get('user');
@@ -450,23 +452,53 @@ app.get('/:username', async (c) => {
     );
   }
 
-  const userData = user[0];
+  const userData = user[0]!;
+  const isOtelUser = userData.otelEnabled;
 
-  // Fetch aggregate stats
-  const statsResult = await db
-    .select({
-      totalPrompts: sql<number>`sum(${dailyStats.promptCount})`,
-      totalLinesWritten: sql<number>`sum(${dailyStats.linesWritten})`,
-      totalCommits: sql<number>`sum(${dailyStats.commitCount})`,
-      totalMessages: sql<number>`sum(${dailyStats.messageCount})`,
-      totalSessions: sql<number>`sum(${dailyStats.sessionCount})`,
-      totalToolCalls: sql<number>`sum(${dailyStats.toolCallCount})`,
-      totalTokens: sql<number>`sum(${dailyStats.tokenCount})`,
-    })
-    .from(dailyStats)
-    .where(eq(dailyStats.userId, userData.id));
+  // Get stats: use users.total_* for OTel users, sum daily_stats for legacy
+  let totalPrompts: number;
+  let totalLinesWritten: number;
+  let totalCommits: number;
+  let totalTokens: number;
+  let totalMessages: number;
+  let totalSessions: number;
+  let totalToolCalls: number;
 
-  // Fetch daily activity for contribution graph (uses prompts for activity level)
+  if (isOtelUser) {
+    // V2: Use cached totals from users table (synced from ClickHouse)
+    totalPrompts = userData.totalPrompts ?? 0;
+    totalLinesWritten = userData.totalLinesAdded ?? 0;
+    totalCommits = userData.totalCommits ?? 0;
+    totalTokens = userData.totalTokens ?? 0;
+    totalMessages = totalPrompts; // For OTel, prompts = messages
+    totalSessions = 0; // Not tracked in OTel v2
+    totalToolCalls = 0; // Not tracked in OTel v2
+  } else {
+    // V1: Sum from daily_stats
+    const statsResult = await db
+      .select({
+        totalPrompts: sql<number>`sum(${dailyStats.promptCount})`,
+        totalLinesWritten: sql<number>`sum(${dailyStats.linesWritten})`,
+        totalCommits: sql<number>`sum(${dailyStats.commitCount})`,
+        totalMessages: sql<number>`sum(${dailyStats.messageCount})`,
+        totalSessions: sql<number>`sum(${dailyStats.sessionCount})`,
+        totalToolCalls: sql<number>`sum(${dailyStats.toolCallCount})`,
+        totalTokens: sql<number>`sum(${dailyStats.tokenCount})`,
+      })
+      .from(dailyStats)
+      .where(eq(dailyStats.userId, userData.id));
+
+    totalPrompts = statsResult[0]?.totalPrompts ?? 0;
+    totalLinesWritten = statsResult[0]?.totalLinesWritten ?? 0;
+    totalCommits = statsResult[0]?.totalCommits ?? 0;
+    totalTokens = statsResult[0]?.totalTokens ?? 0;
+    totalMessages = statsResult[0]?.totalMessages ?? 0;
+    totalSessions = statsResult[0]?.totalSessions ?? 0;
+    totalToolCalls = statsResult[0]?.totalToolCalls ?? 0;
+  }
+
+  // Fetch daily activity for contribution graph
+  // TODO: For OTel users, query ClickHouse when available
   const dailyActivity = await db
     .select({
       date: dailyStats.date,
@@ -490,29 +522,35 @@ app.get('/:username', async (c) => {
     return { date: d.date, count: d.count, level };
   });
 
-  // Get user rank (by prompts now, not messages)
-  const rankResult = await db
-    .select({
-      rank: sql<number>`(
-        SELECT COUNT(*) + 1 FROM (
-          SELECT user_id, SUM(prompt_count) as total
-          FROM daily_stats
-          GROUP BY user_id
-          HAVING total > (
-            SELECT COALESCE(SUM(prompt_count), 0)
-            FROM daily_stats
-            WHERE user_id = ${userData.id}
-          )
-        )
-      )`,
-    })
-    .from(users)
-    .where(eq(users.id, userData.id));
+  // Get user rank
+  // V2: Count users with higher totalPrompts (mix of OTel and legacy)
+  const rankResult = await db.all(sql`
+    SELECT (
+      SELECT COUNT(*) + 1 FROM (
+        SELECT subq.id FROM (
+          SELECT u.id,
+            CASE
+              WHEN u.otel_enabled = 1 THEN u.total_prompts
+              ELSE COALESCE((SELECT SUM(prompt_count) FROM daily_stats WHERE user_id = u.id), 0)
+            END as total_prompts
+          FROM users u
+          WHERE u.otel_enabled = 1
+             OR EXISTS (SELECT 1 FROM daily_stats WHERE user_id = u.id)
+        ) subq
+        WHERE subq.total_prompts > ${totalPrompts}
+      )
+    ) as rank
+  `) as any[];
+  const rank = rankResult[0]?.rank ?? 1;
 
   // Get total users count
-  const totalUsersResult = await db
-    .select({ count: sql<number>`count(distinct user_id)` })
-    .from(dailyStats);
+  const totalUsersResult = await db.all(sql`
+    SELECT COUNT(*) as count
+    FROM users u
+    WHERE u.otel_enabled = 1
+       OR EXISTS (SELECT 1 FROM daily_stats WHERE user_id = u.id)
+  `) as any[];
+  const totalUsers = totalUsersResult[0]?.count ?? 1;
 
   // Parse badges
   let badges: string[] = [];
@@ -527,19 +565,19 @@ app.get('/:username', async (c) => {
     avatarUrl: userData.avatarUrl,
     firstSessionDate: userData.firstSessionDate,
     badges,
-    currentStreak: userData.currentStreak || 0,
-    longestStreak: userData.longestStreak || 0,
-    // New primary metrics
-    totalPrompts: statsResult[0]?.totalPrompts || 0,
-    totalLinesWritten: statsResult[0]?.totalLinesWritten || 0,
-    totalCommits: statsResult[0]?.totalCommits || 0,
-    totalTokens: statsResult[0]?.totalTokens || 0,
+    currentStreak: userData.currentStreak ?? 0,
+    longestStreak: userData.longestStreak ?? 0,
+    // Primary metrics
+    totalPrompts,
+    totalLinesWritten,
+    totalCommits,
+    totalTokens,
     // Legacy metrics
-    totalMessages: statsResult[0]?.totalMessages || 0,
-    totalSessions: statsResult[0]?.totalSessions || 0,
-    totalToolCalls: statsResult[0]?.totalToolCalls || 0,
-    rank: rankResult[0]?.rank || 1,
-    totalUsers: totalUsersResult[0]?.count || 1,
+    totalMessages,
+    totalSessions,
+    totalToolCalls,
+    rank,
+    totalUsers,
   };
 
   return c.html(

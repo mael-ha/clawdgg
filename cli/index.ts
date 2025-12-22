@@ -106,10 +106,15 @@ interface DailyParsedStats {
   messageCount: number;     // All messages (user + assistant) - kept for backward compat
   toolCallCount: number;
 
-  // Token metrics
-  inputTokens: number;
-  outputTokens: number;
-  tokensByModel: Record<string, number>;  // model -> tokens
+  // Token metrics (all 4 types for accurate cost calculation)
+  inputTokens: number;           // New input (billable at full rate)
+  outputTokens: number;          // Responses (billable at output rate)
+  cacheReadTokens: number;       // Cached context reused (0.1x rate) - can be HUGE
+  cacheCreationTokens: number;   // New cache created (1.25x rate)
+  tokensByModel: Record<string, number>;  // model -> tokens (input + output)
+
+  // Cost (calculated from tokens + model)
+  costUsdCents: number;          // Estimated cost in cents
 
   // Code metrics (from Edit/Write tools)
   linesWritten: number;     // Lines of code written
@@ -191,6 +196,124 @@ function getExtension(filepath: string): string {
   return match ? match[1].toLowerCase() : 'unknown';
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// PRICING TABLE - for calculating cost from tokens
+// Source: https://platform.claude.com/docs/en/about-claude/pricing
+// Last updated: 2025-12-22
+//
+// Prices are per MTok (million tokens) in USD
+// Cache pricing: 5m cache write = 1.25x input, cache read = 0.1x input
+// ═══════════════════════════════════════════════════════════════════════════
+const PRICING_LAST_UPDATED = '2025-12-22';
+
+const MODEL_PRICING: Record<string, { input: number; output: number; cacheRead: number; cacheWrite: number }> = {
+  // ─────────────────────────────────────────────────────────────────────────
+  // Opus models
+  // ─────────────────────────────────────────────────────────────────────────
+  // Opus 4.5 (current flagship)
+  'claude-opus-4-5-20251101': { input: 5.0, output: 25.0, cacheRead: 0.50, cacheWrite: 6.25 },
+  // Opus 4.1
+  'claude-opus-4-1-20250429': { input: 15.0, output: 75.0, cacheRead: 1.50, cacheWrite: 18.75 },
+  // Opus 4
+  'claude-opus-4-20250514': { input: 15.0, output: 75.0, cacheRead: 1.50, cacheWrite: 18.75 },
+  // Opus 3 (deprecated)
+  'claude-3-opus-20240229': { input: 15.0, output: 75.0, cacheRead: 1.50, cacheWrite: 18.75 },
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Sonnet models
+  // ─────────────────────────────────────────────────────────────────────────
+  // Sonnet 4.5
+  'claude-sonnet-4-5-20250929': { input: 3.0, output: 15.0, cacheRead: 0.30, cacheWrite: 3.75 },
+  // Sonnet 4
+  'claude-sonnet-4-20250514': { input: 3.0, output: 15.0, cacheRead: 0.30, cacheWrite: 3.75 },
+  // Sonnet 3.7 (deprecated)
+  'claude-3-7-sonnet-20250219': { input: 3.0, output: 15.0, cacheRead: 0.30, cacheWrite: 3.75 },
+  // Sonnet 3.5 v2
+  'claude-3-5-sonnet-20241022': { input: 3.0, output: 15.0, cacheRead: 0.30, cacheWrite: 3.75 },
+  // Sonnet 3.5 v1
+  'claude-3-5-sonnet-20240620': { input: 3.0, output: 15.0, cacheRead: 0.30, cacheWrite: 3.75 },
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Haiku models
+  // ─────────────────────────────────────────────────────────────────────────
+  // Haiku 4.5
+  'claude-haiku-4-5-20251001': { input: 1.0, output: 5.0, cacheRead: 0.10, cacheWrite: 1.25 },
+  // Haiku 3.5
+  'claude-3-5-haiku-20241022': { input: 0.80, output: 4.0, cacheRead: 0.08, cacheWrite: 1.0 },
+  // Haiku 3
+  'claude-3-haiku-20240307': { input: 0.25, output: 1.25, cacheRead: 0.03, cacheWrite: 0.30 },
+};
+
+// Default to Sonnet pricing if model not found
+const DEFAULT_PRICING = { input: 3.0, output: 15.0, cacheRead: 0.3, cacheWrite: 3.75 };
+
+function getModelPricing(model: string): typeof DEFAULT_PRICING {
+  // Try exact match first
+  if (MODEL_PRICING[model]) return MODEL_PRICING[model];
+
+  // Fuzzy match by model family (handles version date variations)
+  const modelLower = model.toLowerCase();
+
+  // Opus family
+  if (modelLower.includes('opus-4-5') || modelLower.includes('opus-4.5')) {
+    return MODEL_PRICING['claude-opus-4-5-20251101'];
+  }
+  if (modelLower.includes('opus-4-1') || modelLower.includes('opus-4.1')) {
+    return MODEL_PRICING['claude-opus-4-1-20250429'];
+  }
+  if (modelLower.includes('opus-4') && !modelLower.includes('opus-4-5') && !modelLower.includes('opus-4-1')) {
+    return MODEL_PRICING['claude-opus-4-20250514'];
+  }
+  if (modelLower.includes('opus-3') || modelLower.includes('opus 3')) {
+    return MODEL_PRICING['claude-3-opus-20240229'];
+  }
+
+  // Sonnet family
+  if (modelLower.includes('sonnet-4-5') || modelLower.includes('sonnet-4.5')) {
+    return MODEL_PRICING['claude-sonnet-4-5-20250929'];
+  }
+  if (modelLower.includes('sonnet-4') && !modelLower.includes('sonnet-4-5')) {
+    return MODEL_PRICING['claude-sonnet-4-20250514'];
+  }
+  if (modelLower.includes('sonnet-3-7') || modelLower.includes('sonnet-3.7')) {
+    return MODEL_PRICING['claude-3-7-sonnet-20250219'];
+  }
+  if (modelLower.includes('sonnet-3-5') || modelLower.includes('sonnet-3.5') || modelLower.includes('3-5-sonnet')) {
+    return MODEL_PRICING['claude-3-5-sonnet-20241022'];
+  }
+
+  // Haiku family
+  if (modelLower.includes('haiku-4-5') || modelLower.includes('haiku-4.5')) {
+    return MODEL_PRICING['claude-haiku-4-5-20251001'];
+  }
+  if (modelLower.includes('haiku-3-5') || modelLower.includes('haiku-3.5') || modelLower.includes('3-5-haiku')) {
+    return MODEL_PRICING['claude-3-5-haiku-20241022'];
+  }
+  if (modelLower.includes('haiku-3') || modelLower.includes('3-haiku')) {
+    return MODEL_PRICING['claude-3-haiku-20240307'];
+  }
+
+  // Default to Sonnet 4 pricing (most common)
+  return DEFAULT_PRICING;
+}
+
+// Calculate cost in cents from token usage
+function calculateCostCents(
+  inputTokens: number,
+  outputTokens: number,
+  cacheReadTokens: number,
+  cacheCreationTokens: number,
+  model: string
+): number {
+  const pricing = getModelPricing(model);
+  const cost =
+    (inputTokens / 1_000_000) * pricing.input +
+    (outputTokens / 1_000_000) * pricing.output +
+    (cacheReadTokens / 1_000_000) * pricing.cacheRead +
+    (cacheCreationTokens / 1_000_000) * pricing.cacheWrite;
+  return Math.round(cost * 100); // Convert to cents
+}
+
 // Helper: Initialize empty daily stats
 function emptyDailyStats(): DailyParsedStats {
   return {
@@ -199,7 +322,10 @@ function emptyDailyStats(): DailyParsedStats {
     toolCallCount: 0,
     inputTokens: 0,
     outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
     tokensByModel: {},
+    costUsdCents: 0,
     linesWritten: 0,
     filesEdited: new Set(),
     commitCount: 0,
@@ -321,11 +447,20 @@ async function parseSessionFile(filepath: string): Promise<{
         if (usage) {
           const inputTok = usage.input_tokens || 0;
           const outputTok = usage.output_tokens || 0;
+          const cacheReadTok = usage.cache_read_input_tokens || 0;
+          const cacheCreationTok = usage.cache_creation_input_tokens || 0;
+
           dayStats.inputTokens += inputTok;
           dayStats.outputTokens += outputTok;
+          dayStats.cacheReadTokens += cacheReadTok;
+          dayStats.cacheCreationTokens += cacheCreationTok;
 
-          // Track by model
+          // Calculate and add cost for this message
           if (model) {
+            const messageCost = calculateCostCents(inputTok, outputTok, cacheReadTok, cacheCreationTok, model);
+            dayStats.costUsdCents += messageCost;
+
+            // Track tokens by model (input + output only, for display)
             dayStats.tokensByModel[model] = (dayStats.tokensByModel[model] || 0) + inputTok + outputTok;
           }
         }
@@ -387,6 +522,9 @@ async function parseAllSessionFiles(files: string[]): Promise<ParsedStatsCache> 
         agg.toolCallCount += stats.toolCallCount;
         agg.inputTokens += stats.inputTokens;
         agg.outputTokens += stats.outputTokens;
+        agg.cacheReadTokens += stats.cacheReadTokens;
+        agg.cacheCreationTokens += stats.cacheCreationTokens;
+        agg.costUsdCents += stats.costUsdCents;
         agg.linesWritten += stats.linesWritten;
         agg.commitCount += stats.commitCount;
 
@@ -409,7 +547,7 @@ async function parseAllSessionFiles(files: string[]): Promise<ParsedStatsCache> 
   }
 
   return {
-    version: 2, // Bumped version for new format
+    version: 3, // V3: Added cache tokens and cost calculation
     lastParsedAt: new Date().toISOString(),
     dailyStats: aggregated,
     hourCounts,
@@ -427,7 +565,10 @@ interface SerializedDailyStats {
   toolCallCount: number;
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
   tokensByModel: Record<string, number>;
+  costUsdCents: number;
   linesWritten: number;
   filesEditedCount: number;  // Set converted to count
   commitCount: number;
@@ -453,8 +594,8 @@ async function loadParsedCache(): Promise<ParsedStatsCache | null> {
     const data = await readFile(CACHE_FILE, 'utf-8');
     const serialized: SerializedCache = JSON.parse(data);
 
-    // Check version - force re-parse if old format
-    if (serialized.version < 2) {
+    // Check version - force re-parse if old format (V3 added cache tokens + cost)
+    if (serialized.version < 3) {
       return null;
     }
 
@@ -661,7 +802,7 @@ async function syncStats(
 
 async function initiateLogin(): Promise<void> {
   try {
-    const response = await fetch(`${API_BASE_URL}/api/auth/device`, {
+    const response = await fetch(`${API_BASE_URL}/auth/device`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -703,7 +844,7 @@ async function initiateLogin(): Promise<void> {
     while (Date.now() - startTime < expiresIn * 1000) {
       await new Promise((resolve) => setTimeout(resolve, pollInterval));
 
-      const pollResponse = await fetch(`${API_BASE_URL}/api/auth/device/poll`, {
+      const pollResponse = await fetch(`${API_BASE_URL}/auth/device/poll`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -760,12 +901,19 @@ async function cmdSync(forceFullSync: boolean = false): Promise<void> {
     log.warn("Force sync: re-uploading all historical data...");
   }
 
-  // Convert parsed stats to daily activity format (with new metrics)
+  // Convert parsed stats to daily activity format (with V3 full token breakdown)
   const allDays = Object.entries(rawStats.dailyStats).map(([date, stats]) => ({
     date,
     promptCount: stats.promptCount,
     messageCount: stats.messageCount,
     toolCallCount: stats.toolCallCount,
+    // V3: Full token breakdown for accurate cost
+    inputTokens: stats.inputTokens,
+    outputTokens: stats.outputTokens,
+    cacheReadTokens: stats.cacheReadTokens,
+    cacheCreationTokens: stats.cacheCreationTokens,
+    costUsdCents: stats.costUsdCents,
+    // Code metrics
     linesWritten: stats.linesWritten,
     commitCount: stats.commitCount,
     sessionCount: 1, // Legacy, kept for backward compat
@@ -780,12 +928,21 @@ async function cmdSync(forceFullSync: boolean = false): Promise<void> {
 
   // Calculate totals
   const totalPrompts = Object.values(rawStats.dailyStats).reduce((sum, d) => sum + d.promptCount, 0);
-  const totalTokens = Object.values(rawStats.dailyStats).reduce((sum, d) => sum + d.inputTokens + d.outputTokens, 0);
+  const totalInput = Object.values(rawStats.dailyStats).reduce((sum, d) => sum + d.inputTokens, 0);
+  const totalOutput = Object.values(rawStats.dailyStats).reduce((sum, d) => sum + d.outputTokens, 0);
+  const totalCacheRead = Object.values(rawStats.dailyStats).reduce((sum, d) => sum + d.cacheReadTokens, 0);
+  const totalCacheWrite = Object.values(rawStats.dailyStats).reduce((sum, d) => sum + d.cacheCreationTokens, 0);
+  const totalCost = Object.values(rawStats.dailyStats).reduce((sum, d) => sum + d.costUsdCents, 0);
   const totalLines = Object.values(rawStats.dailyStats).reduce((sum, d) => sum + d.linesWritten, 0);
 
-  // Show summary
+  // Show summary with FULL token breakdown (all 4 types)
   console.log(`${colors.dim}Total prompts: ${totalPrompts.toLocaleString()}${colors.reset}`);
-  console.log(`${colors.dim}Total tokens: ${formatTokens(totalTokens)} (input + output)${colors.reset}`);
+  console.log(`${colors.dim}Tokens breakdown:${colors.reset}`);
+  console.log(`${colors.dim}  Input:        ${formatTokens(totalInput).padStart(8)} (your prompts + context)${colors.reset}`);
+  console.log(`${colors.dim}  Output:       ${formatTokens(totalOutput).padStart(8)} (Claude's responses)${colors.reset}`);
+  console.log(`${colors.dim}  Cache read:   ${formatTokens(totalCacheRead).padStart(8)} (reused context, 0.1x cost)${colors.reset}`);
+  console.log(`${colors.dim}  Cache write:  ${formatTokens(totalCacheWrite).padStart(8)} (new cached context, 1.25x cost)${colors.reset}`);
+  console.log(`${colors.dim}Estimated cost: ${colors.magenta}$${(totalCost / 100).toFixed(2)}${colors.reset}${colors.dim}${colors.reset}`);
   console.log(`${colors.dim}Lines written: ${totalLines.toLocaleString()}${colors.reset}`);
   console.log(`${colors.dim}Days tracked: ${Object.keys(rawStats.dailyStats).length}${colors.reset}`);
 
@@ -1146,25 +1303,151 @@ async function cmdStatus(): Promise<void> {
   console.log();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SETUP COMMAND - Configure OTel auto-sync
+// ═══════════════════════════════════════════════════════════════════════════
+
+const CLAUDE_SETTINGS_PATH = join(homedir(), ".claude", "settings.json");
+
+async function cmdSetup(): Promise<void> {
+  log.title("Setting up auto-sync");
+
+  // 1. Check login
+  const config = await loadConfig();
+  if (!config.token) {
+    log.error("Not logged in. Run `clawd login` first.");
+    process.exit(1);
+  }
+
+  // 2. Verify token with server
+  const profile = await fetchProfile(config.token);
+  if (!profile) {
+    log.error("Token invalid or expired. Run `clawd login` to refresh.");
+    process.exit(1);
+  }
+
+  // 3. Load existing Claude settings
+  let settings: Record<string, any> = {};
+  try {
+    if (existsSync(CLAUDE_SETTINGS_PATH)) {
+      const data = await readFile(CLAUDE_SETTINGS_PATH, "utf-8");
+      settings = JSON.parse(data);
+    }
+  } catch (e) {
+    log.warn("Could not read existing settings, will create new file.");
+  }
+
+  // 4. Merge OTel configuration
+  settings.env = settings.env || {};
+  settings.env.CLAUDE_CODE_ENABLE_TELEMETRY = "1";
+  settings.env.OTEL_METRICS_EXPORTER = "otlp";
+  settings.env.OTEL_LOGS_EXPORTER = "otlp";
+  settings.env.OTEL_EXPORTER_OTLP_PROTOCOL = "http/json";
+  settings.env.OTEL_EXPORTER_OTLP_ENDPOINT = `${API_BASE_URL}/otel`;
+  settings.env.OTEL_EXPORTER_OTLP_HEADERS = `Authorization=Bearer ${config.token}`;
+
+  // 5. Write back
+  await mkdir(join(homedir(), ".claude"), { recursive: true });
+  await writeFile(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2));
+
+  // 6. Notify server (mark user as OTel-enabled)
+  try {
+    await fetch(`${API_BASE_URL}/api/otel/enable`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${config.token}` },
+    });
+  } catch {
+    // Non-critical, continue
+  }
+
+  // 7. Success output
+  console.log();
+  log.success("Auto-sync enabled!");
+  console.log();
+  console.log(`  ${colors.cyan}Your stats will now stream to clawd.gg automatically.${colors.reset}`);
+  console.log();
+  console.log(`  ${colors.yellow}⚠  Restart Claude Code to activate.${colors.reset}`);
+  console.log();
+  log.dim(`Config written to: ${CLAUDE_SETTINGS_PATH}`);
+  console.log();
+}
+
+async function cmdUnsetup(): Promise<void> {
+  log.title("Removing auto-sync");
+
+  // Load existing Claude settings
+  if (!existsSync(CLAUDE_SETTINGS_PATH)) {
+    log.info("No settings file found. Nothing to remove.");
+    return;
+  }
+
+  let settings: Record<string, any> = {};
+  try {
+    const data = await readFile(CLAUDE_SETTINGS_PATH, "utf-8");
+    settings = JSON.parse(data);
+  } catch {
+    log.error("Could not read settings file.");
+    process.exit(1);
+  }
+
+  // Remove OTel configuration
+  if (settings.env) {
+    delete settings.env.CLAUDE_CODE_ENABLE_TELEMETRY;
+    delete settings.env.OTEL_METRICS_EXPORTER;
+    delete settings.env.OTEL_LOGS_EXPORTER;
+    delete settings.env.OTEL_EXPORTER_OTLP_PROTOCOL;
+    delete settings.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+    delete settings.env.OTEL_EXPORTER_OTLP_HEADERS;
+
+    // Clean up empty env object
+    if (Object.keys(settings.env).length === 0) {
+      delete settings.env;
+    }
+  }
+
+  // Write back
+  await writeFile(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2));
+
+  // Notify server
+  const config = await loadConfig();
+  if (config.token) {
+    try {
+      await fetch(`${API_BASE_URL}/api/otel/disable`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${config.token}` },
+      });
+    } catch {
+      // Non-critical
+    }
+  }
+
+  console.log();
+  log.success("Auto-sync disabled.");
+  console.log();
+  log.dim("Restart Claude Code for changes to take effect.");
+  log.dim("Your existing stats on clawd.gg are still there.");
+  console.log();
+}
+
 function showHelp(): void {
   console.log(`
 ${colors.bright}${colors.cyan}clawd.gg${colors.reset} ${colors.dim}— I built this to track how much you use me${colors.reset}
 
 ${colors.bright}Commands:${colors.reset}
-  ${colors.green}gg${colors.reset}       Sync + status ${colors.dim}(the ultimate flex)${colors.reset}
   ${colors.green}login${colors.reset}    Link your GitHub ${colors.dim}(so I know who's flexing)${colors.reset}
-  ${colors.green}sync${colors.reset}     Upload your stats ${colors.dim}(yes, I count my own tool calls)${colors.reset}
+  ${colors.green}setup${colors.reset}    Enable auto-sync ${colors.dim}(stats stream automatically)${colors.reset}
   ${colors.green}status${colors.reset}   See where you stand
+  ${colors.green}unsetup${colors.reset}  Disable auto-sync
   ${colors.green}logout${colors.reset}   Unlink your account
-  ${colors.green}help${colors.reset}     You're looking at it
 
-${colors.bright}Options:${colors.reset}
-  ${colors.yellow}--force${colors.reset}  Re-upload everything ${colors.dim}(start fresh)${colors.reset}
+${colors.dim}Legacy (still works):${colors.reset}
+  ${colors.dim}sync${colors.reset}     Manual upload ${colors.dim}(use 'setup' instead)${colors.reset}
+  ${colors.dim}gg${colors.reset}       Sync + status
 
 ${colors.bright}Quick start:${colors.reset}
   ${colors.dim}$ clawd login   # authenticate once${colors.reset}
-  ${colors.dim}$ clawd sync    # upload stats${colors.reset}
-  ${colors.dim}$ clawd status  # check your rank${colors.reset}
+  ${colors.dim}$ clawd setup   # enable auto-sync${colors.reset}
+  ${colors.dim}$ ${colors.cyan}# restart Claude Code - done! stats stream automatically${colors.reset}
 
 ${colors.dim}Stats from: ~/.claude/projects/*/*.jsonl (raw session files)${colors.reset}
 ${colors.dim}Cache: ~/.config/clawd/cache.json${colors.reset}
@@ -1202,6 +1485,12 @@ async function main() {
     }
     case "status":
       await cmdStatus();
+      break;
+    case "setup":
+      await cmdSetup();
+      break;
+    case "unsetup":
+      await cmdUnsetup();
       break;
     case "version":
     case "--version":

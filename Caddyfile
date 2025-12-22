@@ -1,0 +1,33 @@
+# Production Caddyfile for clawd.gg
+# Caddy automatically handles HTTPS via Let's Encrypt
+
+{
+    email admin@clawd.gg
+}
+
+clawd.gg {
+    # Reverse proxy to the app
+    reverse_proxy app:3000
+
+    # Enable compression
+    encode gzip zstd
+
+    # Security headers
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        -Server
+    }
+
+    # Logging
+    log {
+        output file /var/log/caddy/access.log
+        format json
+    }
+}
+
+# Redirect www to non-www
+www.clawd.gg {
+    redir https://clawd.gg{uri} permanent
+}

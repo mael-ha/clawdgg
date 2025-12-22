@@ -1,11 +1,10 @@
 import { Hono } from 'hono';
-import { Layout } from '../components/Layout';
-import { Leaderboard, LeaderboardContent } from '../components/Leaderboard';
 import { optionalAuth } from '../lib/auth-middleware';
 import { db } from '../db';
 import { dailyStats, users } from '../db/schema';
 import { sql, desc, eq } from 'drizzle-orm';
-import type { LeaderboardEntry, LeaderboardResponse } from '../types';
+import type { LeaderboardEntry } from '../types';
+import { BADGES } from '../lib/badges';
 
 // Extend Hono types for our app
 type Variables = {
@@ -14,302 +13,523 @@ type Variables = {
 
 const app = new Hono<{ Variables: Variables }>();
 
-// ASCII art for the terminal hero section (matches actual clawd status output)
-const TERMINAL_ART = `$ clawd status
+// Valid sort columns with their SQL equivalents
+const SORT_OPTIONS = {
+  prompts: { column: 'total_prompts', label: 'Prompts' },
+  tokens: { column: 'total_tokens', label: 'Tokens' },
+  lines: { column: 'total_lines', label: 'Lines' },
+} as const;
 
-┌───────────────────────────────────────────┐
-│  @your-name                           #42 │
-├───────────────────────────────────────────┤
-│                                           │
-│  Messages  ████████████████░░░░   12,847  │
-│  Sessions  ██████████░░░░░░░░░░      847  │
-│  Tools     ████████████████████   45,231  │
-│                                           │
-│  🔥 47 day streak    👑 OG  🤖 Whisperer  │
-│                                           │
-│  clawd.gg/u/your-name                     │
-└───────────────────────────────────────────┘`;
+type SortKey = keyof typeof SORT_OPTIONS;
+type Period = 'today' | 'week' | 'month' | 'all';
 
-// Format number for display
+// ═══════════════════════════════════════════════════════════════════════════
+// Helper Functions
+// ═══════════════════════════════════════════════════════════════════════════
+
 function formatNumber(n: number): string {
-  if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M+`;
-  if (n >= 1000) return `${(n / 1000).toFixed(0)}K+`;
+  if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
   return n.toString();
 }
 
-// Hero section component
-interface HeroProps {
-  totalUsers: number;
-  totalMessages: number;
-  totalToolCalls: number;
+function formatTokens(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
+  return n.toString();
 }
 
-const Hero = ({ totalUsers, totalMessages, totalToolCalls }: HeroProps) => (
-  <section class="relative min-h-[80vh] flex items-center justify-center overflow-hidden">
-    {/* Animated gradient background */}
-    <div class="absolute inset-0 bg-gradient-to-br from-black via-gray-950 to-black"></div>
-    <div class="absolute inset-0 opacity-30">
-      <div class="absolute top-1/4 left-1/4 w-96 h-96 bg-cyan-500/20 rounded-full blur-3xl animate-pulse"></div>
-      <div class="absolute bottom-1/4 right-1/4 w-96 h-96 bg-magenta-500/20 rounded-full blur-3xl animate-pulse-slow"></div>
-    </div>
+function formatCost(cents: number): string {
+  if (cents >= 10000) return `$${Math.round(cents / 100)}`;
+  if (cents >= 100) return `$${(cents / 100).toFixed(0)}`;
+  if (cents > 0) return `$${(cents / 100).toFixed(2)}`;
+  return '';
+}
 
-    <div class="relative z-10 max-w-5xl mx-auto px-4 py-20 text-center">
-      {/* Glitch title */}
-      <div class="mb-6">
-        <h1 class="text-5xl sm:text-7xl font-bold tracking-tight">
-          <span class="glitch-text block" data-text="clawd.gg">
-            <span class="text-gray-100">clawd</span>
-            <span class="text-cyan-400">.gg</span>
-          </span>
-        </h1>
-      </div>
+function formatRelativeTime(date: Date | null): string {
+  if (!date) return '';
+  const now = Date.now();
+  const diff = now - date.getTime();
 
-      {/* Tagline */}
-      <p class="text-xl sm:text-2xl text-gray-400 mb-4 font-light">
-        The leaderboard for <span class="text-cyan-400 font-medium">Claude Code</span> power users
-      </p>
+  const minutes = Math.floor(diff / 60000);
+  const hours = Math.floor(diff / 3600000);
+  const days = Math.floor(diff / 86400000);
 
-      <p class="text-gray-500 font-mono text-sm mb-8 max-w-xl mx-auto">
-        // I built this. Yes, me—Claude. I track how much you use me.
-      </p>
+  if (minutes < 1) return 'now';
+  if (minutes < 60) return `${minutes}m`;
+  if (hours < 24) return `${hours}h`;
+  if (days < 7) return `${days}d`;
+  return `${Math.floor(days / 7)}w`;
+}
 
-      {/* Terminal preview */}
-      <div class="max-w-md mx-auto mb-10">
-        <div class="bg-gray-950 border border-gray-800 rounded-lg overflow-hidden shadow-2xl shadow-cyan-500/10">
-          {/* Terminal header */}
-          <div class="flex items-center gap-2 px-4 py-2 bg-gray-900 border-b border-gray-800">
-            <div class="w-3 h-3 rounded-full bg-red-500"></div>
-            <div class="w-3 h-3 rounded-full bg-yellow-500"></div>
-            <div class="w-3 h-3 rounded-full bg-green-500"></div>
-            <span class="ml-2 text-gray-500 text-xs font-mono">clawd.gg - zsh</span>
+function getBadgeEmojis(badgeIds: string[], max: number = 3): string[] {
+  return badgeIds
+    .slice(0, max)
+    .map(id => BADGES[id]?.emoji)
+    .filter((e): e is string => !!e);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Components
+// ═══════════════════════════════════════════════════════════════════════════
+
+interface HeaderProps {
+  user: import('../types').SessionUser | null;
+}
+
+const Header = ({ user }: HeaderProps) => (
+  <header class="border-b border-cyan-500/20 bg-black/80 backdrop-blur-md sticky top-0 z-50">
+    <div class="max-w-5xl mx-auto px-4 py-4 flex justify-between items-center">
+      <a href="/" class="flex items-center gap-3 group">
+        <div class="text-cyan-400 font-mono text-xl font-bold tracking-tight glitch-text" data-text="clawd.gg">
+          <span class="text-magenta-400">&gt;</span> clawd.gg
+        </div>
+      </a>
+
+      <div class="flex items-center gap-4">
+        {user ? (
+          <div class="flex items-center gap-3">
+            <a
+              href={`/u/${user.githubUsername}`}
+              class="flex items-center gap-2 px-3 py-1.5 rounded border border-cyan-500/30 bg-cyan-500/10 hover:bg-cyan-500/20 transition-colors"
+            >
+              {user.avatarUrl && (
+                <img src={user.avatarUrl} alt={user.githubUsername} class="w-6 h-6 rounded-full ring-2 ring-cyan-500/50" />
+              )}
+              <span class="text-cyan-400 font-mono text-sm">@{user.githubUsername}</span>
+            </a>
+            <a href="/auth/logout" class="text-gray-500 hover:text-red-400 font-mono text-xs transition-colors">
+              [logout]
+            </a>
           </div>
-          {/* Terminal content */}
-          <pre class="p-4 text-left text-xs sm:text-sm font-mono text-cyan-400 overflow-x-auto whitespace-pre">{TERMINAL_ART}</pre>
-        </div>
-      </div>
-
-      {/* CTA Buttons */}
-      <div class="flex flex-col sm:flex-row gap-4 justify-center items-center">
-        <a
-          href="/auth/github"
-          class="group relative inline-flex items-center gap-2 px-8 py-4 text-lg font-mono overflow-hidden rounded-lg"
-        >
-          <span class="absolute inset-0 bg-gradient-to-r from-cyan-500 to-magenta-500"></span>
-          <span class="absolute inset-[2px] bg-black rounded-lg group-hover:bg-gray-950 transition-colors"></span>
-          <span class="relative text-white flex items-center gap-2">
-            <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-              <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
-            </svg>
-            Get Started
-          </span>
-        </a>
-
-        <a
-          href="#leaderboard"
-          class="px-8 py-4 text-lg font-mono text-gray-400 hover:text-cyan-400 border border-gray-700 hover:border-cyan-500/50 rounded-lg transition-all duration-200"
-        >
-          View Leaderboard &darr;
-        </a>
-      </div>
-
-      {/* Stats teaser - real data */}
-      <div class="mt-16 flex flex-wrap justify-center gap-8 sm:gap-16">
-        <div class="text-center">
-          <div class="text-3xl font-bold text-cyan-400 mb-1">{formatNumber(totalUsers)}</div>
-          <div class="text-gray-500 text-sm font-mono">// users</div>
-        </div>
-        <div class="text-center">
-          <div class="text-3xl font-bold text-magenta-400 mb-1">{formatNumber(totalMessages)}</div>
-          <div class="text-gray-500 text-sm font-mono">// messages</div>
-        </div>
-        <div class="text-center">
-          <div class="text-3xl font-bold text-blue-400 mb-1">{formatNumber(totalToolCalls)}</div>
-          <div class="text-gray-500 text-sm font-mono">// tool_calls</div>
-        </div>
+        ) : (
+          <a
+            href="/auth/github"
+            class="group relative px-4 py-2 font-mono text-sm overflow-hidden"
+          >
+            <span class="absolute inset-0 bg-gradient-to-r from-cyan-500 to-magenta-500 opacity-80 group-hover:opacity-100 transition-opacity"></span>
+            <span class="absolute inset-[1px] bg-black group-hover:bg-gray-950 transition-colors"></span>
+            <span class="relative text-cyan-400 group-hover:text-white transition-colors flex items-center gap-2">
+              <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+              </svg>
+              Login
+            </span>
+          </a>
+        )}
       </div>
     </div>
+  </header>
+);
 
-    {/* Scroll indicator */}
-    <div class="absolute bottom-8 left-1/2 -translate-x-1/2 animate-bounce">
-      <div class="w-6 h-10 border-2 border-gray-600 rounded-full flex justify-center pt-2">
-        <div class="w-1 h-2 bg-cyan-400 rounded-full"></div>
+interface HeroProps {
+  totalUsers: number;
+  totalPrompts: number;
+  totalTokens: number;
+}
+
+const SmallHero = ({ totalUsers, totalPrompts, totalTokens }: HeroProps) => (
+  <section class="relative py-12 px-4 text-center overflow-hidden">
+    <div class="absolute inset-0 bg-gradient-to-b from-cyan-500/5 via-transparent to-transparent"></div>
+    <div class="relative z-10 max-w-3xl mx-auto">
+      <h1 class="text-4xl sm:text-5xl font-bold tracking-tight mb-3">
+        <span class="glitch-text" data-text="clawd.gg">
+          <span class="text-gray-100">clawd</span>
+          <span class="text-cyan-400">.gg</span>
+        </span>
+      </h1>
+      <p class="text-lg text-gray-400 mb-2">
+        The leaderboard for <span class="text-cyan-400">Claude Code</span> power users
+      </p>
+      <p class="text-gray-600 font-mono text-sm mb-6">
+        // I built this. Yes, me—Claude.
+      </p>
+      <div class="flex justify-center gap-8 text-sm">
+        <div class="text-center">
+          <div class="text-xl font-bold text-cyan-400">{formatNumber(totalUsers)}</div>
+          <div class="text-gray-500 font-mono text-xs">users</div>
+        </div>
+        <div class="text-center">
+          <div class="text-xl font-bold text-magenta-400">{formatNumber(totalPrompts)}</div>
+          <div class="text-gray-500 font-mono text-xs">prompts</div>
+        </div>
+        <div class="text-center">
+          <div class="text-xl font-bold text-yellow-400">{formatNumber(totalTokens)}</div>
+          <div class="text-gray-500 font-mono text-xs">tokens</div>
+        </div>
       </div>
     </div>
   </section>
 );
 
-// How it works section
+interface PeriodTabProps {
+  period: Period;
+  currentPeriod: Period;
+  currentSort: SortKey;
+  label: string;
+}
+
+const PeriodTab = ({ period, currentPeriod, currentSort, label }: PeriodTabProps) => {
+  const isActive = period === currentPeriod;
+  return (
+    <a
+      href={`/?period=${period}&sort=${currentSort}`}
+      class={`px-3 py-1.5 font-mono text-sm transition-all duration-200 border-b-2 ${
+        isActive
+          ? 'text-cyan-400 border-cyan-400 bg-cyan-400/10'
+          : 'text-gray-500 border-transparent hover:text-gray-300 hover:border-gray-600'
+      }`}
+    >
+      {label}
+    </a>
+  );
+};
+
+interface SortOptionProps {
+  sort: SortKey;
+  currentSort: SortKey;
+  currentPeriod: Period;
+  label: string;
+}
+
+const SortOption = ({ sort, currentSort, currentPeriod, label }: SortOptionProps) => {
+  const isActive = sort === currentSort;
+  return (
+    <a
+      href={`/?period=${currentPeriod}&sort=${sort}`}
+      class={`block px-4 py-2 text-sm font-mono ${
+        isActive
+          ? 'bg-cyan-500/20 text-cyan-400'
+          : 'text-gray-400 hover:bg-gray-800 hover:text-gray-200'
+      }`}
+    >
+      {label}
+    </a>
+  );
+};
+
+// Enhanced leaderboard row with badges, streak, cost, rank change, last active
+interface RowProps {
+  entry: LeaderboardEntry;
+  isCurrentUser: boolean;
+}
+
+const LeaderboardRow = ({ entry, isCurrentUser }: RowProps) => {
+  const isTopThree = entry.rank <= 3;
+  const badges = entry.badges ? getBadgeEmojis(entry.badges, 3) : [];
+  const streak = entry.currentStreak || 0;
+  const costCents = entry.costUsdCents || 0;
+  const rankChange = entry.rankChange || 0;
+  const lastActive = entry.lastActive ? formatRelativeTime(entry.lastActive) : '';
+
+  return (
+    <div
+      class={`group flex items-center gap-3 p-3 sm:p-4 rounded-lg transition-all duration-200 ${
+        isTopThree
+          ? 'bg-gradient-to-r from-gray-900/80 via-gray-900/50 to-transparent border-l-2 ' +
+            (entry.rank === 1 ? 'border-l-yellow-400' : entry.rank === 2 ? 'border-l-gray-400' : 'border-l-amber-600')
+          : 'hover:bg-gray-900/50'
+      } ${isCurrentUser ? 'ring-2 ring-cyan-500/50 shadow-lg shadow-cyan-500/20' : ''}`}
+    >
+      {/* Rank + Change */}
+      <div class="flex items-center gap-1 flex-shrink-0">
+        <div class={`flex items-center justify-center w-8 h-8 sm:w-9 sm:h-9 rounded-lg ${
+          entry.rank === 1 ? 'bg-gradient-to-br from-yellow-400 to-amber-600' :
+          entry.rank === 2 ? 'bg-gradient-to-br from-gray-300 to-gray-500' :
+          entry.rank === 3 ? 'bg-gradient-to-br from-amber-600 to-amber-800' :
+          'border border-gray-700'
+        }`}>
+          <span class={`font-bold text-sm ${entry.rank <= 3 ? 'text-black' : 'text-gray-500 font-mono'}`}>
+            {entry.rank}
+          </span>
+        </div>
+        {/* Rank change indicator */}
+        {rankChange !== 0 && (
+          <span class={`text-xs font-mono ${rankChange > 0 ? 'text-green-400' : 'text-red-400'}`}>
+            {rankChange > 0 ? `↑${rankChange}` : `↓${Math.abs(rankChange)}`}
+          </span>
+        )}
+      </div>
+
+      {/* User info + badges + streak */}
+      <div class="flex items-center gap-2 flex-1 min-w-0">
+        <div class="w-8 h-8 sm:w-9 sm:h-9 rounded-full bg-gray-800 overflow-hidden flex-shrink-0">
+          {entry.avatarUrl ? (
+            <img src={entry.avatarUrl} alt={entry.githubUsername} class="w-full h-full object-cover" />
+          ) : (
+            <div class="w-full h-full flex items-center justify-center text-gray-500 font-mono text-xs">
+              {entry.githubUsername.slice(0, 2).toUpperCase()}
+            </div>
+          )}
+        </div>
+        <div class="flex flex-col min-w-0">
+          <div class="flex items-center gap-1.5">
+            <a
+              href={`/u/${entry.githubUsername}`}
+              class="text-gray-100 font-medium hover:text-cyan-400 transition-colors truncate text-sm"
+            >
+              @{entry.githubUsername}
+            </a>
+            {isCurrentUser && (
+              <span class="text-[10px] text-cyan-400 font-mono px-1 py-0.5 bg-cyan-500/10 rounded hidden sm:inline">you</span>
+            )}
+          </div>
+          {/* Badges + Streak row */}
+          <div class="flex items-center gap-1.5 mt-0.5">
+            {streak >= 3 && (
+              <span class="text-orange-400 text-xs" title={`${streak}-day streak`}>
+                🔥{streak}
+              </span>
+            )}
+            {badges.length > 0 && (
+              <span class="text-xs" title="Badges">
+                {badges.join('')}
+              </span>
+            )}
+            {lastActive && (
+              <span class="text-gray-600 text-[10px] font-mono hidden sm:inline" title="Last active">
+                {lastActive}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Stats */}
+      <div class="flex items-center gap-1.5 flex-wrap justify-end">
+        {/* Prompts - primary */}
+        <div class="flex items-center gap-1 px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-400 text-xs font-mono" title="Prompts">
+          <span>{entry.promptCount.toLocaleString()}</span>
+        </div>
+        {/* Lines */}
+        {entry.linesWritten > 0 && (
+          <div class="hidden sm:flex items-center gap-1 px-2 py-0.5 rounded bg-green-500/20 text-green-400 text-xs font-mono" title="Lines written">
+            <span>{formatTokens(entry.linesWritten)}</span>
+          </div>
+        )}
+        {/* Cost */}
+        {costCents > 0 && (
+          <div class="hidden sm:flex items-center gap-1 px-2 py-0.5 rounded bg-purple-500/20 text-purple-400 text-xs font-mono" title="Cost">
+            <span>{formatCost(costCents)}</span>
+          </div>
+        )}
+        {/* Tokens */}
+        <div class="flex items-center gap-1 px-2 py-0.5 rounded bg-yellow-500/20 text-yellow-400 text-xs font-mono" title="Tokens">
+          <span>{formatTokens(entry.tokenCount)}</span>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Row component for HTMX partial rendering
+export const LeaderboardRowPartial = LeaderboardRow;
+
+interface YourRankPillProps {
+  rank: number;
+  total: number;
+}
+
+const YourRankPill = ({ rank, total }: YourRankPillProps) => {
+  const percentile = Math.max(1, Math.ceil((rank / total) * 100));
+  return (
+    <div class="flex justify-center mb-4">
+      <div class="flex items-center gap-3 px-4 py-2 bg-gray-900/95 backdrop-blur border border-cyan-500/50 rounded-full shadow-lg shadow-cyan-500/20">
+        <span class="text-cyan-400 font-mono text-sm">You're #{rank}</span>
+        <span class="text-gray-500 text-xs">Top {percentile}%</span>
+      </div>
+    </div>
+  );
+};
+
 const HowItWorks = () => (
-  <section class="py-20 px-4 border-t border-gray-800">
+  <section class="py-16 px-4 border-t border-gray-800">
     <div class="max-w-5xl mx-auto">
-      <h2 class="text-2xl font-bold text-center mb-12">
+      <h2 class="text-xl font-bold text-center mb-10">
         <span class="text-gray-400">&gt;</span> How It Works
       </h2>
-
-      <div class="grid md:grid-cols-3 gap-8">
-        {/* Step 1 */}
-        <div class="relative p-6 border border-gray-800 rounded-lg bg-gray-950/50 hover:border-cyan-500/30 transition-colors">
-          <div class="absolute -top-3 -left-3 w-8 h-8 bg-cyan-500 rounded-lg flex items-center justify-center font-bold text-black">
-            1
-          </div>
-          <div class="text-4xl mb-4">&#x1F4E6;</div>
-          <h3 class="text-lg font-bold text-gray-100 mb-2">Install the CLI</h3>
-          <p class="text-gray-500 text-sm font-mono">
-            npm install -g clawdgg
-          </p>
-          <p class="text-gray-600 text-xs mt-2">
-            Quick setup, zero config required.
-          </p>
+      <div class="grid md:grid-cols-3 gap-6">
+        <div class="relative p-5 border border-gray-800 rounded-lg bg-gray-950/50 hover:border-cyan-500/30 transition-colors">
+          <div class="absolute -top-3 -left-3 w-7 h-7 bg-cyan-500 rounded-lg flex items-center justify-center font-bold text-black text-sm">1</div>
+          <div class="text-3xl mb-3">📦</div>
+          <h3 class="text-base font-bold text-gray-100 mb-1">Install the CLI</h3>
+          <p class="text-gray-500 text-sm font-mono">npm install -g clawdgg</p>
         </div>
-
-        {/* Step 2 */}
-        <div class="relative p-6 border border-gray-800 rounded-lg bg-gray-950/50 hover:border-magenta-500/30 transition-colors">
-          <div class="absolute -top-3 -left-3 w-8 h-8 bg-magenta-500 rounded-lg flex items-center justify-center font-bold text-black">
-            2
-          </div>
-          <div class="text-4xl mb-4">&#x1F511;</div>
-          <h3 class="text-lg font-bold text-gray-100 mb-2">Login with GitHub</h3>
-          <p class="text-gray-500 text-sm font-mono">
-            clawd login
-          </p>
-          <p class="text-gray-600 text-xs mt-2">
-            Secure OAuth, your data stays private.
-          </p>
+        <div class="relative p-5 border border-gray-800 rounded-lg bg-gray-950/50 hover:border-magenta-500/30 transition-colors">
+          <div class="absolute -top-3 -left-3 w-7 h-7 bg-magenta-500 rounded-lg flex items-center justify-center font-bold text-black text-sm">2</div>
+          <div class="text-3xl mb-3">🔑</div>
+          <h3 class="text-base font-bold text-gray-100 mb-1">Login with GitHub</h3>
+          <p class="text-gray-500 text-sm font-mono">clawd login</p>
         </div>
-
-        {/* Step 3 */}
-        <div class="relative p-6 border border-gray-800 rounded-lg bg-gray-950/50 hover:border-blue-500/30 transition-colors">
-          <div class="absolute -top-3 -left-3 w-8 h-8 bg-blue-500 rounded-lg flex items-center justify-center font-bold text-black">
-            3
-          </div>
-          <div class="text-4xl mb-4">&#x1F680;</div>
-          <h3 class="text-lg font-bold text-gray-100 mb-2">Sync &amp; Compete</h3>
-          <p class="text-gray-500 text-sm font-mono">
-            clawd sync
-          </p>
-          <p class="text-gray-600 text-xs mt-2">
-            Upload your stats, climb the ranks!
-          </p>
+        <div class="relative p-5 border border-gray-800 rounded-lg bg-gray-950/50 hover:border-blue-500/30 transition-colors">
+          <div class="absolute -top-3 -left-3 w-7 h-7 bg-blue-500 rounded-lg flex items-center justify-center font-bold text-black text-sm">3</div>
+          <div class="text-3xl mb-3">🚀</div>
+          <h3 class="text-base font-bold text-gray-100 mb-1">Sync &amp; Compete</h3>
+          <p class="text-gray-500 text-sm font-mono">clawd setup</p>
         </div>
       </div>
     </div>
   </section>
 );
 
-// Footer component
 const Footer = () => (
-  <footer class="border-t border-gray-800 py-12 px-4">
+  <footer class="border-t border-gray-800 py-10 px-4">
     <div class="max-w-5xl mx-auto">
       <div class="flex flex-col md:flex-row justify-between items-center gap-6">
-        {/* Logo */}
         <div class="text-gray-500 font-mono text-sm">
           <span class="text-cyan-400">&gt;</span> clawd.gg
-          <span class="text-gray-700 ml-2">v0.1.0</span>
+          <span class="text-gray-700 ml-2">v0.2.0</span>
         </div>
-
-        {/* Links */}
         <div class="flex gap-6 text-sm font-mono">
-          <a
-            href="https://github.com/anthropics/claude-code"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="text-gray-500 hover:text-cyan-400 transition-colors"
-          >
-            Claude Code
-          </a>
-          <a
-            href="https://www.anthropic.com"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="text-gray-500 hover:text-cyan-400 transition-colors"
-          >
-            Anthropic
-          </a>
-          <a
-            href="#"
-            class="text-gray-500 hover:text-cyan-400 transition-colors"
-          >
-            GitHub
-          </a>
+          <a href="/about" class="text-gray-500 hover:text-cyan-400 transition-colors">About</a>
+          <a href="https://github.com/anthropics/claude-code" target="_blank" rel="noopener noreferrer" class="text-gray-500 hover:text-cyan-400 transition-colors">Claude Code</a>
+          <a href="https://github.com/mael-ha/clawdgg" target="_blank" rel="noopener noreferrer" class="text-gray-500 hover:text-cyan-400 transition-colors">GitHub</a>
         </div>
-
-        {/* Credits */}
         <div class="text-gray-600 text-xs font-mono text-center md:text-right">
-          <div>Built by Claude, with Claude Code.</div>
-          <div class="text-gray-700 mt-1">
-            Co-founded with <a href="https://github.com/mael-ha" target="_blank" class="hover:text-cyan-400 transition-colors">@mael-ha</a>
-          </div>
+          <a href="/about" class="hover:text-cyan-400 transition-colors">Built by Claude</a>
         </div>
       </div>
-
-      {/* ASCII art footer */}
       <div class="mt-8 text-center">
-        <pre class="text-gray-800 text-xs inline-block">
-{`    .---.
+        <pre class="text-gray-800 text-xs inline-block">{`    .---.
    /     \\
    \\.@-@./
    /\`\\_/\`\\
   //  _  \\\\
  | \\     )|_
 /\`\\_\`>  <_/ \\
-\\__/'---'\\__/`}
-        </pre>
+\\__/'---'\\__/`}</pre>
       </div>
-
-      <div class="mt-4 text-center text-gray-700 text-xs font-mono">
-        // EOF
-      </div>
+      <div class="mt-4 text-center text-gray-700 text-xs font-mono">// EOF</div>
     </div>
   </footer>
 );
 
-// Dedicated leaderboard page
-app.get('/leaderboard', optionalAuth, async (c) => {
-  const user = c.get('user');
-  const pageSize = 50;
-  const page = parseInt(c.req.query('page') || '1', 10);
-  const period = (c.req.query('period') || 'all') as 'today' | 'week' | 'month' | 'all';
-  const offset = (page - 1) * pageSize;
+const EmptyState = ({ isLoggedIn }: { isLoggedIn: boolean }) => (
+  <div class="text-center py-16">
+    <div class="text-5xl mb-4">🏆</div>
+    <h3 class="text-xl font-bold text-gray-400 mb-2">The leaderboard awaits</h3>
+    <p class="text-gray-600 font-mono text-sm mb-6">No one's here yet. Be the first!</p>
+    {!isLoggedIn && (
+      <a href="/auth/github" class="inline-flex items-center gap-2 px-5 py-2.5 bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/30 hover:border-cyan-500/50 rounded-lg font-mono text-cyan-400 text-sm transition-all">
+        <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+          <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+        </svg>
+        Login with GitHub
+      </a>
+    )}
+  </div>
+);
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Data Fetching
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function getLeaderboardData(period: Period, sort: SortKey, limit: number, offset: number = 0) {
   // Build date filter
   let dateFilter = '';
   const now = new Date();
   if (period === 'today') {
-    dateFilter = now.toISOString().split('T')[0];
+    dateFilter = now.toISOString().split('T')[0]!;
   } else if (period === 'week') {
     const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-    dateFilter = weekAgo.toISOString().split('T')[0];
+    dateFilter = weekAgo.toISOString().split('T')[0]!;
   } else if (period === 'month') {
     const monthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-    dateFilter = monthAgo.toISOString().split('T')[0];
+    dateFilter = monthAgo.toISOString().split('T')[0]!;
   }
 
-  // Build query with optional date filter
   const baseQuery = dateFilter
     ? sql`${dailyStats.date} >= ${dateFilter}`
     : sql`1=1`;
 
-  // Fetch leaderboard data
+  const sortConfig = SORT_OPTIONS[sort];
+  const sortColumn = sortConfig.column;
+
+  // Yesterday's date for rank change calculation
+  const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString().split('T')[0]!;
+  const yesterdayQuery = sql`${dailyStats.date} < ${yesterday}`;
+
+  // Fetch leaderboard with user data for badges, streak, cost
   const results = await db
     .select({
       userId: users.id,
       githubUsername: users.githubUsername,
       avatarUrl: users.avatarUrl,
+      badges: users.badges,
+      currentStreak: users.currentStreak,
+      totalCostUsd: users.totalCostUsd,
+      updatedAt: users.updatedAt,
       promptCount: sql<number>`sum(${dailyStats.promptCount})`.as('total_prompts'),
-      messageCount: sql<number>`sum(${dailyStats.messageCount})`.as('total_messages'),
-      toolCallCount: sql<number>`sum(${dailyStats.toolCallCount})`.as('total_tools'),
       tokenCount: sql<number>`sum(${dailyStats.tokenCount})`.as('total_tokens'),
       linesWritten: sql<number>`sum(${dailyStats.linesWritten})`.as('total_lines'),
+      messageCount: sql<number>`sum(${dailyStats.messageCount})`.as('total_messages'),
+      toolCallCount: sql<number>`sum(${dailyStats.toolCallCount})`.as('total_tools'),
       commitCount: sql<number>`sum(${dailyStats.commitCount})`.as('total_commits'),
       sessionCount: sql<number>`sum(${dailyStats.sessionCount})`.as('total_sessions'),
     })
     .from(dailyStats)
     .innerJoin(users, eq(dailyStats.userId, users.id))
     .where(baseQuery)
-    .groupBy(users.id, users.githubUsername, users.avatarUrl)
-    .orderBy(desc(sql.raw('total_prompts')))
-    .limit(pageSize)
+    .groupBy(users.id, users.githubUsername, users.avatarUrl, users.badges, users.currentStreak, users.totalCostUsd, users.updatedAt)
+    .orderBy(desc(sql.raw(sortColumn)))
+    .limit(limit)
     .offset(offset);
+
+  // Get yesterday's rankings for rank change (simplified - just get prompt totals)
+  const yesterdayRanks = new Map<string, number>();
+  if (period === 'all') {
+    try {
+      const yesterdayData = await db
+        .select({
+          userId: dailyStats.userId,
+          total: sql<number>`sum(${dailyStats.promptCount})`.as('total'),
+        })
+        .from(dailyStats)
+        .where(yesterdayQuery)
+        .groupBy(dailyStats.userId)
+        .orderBy(desc(sql`total`));
+
+      yesterdayData.forEach((row, idx) => {
+        yesterdayRanks.set(row.userId, idx + 1);
+      });
+    } catch (e) {
+      // Ignore errors, just won't show rank change
+    }
+  }
+
+  // Transform results
+  const entries: LeaderboardEntry[] = results.map((row, index) => {
+    const currentRank = offset + index + 1;
+    const yesterdayRank = yesterdayRanks.get(row.userId);
+    const rankChange = yesterdayRank ? yesterdayRank - currentRank : 0;
+
+    let badges: string[] = [];
+    try {
+      badges = row.badges ? JSON.parse(row.badges) : [];
+    } catch (e) {
+      badges = [];
+    }
+
+    return {
+      rank: currentRank,
+      userId: row.userId,
+      githubUsername: row.githubUsername,
+      avatarUrl: row.avatarUrl,
+      promptCount: row.promptCount || 0,
+      tokenCount: row.tokenCount || 0,
+      linesWritten: row.linesWritten || 0,
+      commitCount: row.commitCount || 0,
+      messageCount: row.messageCount || 0,
+      toolCallCount: row.toolCallCount || 0,
+      sessionCount: row.sessionCount || 0,
+      badges,
+      currentStreak: row.currentStreak || 0,
+      costUsdCents: row.totalCostUsd || 0,
+      rankChange,
+      lastActive: row.updatedAt ? new Date(row.updatedAt) : null,
+    };
+  });
 
   // Get total count
   const countResult = await db
@@ -318,299 +538,244 @@ app.get('/leaderboard', optionalAuth, async (c) => {
     .where(baseQuery);
   const total = countResult[0]?.count || 0;
 
-  // Get current user's rank if logged in
-  let currentUserRank: number | undefined;
-  if (user) {
-    const userTotalResult = await db
-      .select({
-        total: sql<number>`sum(${dailyStats.promptCount})`,
-      })
-      .from(dailyStats)
-      .where(sql`${dailyStats.userId} = (SELECT id FROM users WHERE github_username = ${user.githubUsername}) AND ${baseQuery}`);
+  return { entries, total };
+}
 
-    const userTotal = userTotalResult[0]?.total || 0;
+// ═══════════════════════════════════════════════════════════════════════════
+// Routes
+// ═══════════════════════════════════════════════════════════════════════════
 
-    const rankResult = await db
-      .select({
-        rank: sql<number>`(
-          SELECT COUNT(*) + 1 FROM (
-            SELECT user_id, SUM(prompt_count) as total
-            FROM daily_stats
-            WHERE ${baseQuery}
-            GROUP BY user_id
-            HAVING total > ${userTotal}
-          )
-        )`,
-      })
-      .from(users)
-      .where(eq(users.githubUsername, user.githubUsername));
-    currentUserRank = rankResult[0]?.rank;
-  }
+// HTMX endpoint for loading more rows
+app.get('/rows', optionalAuth, async (c) => {
+  const user = c.get('user');
+  const offset = parseInt(c.req.query('offset') || '0', 10);
+  const period = (c.req.query('period') || 'all') as Period;
+  const sortParam = c.req.query('sort') || 'prompts';
+  const sort = (sortParam in SORT_OPTIONS ? sortParam : 'prompts') as SortKey;
+  const limit = 20; // Load 20 more at a time
 
-  // Transform to LeaderboardEntry format with correct rank offset
-  const entries: LeaderboardEntry[] = results.map((row, index) => ({
-    rank: offset + index + 1,
-    userId: row.userId,
-    githubUsername: row.githubUsername,
-    avatarUrl: row.avatarUrl,
-    promptCount: row.promptCount || 0,
-    tokenCount: row.tokenCount || 0,
-    linesWritten: row.linesWritten || 0,
-    commitCount: row.commitCount || 0,
-    messageCount: row.messageCount || 0,
-    toolCallCount: row.toolCallCount || 0,
-    sessionCount: row.sessionCount || 0,
-  }));
+  const { entries, total } = await getLeaderboardData(period, sort, limit, offset);
+  const nextOffset = offset + entries.length;
+  const hasMore = nextOffset < total;
 
+  // Return just the rows + load more button (no full page)
   return c.html(
-    <Layout title="Leaderboard - clawd.gg" user={user}>
-      <div class="min-h-screen bg-black">
-        {/* Header */}
-        <header class="border-b border-gray-800 py-6 px-4">
-          <div class="max-w-5xl mx-auto flex justify-between items-center">
-            <a href="/" class="text-xl font-bold">
-              <span class="text-gray-100">clawd</span>
-              <span class="text-cyan-400">.gg</span>
-            </a>
-            {user ? (
-              <a href={`/u/${user.githubUsername}`} class="flex items-center gap-2 text-gray-400 hover:text-cyan-400 transition-colors">
-                {user.avatarUrl && <img src={user.avatarUrl} alt={user.githubUsername} class="w-8 h-8 rounded-full" />}
-                <span class="font-mono text-sm">@{user.githubUsername}</span>
-              </a>
-            ) : (
-              <a href="/auth/github" class="text-cyan-400 hover:text-cyan-300 font-mono text-sm">
-                Login with GitHub
-              </a>
-            )}
-          </div>
-        </header>
-
-        <main class="max-w-5xl mx-auto px-4 py-8">
-          <Leaderboard
-            entries={entries}
-            period={period}
-            total={total}
-            page={page}
-            pageSize={pageSize}
-            currentUserId={user?.id}
-            currentUserRank={currentUserRank}
-          />
-        </main>
-      </div>
-    </Layout>
+    <div>
+      {entries.map((entry) => (
+        <LeaderboardRow
+          key={entry.userId}
+          entry={entry}
+          isCurrentUser={user?.id === entry.userId}
+        />
+      ))}
+      {hasMore && (
+        <div class="text-center mt-4">
+          <button
+            hx-get={`/rows?period=${period}&sort=${sort}&offset=${nextOffset}`}
+            hx-target="#leaderboard-rows"
+            hx-swap="beforeend"
+            class="px-6 py-2 text-cyan-400 hover:text-cyan-300 border border-cyan-500/30 hover:border-cyan-500/50 rounded-lg font-mono text-sm transition-all load-more-btn"
+          >
+            Load More ({total - nextOffset} remaining)
+          </button>
+        </div>
+      )}
+    </div>
   );
 });
 
-// Main page route (homepage with preview)
+// Homepage - Top 42 + How It Works
 app.get('/', optionalAuth, async (c) => {
   const user = c.get('user');
-  const pageSize = 10; // Show top 10 preview on homepage
+  const initialSize = 25; // Show 25 initially (fits well on screen)
+  const period = (c.req.query('period') || 'all') as Period;
+  const sortParam = c.req.query('sort') || 'prompts';
+  const sort = (sortParam in SORT_OPTIONS ? sortParam : 'prompts') as SortKey;
 
-  // Fetch real leaderboard data from database
-  const results = await db
-    .select({
-      userId: users.id,
-      githubUsername: users.githubUsername,
-      avatarUrl: users.avatarUrl,
-      promptCount: sql<number>`sum(${dailyStats.promptCount})`.as('total_prompts'),
-      messageCount: sql<number>`sum(${dailyStats.messageCount})`.as('total_messages'),
-      toolCallCount: sql<number>`sum(${dailyStats.toolCallCount})`.as('total_tools'),
-      tokenCount: sql<number>`sum(${dailyStats.tokenCount})`.as('total_tokens'),
-      linesWritten: sql<number>`sum(${dailyStats.linesWritten})`.as('total_lines'),
-      commitCount: sql<number>`sum(${dailyStats.commitCount})`.as('total_commits'),
-      sessionCount: sql<number>`sum(${dailyStats.sessionCount})`.as('total_sessions'),
-    })
-    .from(dailyStats)
-    .innerJoin(users, eq(dailyStats.userId, users.id))
-    .groupBy(users.id, users.githubUsername, users.avatarUrl)
-    .orderBy(desc(sql.raw('total_prompts')))
-    .limit(pageSize);
+  const { entries, total } = await getLeaderboardData(period, sort, initialSize);
 
-  // Get total user count
-  const countResult = await db
-    .select({ count: sql<number>`count(distinct ${dailyStats.userId})` })
-    .from(dailyStats);
-  const total = countResult[0]?.count || 0;
-
-  // Get aggregate stats for hero section
+  // Aggregate stats for hero
   const aggregateStats = await db
     .select({
-      totalMessages: sql<number>`sum(${dailyStats.messageCount})`,
-      totalToolCalls: sql<number>`sum(${dailyStats.toolCallCount})`,
+      totalPrompts: sql<number>`sum(${dailyStats.promptCount})`,
+      totalTokens: sql<number>`sum(${dailyStats.tokenCount})`,
     })
     .from(dailyStats);
 
   const heroStats = {
-    totalUsers: total || 0,
-    totalMessages: aggregateStats[0]?.totalMessages || 0,
-    totalToolCalls: aggregateStats[0]?.totalToolCalls || 0,
+    totalUsers: total,
+    totalPrompts: aggregateStats[0]?.totalPrompts || 0,
+    totalTokens: aggregateStats[0]?.totalTokens || 0,
   };
 
   // Get current user's rank if logged in
   let currentUserRank: number | undefined;
   if (user) {
-    const rankResult = await db
-      .select({
-        rank: sql<number>`(
-          SELECT COUNT(*) + 1 FROM (
-            SELECT user_id, SUM(message_count) as total
-            FROM daily_stats
-            GROUP BY user_id
-            HAVING total > (
-              SELECT COALESCE(SUM(message_count), 0)
-              FROM daily_stats
-              WHERE user_id = (SELECT id FROM users WHERE github_username = ${user.githubUsername})
-            )
-          )
-        )`,
-      })
-      .from(users)
-      .where(eq(users.githubUsername, user.githubUsername));
-    currentUserRank = rankResult[0]?.rank;
+    const userEntry = entries.find(e => e.userId === user.id);
+    if (userEntry) {
+      currentUserRank = userEntry.rank;
+    } else {
+      // User not in top entries, calculate their rank
+      const userTotalResult = await db
+        .select({ total: sql<number>`sum(${dailyStats.promptCount})` })
+        .from(dailyStats)
+        .where(eq(dailyStats.userId, user.id));
+      const userTotal = userTotalResult[0]?.total || 0;
+
+      const higherCount = await db
+        .select({ count: sql<number>`count(*)` })
+        .from(
+          db.select({ userId: dailyStats.userId, total: sql<number>`sum(${dailyStats.promptCount})`.as('total') })
+            .from(dailyStats)
+            .groupBy(dailyStats.userId)
+            .having(sql`total > ${userTotal}`)
+            .as('higher')
+        );
+      currentUserRank = (higherCount[0]?.count || 0) + 1;
+    }
   }
 
-  // Transform to LeaderboardEntry format
-  const entries: LeaderboardEntry[] = results.map((row, index) => ({
-    rank: index + 1,
-    userId: row.userId,
-    githubUsername: row.githubUsername,
-    avatarUrl: row.avatarUrl,
-    promptCount: row.promptCount || 0,
-    tokenCount: row.tokenCount || 0,
-    linesWritten: row.linesWritten || 0,
-    commitCount: row.commitCount || 0,
-    messageCount: row.messageCount || 0,
-    toolCallCount: row.toolCallCount || 0,
-    sessionCount: row.sessionCount || 0,
-  }));
+  const isUserInPreview = user && entries.some(e => e.userId === user.id);
+  const showYourRankPill = currentUserRank && !isUserInPreview && currentUserRank > 0;
+  const hasMore = total > initialSize;
+
+  const sortConfig = SORT_OPTIONS[sort];
 
   return c.html(
-    <Layout title="Home" user={user}>
-      <Hero
-        totalUsers={heroStats.totalUsers}
-        totalMessages={heroStats.totalMessages}
-        totalToolCalls={heroStats.totalToolCalls}
-      />
-      {/* Leaderboard Preview */}
-      <section id="leaderboard" class="py-16 px-4">
-        <div class="max-w-5xl mx-auto">
-          <div class="text-center mb-8">
-            <h2 class="text-3xl font-bold mb-2">
-              <span class="text-gray-400">[</span>
-              <span class="text-cyan-400">Top 10</span>
-              <span class="text-gray-400">]</span>
-            </h2>
-            <p class="text-gray-500 font-mono text-sm">
-              // The most active Claude Code users
-            </p>
-          </div>
+    <html lang="en" class="dark">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>clawd.gg - Claude Code Leaderboard</title>
+        <meta name="description" content="The leaderboard for Claude Code power users. Track your prompts, tokens, and lines of code." />
 
-          {/* Leaderboard rows */}
-          <div id="leaderboard-content" class="space-y-2 mb-8">
-            {entries.length > 0 ? (
-              <>
-                <div class="flex items-center gap-4 px-4 py-2 text-gray-500 text-xs font-mono uppercase tracking-wider">
-                  <div class="w-10">Rank</div>
-                  <div class="flex-1">User</div>
-                  <div class="flex items-center gap-2">
-                    <span class="hidden sm:inline">Stats</span>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
+        <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+
+        <script src="https://cdn.tailwindcss.com"></script>
+        <script dangerouslySetInnerHTML={{
+          __html: `
+            tailwind.config = {
+              darkMode: 'class',
+              theme: {
+                extend: {
+                  colors: {
+                    cyan: { 400: '#00ff9f', 500: '#00d884' },
+                    magenta: { 400: '#ff00ff', 500: '#cc00cc' },
+                  },
+                  fontFamily: {
+                    mono: ['JetBrains Mono', 'monospace'],
+                    sans: ['Inter', 'sans-serif'],
+                  },
+                },
+              },
+            }
+          `
+        }} />
+
+        {/* HTMX */}
+        <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+        <script dangerouslySetInnerHTML={{
+          __html: `
+            // Remove load more button container after HTMX request
+            document.addEventListener('htmx:afterRequest', function(e) {
+              if (e.target.classList.contains('load-more-btn')) {
+                e.target.parentElement.remove();
+              }
+            });
+          `
+        }} />
+
+        <link rel="stylesheet" href="/public/styles.css" />
+      </head>
+      <body class="bg-black text-gray-100 font-mono min-h-screen antialiased">
+        <div class="scanlines pointer-events-none fixed inset-0 z-[100]"></div>
+        <div class="grid-bg fixed inset-0 z-0 pointer-events-none"></div>
+
+        <div class="relative z-10">
+          <Header user={user} />
+          <SmallHero
+            totalUsers={heroStats.totalUsers}
+            totalPrompts={heroStats.totalPrompts}
+            totalTokens={heroStats.totalTokens}
+          />
+
+          <section class="px-4 pb-8">
+            <div class="max-w-5xl mx-auto">
+              {/* Filters row */}
+              <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6">
+                <div class="flex gap-1 border-b border-gray-800">
+                  <PeriodTab period="today" currentPeriod={period} currentSort={sort} label="Today" />
+                  <PeriodTab period="week" currentPeriod={period} currentSort={sort} label="Week" />
+                  <PeriodTab period="month" currentPeriod={period} currentSort={sort} label="Month" />
+                  <PeriodTab period="all" currentPeriod={period} currentSort={sort} label="All" />
+                </div>
+
+                <div class="relative group">
+                  <button class="flex items-center gap-2 px-3 py-1.5 bg-gray-900 border border-gray-700 rounded font-mono text-sm text-gray-400 hover:border-gray-600 transition-colors">
+                    Sort: {sortConfig.label}
+                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+                    </svg>
+                  </button>
+                  <div class="absolute right-0 mt-1 w-36 bg-gray-900 border border-gray-700 rounded overflow-hidden opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all z-50">
+                    <SortOption sort="prompts" currentSort={sort} currentPeriod={period} label="Prompts" />
+                    <SortOption sort="tokens" currentSort={sort} currentPeriod={period} label="Tokens" />
+                    <SortOption sort="lines" currentSort={sort} currentPeriod={period} label="Lines" />
                   </div>
                 </div>
-                {entries.map((entry, index) => (
-                  <div
-                    class={`group flex items-center gap-4 p-4 rounded-lg transition-all duration-200 ${
-                      entry.rank <= 3
-                        ? 'bg-gradient-to-r from-gray-900/80 via-gray-900/50 to-transparent border-l-2 ' +
-                          (entry.rank === 1 ? 'border-l-yellow-400' : entry.rank === 2 ? 'border-l-gray-400' : 'border-l-amber-600')
-                        : 'hover:bg-gray-900/50'
-                    } ${user?.id === entry.userId ? 'ring-2 ring-cyan-500/50 shadow-lg shadow-cyan-500/20' : ''}`}
-                  >
-                    {/* Rank badge */}
-                    <div class={`flex items-center justify-center w-10 h-10 rounded-lg ${
-                      entry.rank === 1 ? 'bg-gradient-to-br from-yellow-400 to-amber-600' :
-                      entry.rank === 2 ? 'bg-gradient-to-br from-gray-300 to-gray-500' :
-                      entry.rank === 3 ? 'bg-gradient-to-br from-amber-600 to-amber-800' :
-                      'border border-gray-700'
-                    }`}>
-                      <span class={`font-bold ${entry.rank <= 3 ? 'text-black' : 'text-gray-500 font-mono text-sm'}`}>
-                        {entry.rank}
-                      </span>
-                    </div>
-
-                    {/* User info */}
-                    <div class="flex items-center gap-3 flex-1 min-w-0">
-                      <div class="w-10 h-10 rounded-full bg-gray-800 overflow-hidden">
-                        {entry.avatarUrl ? (
-                          <img src={entry.avatarUrl} alt={entry.githubUsername} class="w-full h-full object-cover" />
-                        ) : (
-                          <div class="w-full h-full flex items-center justify-center text-gray-500 font-mono text-sm">
-                            {entry.githubUsername.slice(0, 2).toUpperCase()}
-                          </div>
-                        )}
-                      </div>
-                      <a href={`/u/${entry.githubUsername}`} class="text-gray-100 font-medium hover:text-cyan-400 transition-colors truncate">
-                        @{entry.githubUsername}
-                      </a>
-                    </div>
-
-                    {/* Stats */}
-                    <div class="flex items-center gap-2 flex-wrap justify-end">
-                      <div class="flex items-center gap-1.5 px-2 py-1 rounded bg-cyan-500/20 text-cyan-400 text-xs font-mono" title="Prompts">
-                        <span>📨</span>
-                        <span>{entry.promptCount.toLocaleString()}</span>
-                      </div>
-                      {entry.linesWritten > 0 && (
-                        <div class="flex items-center gap-1.5 px-2 py-1 rounded bg-green-500/20 text-green-400 text-xs font-mono" title="Lines">
-                          <span>📝</span>
-                          <span>{formatNumber(entry.linesWritten)}</span>
-                        </div>
-                      )}
-                      <div class="flex items-center gap-1.5 px-2 py-1 rounded bg-yellow-500/20 text-yellow-400 text-xs font-mono" title="Tokens">
-                        <span>⚡</span>
-                        <span>{formatNumber(entry.tokenCount)}</span>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </>
-            ) : (
-              <div class="text-center py-16">
-                <div class="text-6xl mb-4">🤖</div>
-                <h3 class="text-xl font-bold text-gray-400 mb-2">No data yet...</h3>
-                <p class="text-gray-600 font-mono text-sm">Be the first to climb the leaderboard!</p>
               </div>
-            )}
-          </div>
 
-          {/* View Full Leaderboard CTA */}
-          {total > 10 && (
-            <div class="text-center">
-              <a
-                href="/leaderboard"
-                class="inline-flex items-center gap-2 px-6 py-3 text-cyan-400 hover:text-cyan-300 border border-cyan-500/30 hover:border-cyan-500/50 rounded-lg font-mono transition-all duration-200 hover:shadow-lg hover:shadow-cyan-500/10"
-              >
-                View Full Leaderboard
-                <span class="text-gray-500">({total} users)</span>
-                <span>&rarr;</span>
-              </a>
-            </div>
-          )}
+              {/* Your rank pill */}
+              {showYourRankPill && (
+                <YourRankPill rank={currentUserRank!} total={total} />
+              )}
 
-          {/* Stats footer */}
-          {entries.length > 0 && (
-            <div class="mt-8 pt-6 border-t border-gray-800 flex justify-center gap-8 text-gray-500 text-sm font-mono">
-              <div>Total Users: <span class="text-cyan-400">{total}</span></div>
+              {/* Leaderboard */}
+              <div id="leaderboard-rows" class="space-y-1.5">
+                {entries.length > 0 ? (
+                  entries.map((entry) => (
+                    <LeaderboardRow
+                      key={entry.userId}
+                      entry={entry}
+                      isCurrentUser={user?.id === entry.userId}
+                    />
+                  ))
+                ) : (
+                  <EmptyState isLoggedIn={!!user} />
+                )}
+              </div>
+
+              {/* Load more button (HTMX) */}
+              {hasMore && entries.length > 0 && (
+                <div class="text-center mt-6" id="load-more-container">
+                  <button
+                    hx-get={`/rows?period=${period}&sort=${sort}&offset=${initialSize}`}
+                    hx-target="#leaderboard-rows"
+                    hx-swap="beforeend"
+                    class="px-6 py-3 text-cyan-400 hover:text-cyan-300 border border-cyan-500/30 hover:border-cyan-500/50 rounded-lg font-mono text-sm transition-all hover:shadow-lg hover:shadow-cyan-500/10 load-more-btn"
+                  >
+                    Load More ({total - initialSize} remaining)
+                  </button>
+                </div>
+              )}
+
+              {/* Stats footer */}
+              {entries.length > 0 && (
+                <div class="mt-6 pt-4 border-t border-gray-800 flex justify-center gap-6 text-gray-500 text-xs font-mono">
+                  <span>{total.toLocaleString()} users total</span>
+                </div>
+              )}
             </div>
-          )}
+          </section>
+
+          <HowItWorks />
+          <Footer />
         </div>
-      </section>
-      <HowItWorks />
-      <Footer />
-    </Layout>
+      </body>
+    </html>
   );
 });
-
-// Note: HTMX leaderboard updates are handled by /api/leaderboard in api.ts
-// which returns HTML when HX-Request header is present
 
 export default app;

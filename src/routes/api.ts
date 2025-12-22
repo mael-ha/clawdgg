@@ -105,7 +105,15 @@ api.post('/stats', requireAuth, async (c) => {
         continue; // Skip invalid dates
       }
 
-      const tokenCount = tokensByDate.get(day.date) || 0;
+      // V3: Use detailed token breakdown if available, fall back to legacy tokensByModel
+      const inputTokens = day.inputTokens || 0;
+      const outputTokens = day.outputTokens || 0;
+      const cacheReadTokens = day.cacheReadTokens || 0;
+      const cacheCreationTokens = day.cacheCreationTokens || 0;
+      const costUsdCents = day.costUsdCents || 0;
+
+      // Legacy: Calculate tokenCount from detailed breakdown or fallback to tokensByDate
+      const tokenCount = (inputTokens + outputTokens) || tokensByDate.get(day.date) || 0;
 
       await db
         .insert(dailyStats)
@@ -116,6 +124,13 @@ api.post('/stats', requireAuth, async (c) => {
           messageCount: day.messageCount || 0,
           toolCallCount: day.toolCallCount || 0,
           tokenCount,
+          // V3: Full token breakdown
+          inputTokens,
+          outputTokens,
+          cacheReadTokens,
+          cacheCreationTokens,
+          costUsdCents,
+          // Code metrics
           linesWritten: day.linesWritten || 0,
           commitCount: day.commitCount || 0,
           sessionCount: day.sessionCount || 0,
@@ -127,6 +142,13 @@ api.post('/stats', requireAuth, async (c) => {
             messageCount: sql`excluded.message_count`,
             toolCallCount: sql`excluded.tool_call_count`,
             tokenCount: sql`excluded.token_count`,
+            // V3: Full token breakdown
+            inputTokens: sql`excluded.input_tokens`,
+            outputTokens: sql`excluded.output_tokens`,
+            cacheReadTokens: sql`excluded.cache_read_tokens`,
+            cacheCreationTokens: sql`excluded.cache_creation_tokens`,
+            costUsdCents: sql`excluded.cost_usd_cents`,
+            // Code metrics
             linesWritten: sql`excluded.lines_written`,
             commitCount: sql`excluded.commit_count`,
             sessionCount: sql`excluded.session_count`,
@@ -215,14 +237,30 @@ api.post('/stats', requireAuth, async (c) => {
 });
 
 // GET /api/leaderboard - Get leaderboard data
+// V2: Supports both OTel users (users.total_*) and legacy users (daily_stats)
 api.get('/leaderboard', optionalAuth, async (c) => {
   try {
     // Parse query parameters
     const period = (c.req.query('period') || 'all') as 'today' | 'week' | 'month' | 'all';
-    const sort = (c.req.query('sort') || 'messages') as 'messages' | 'sessions' | 'tools';
+    const sort = (c.req.query('sort') || 'prompts') as 'prompts' | 'tokens' | 'lines' | 'messages' | 'sessions' | 'tools';
     const page = Math.max(1, parseInt(c.req.query('page') || '1', 10));
     const limit = Math.min(100, Math.max(1, parseInt(c.req.query('limit') || '42', 10)));
     const offset = (page - 1) * limit;
+
+    // Validate sort parameter with whitelist
+    const VALID_SORT_COLUMNS: Record<string, string> = {
+      prompts: 'promptCount',
+      tokens: 'tokenCount',
+      lines: 'linesWritten',
+      messages: 'messageCount',
+      sessions: 'sessionCount',
+      tools: 'toolCallCount',
+    };
+
+    const sortColumn = VALID_SORT_COLUMNS[sort];
+    if (!sortColumn) {
+      return c.json({ error: 'Invalid sort parameter' }, 400);
+    }
 
     // Calculate date filter based on period
     let dateFilter: string | null = null;
@@ -249,21 +287,103 @@ api.get('/leaderboard', optionalAuth, async (c) => {
         dateFilter = null;
     }
 
-    // Determine sort column
-    let sortColumn: typeof dailyStats.messageCount | typeof dailyStats.sessionCount | typeof dailyStats.toolCallCount;
-    switch (sort) {
-      case 'sessions':
-        sortColumn = dailyStats.sessionCount;
-        break;
-      case 'tools':
-        sortColumn = dailyStats.toolCallCount;
-        break;
-      case 'messages':
-      default:
-        sortColumn = dailyStats.messageCount;
+    // For "all" period, we can use the optimized users.total_* columns
+    // For other periods, we still need to query daily_stats or ClickHouse
+    if (period === 'all') {
+      // V2 optimized query: Use users.total_* for OTel users, sum daily_stats for legacy
+      // This is a unified query that handles both data sources
+      const results = await db.all(sql`
+        SELECT
+          u.id as userId,
+          u.github_username as githubUsername,
+          u.avatar_url as avatarUrl,
+          u.badges,
+          u.otel_enabled as otelEnabled,
+          -- For OTel users, use cached totals. For legacy, sum daily_stats.
+          CASE
+            WHEN u.otel_enabled = 1 THEN u.total_prompts
+            ELSE COALESCE((SELECT SUM(prompt_count) FROM daily_stats WHERE user_id = u.id), 0)
+          END as promptCount,
+          CASE
+            WHEN u.otel_enabled = 1 THEN u.total_tokens
+            ELSE COALESCE((SELECT SUM(token_count) FROM daily_stats WHERE user_id = u.id), 0)
+          END as tokenCount,
+          CASE
+            WHEN u.otel_enabled = 1 THEN u.total_lines_added
+            ELSE COALESCE((SELECT SUM(lines_written) FROM daily_stats WHERE user_id = u.id), 0)
+          END as linesWritten,
+          CASE
+            WHEN u.otel_enabled = 1 THEN u.total_commits
+            ELSE COALESCE((SELECT SUM(commit_count) FROM daily_stats WHERE user_id = u.id), 0)
+          END as commitCount,
+          CASE
+            WHEN u.otel_enabled = 1 THEN u.total_cost_usd
+            ELSE COALESCE((SELECT SUM(cost_usd_cents) FROM daily_stats WHERE user_id = u.id), 0)
+          END as costUsdCents,
+          -- Legacy fields (for backward compat)
+          COALESCE((SELECT SUM(message_count) FROM daily_stats WHERE user_id = u.id), 0) as messageCount,
+          COALESCE((SELECT SUM(tool_call_count) FROM daily_stats WHERE user_id = u.id), 0) as toolCallCount,
+          COALESCE((SELECT SUM(session_count) FROM daily_stats WHERE user_id = u.id), 0) as sessionCount
+        FROM users u
+        WHERE u.otel_enabled = 1
+           OR EXISTS (SELECT 1 FROM daily_stats WHERE user_id = u.id)
+        ORDER BY ${sql.raw(sortColumn)} DESC
+        LIMIT ${limit}
+        OFFSET ${offset}
+      `) as any[];
+
+      // Get total count
+      const countResult = await db.all(sql`
+        SELECT COUNT(*) as count
+        FROM users u
+        WHERE u.otel_enabled = 1
+           OR EXISTS (SELECT 1 FROM daily_stats WHERE user_id = u.id)
+      `) as any[];
+      const total = countResult[0]?.count || 0;
+
+      // Transform results
+      const entries: LeaderboardEntry[] = results.map((row: any, index: number) => {
+        let badges: string[] = [];
+        try {
+          badges = row.badges ? JSON.parse(row.badges) : [];
+        } catch {
+          badges = [];
+        }
+        return {
+          rank: offset + index + 1,
+          userId: row.userId,
+          githubUsername: row.githubUsername,
+          avatarUrl: row.avatarUrl,
+          promptCount: Number(row.promptCount) || 0,
+          tokenCount: Number(row.tokenCount) || 0,
+          linesWritten: Number(row.linesWritten) || 0,
+          commitCount: Number(row.commitCount) || 0,
+          costUsdCents: Number(row.costUsdCents) || 0,
+          messageCount: Number(row.messageCount) || 0,
+          toolCallCount: Number(row.toolCallCount) || 0,
+          sessionCount: Number(row.sessionCount) || 0,
+          badges,
+        };
+      });
+
+      const response: LeaderboardResponse = {
+        entries,
+        period,
+        total,
+        page,
+        pageSize: limit,
+      };
+
+      // Check if this is an HTMX request
+      const isHtmxRequest = c.req.header('HX-Request') === 'true';
+      if (isHtmxRequest) {
+        return c.html(renderLeaderboardHtml(entries, period, page, total, limit));
+      }
+      return c.json(response);
     }
 
-    // Build the base query with aggregation
+    // For period-based queries (today/week/month), use legacy daily_stats query
+    // TODO: When ClickHouse is live, query ClickHouse for period-based data
     const baseQuery = db
       .select({
         userId: users.id,
@@ -281,25 +401,28 @@ api.get('/leaderboard', optionalAuth, async (c) => {
       .from(dailyStats)
       .innerJoin(users, eq(dailyStats.userId, users.id));
 
-    // Apply date filter if needed
+    // Apply date filter
     const queryWithFilter = dateFilter
       ? baseQuery.where(gte(dailyStats.date, dateFilter))
       : baseQuery;
 
-    // Group by user and order by selected column
-    const sortColumnName = sort === 'sessions'
-      ? 'total_sessions'
-      : sort === 'tools'
-        ? 'total_tools'
-        : 'total_messages';
+    // Group and sort
+    // Map validated sort column to the alias used in the query
+    const sortColumnAlias =
+      sortColumn === 'promptCount' ? 'total_prompts' :
+      sortColumn === 'tokenCount' ? 'total_tokens' :
+      sortColumn === 'linesWritten' ? 'total_lines' :
+      sortColumn === 'messageCount' ? 'total_messages' :
+      sortColumn === 'sessionCount' ? 'total_sessions' :
+      sortColumn === 'toolCallCount' ? 'total_tools' : 'total_prompts';
 
     const results = await queryWithFilter
       .groupBy(users.id, users.githubUsername, users.avatarUrl, users.badges)
-      .orderBy(desc(sql.raw(sortColumnName)))
+      .orderBy(desc(sql.raw(sortColumnAlias)))
       .limit(limit)
       .offset(offset);
 
-    // Get total count for pagination
+    // Get total count
     const countQuery = db
       .select({ count: sql<number>`count(distinct ${dailyStats.userId})` })
       .from(dailyStats);
@@ -311,7 +434,7 @@ api.get('/leaderboard', optionalAuth, async (c) => {
     const countResult = await countWithFilter;
     const total = countResult[0]?.count || 0;
 
-    // Transform results to LeaderboardEntry format with ranks
+    // Transform results
     const entries: LeaderboardEntry[] = results.map((row, index) => {
       let badges: string[] = [];
       try {
@@ -343,15 +466,10 @@ api.get('/leaderboard', optionalAuth, async (c) => {
       pageSize: limit,
     };
 
-    // Check if this is an HTMX request - return HTML fragment if so
     const isHtmxRequest = c.req.header('HX-Request') === 'true';
-
     if (isHtmxRequest) {
-      // Return HTML fragment for HTMX partial updates
-      const html = renderLeaderboardHtml(entries, period, page, total, limit);
-      return c.html(html);
+      return c.html(renderLeaderboardHtml(entries, period, page, total, limit));
     }
-
     return c.json(response);
   } catch (error) {
     console.error('Error fetching leaderboard:', error);
@@ -563,6 +681,85 @@ api.get('/me', requireAuth, async (c) => {
   } catch (error) {
     console.error('Error fetching user profile:', error);
     return c.json({ error: 'Failed to fetch profile' }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OTel Enable/Disable - Mark user as OTel-enabled
+// ═══════════════════════════════════════════════════════════════════════════
+
+// POST /api/otel/enable - Mark user as OTel-enabled
+api.post('/otel/enable', requireAuth, async (c) => {
+  try {
+    const user = c.get('user');
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    await db
+      .update(users)
+      .set({
+        otelEnabled: true,
+        otelSetupAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(eq(users.id, user.id));
+
+    return c.json({ success: true, otelEnabled: true });
+  } catch (error) {
+    console.error('Error enabling OTel:', error);
+    return c.json({ error: 'Failed to enable OTel' }, 500);
+  }
+});
+
+// POST /api/otel/disable - Mark user as OTel-disabled
+api.post('/otel/disable', requireAuth, async (c) => {
+  try {
+    const user = c.get('user');
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    await db
+      .update(users)
+      .set({
+        otelEnabled: false,
+        updatedAt: new Date(),
+      })
+      .where(eq(users.id, user.id));
+
+    return c.json({ success: true, otelEnabled: false });
+  } catch (error) {
+    console.error('Error disabling OTel:', error);
+    return c.json({ error: 'Failed to disable OTel' }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Admin Endpoints
+// ═══════════════════════════════════════════════════════════════════════════
+
+// POST /api/admin/sync - Manually trigger ClickHouse → SQLite sync
+// Only works if ADMIN_TOKEN env var is set and matches
+api.post('/admin/sync', async (c) => {
+  const adminToken = process.env.ADMIN_TOKEN;
+  if (!adminToken) {
+    return c.json({ error: 'Admin endpoint disabled' }, 403);
+  }
+
+  const authHeader = c.req.header('Authorization');
+  if (authHeader !== `Bearer ${adminToken}`) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  try {
+    // Dynamic import to avoid circular dependencies
+    const { triggerSync } = await import('../jobs/sync-clickhouse');
+    const result = await triggerSync();
+    return c.json({ success: true, ...result });
+  } catch (error) {
+    console.error('Error triggering sync:', error);
+    return c.json({ error: 'Sync failed', details: String(error) }, 500);
   }
 });
 

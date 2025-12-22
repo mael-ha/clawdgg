@@ -6,6 +6,13 @@ export interface DailyActivity {
   promptCount: number;      // User messages only (YOUR engagement)
   messageCount: number;     // All messages (for backward compat)
   toolCallCount: number;
+  // V3: Full token breakdown for accurate cost calculation
+  inputTokens?: number;          // New input (billable at full rate)
+  outputTokens?: number;         // Responses (billable at output rate)
+  cacheReadTokens?: number;      // Cached context reused (0.1x rate)
+  cacheCreationTokens?: number;  // New cache created (1.25x rate)
+  costUsdCents?: number;         // Calculated cost in cents
+  // Code metrics
   linesWritten: number;     // Lines of code written
   commitCount: number;      // Git commits
   sessionCount: number;     // Legacy, kept for backward compat
@@ -69,11 +76,17 @@ export interface LeaderboardEntry {
   // Code metrics
   linesWritten: number;     // Lines of code written
   commitCount: number;      // Git commits
+  // V2 OTel: Cost tracking
+  costUsdCents?: number;    // Cost in cents (divide by 100 for USD)
   // Legacy (kept for backward compat)
   messageCount: number;
   toolCallCount: number;
   sessionCount: number;
-  badges?: string[];
+  // Enhanced display fields
+  badges?: string[];        // Array of badge IDs
+  currentStreak?: number;   // Current streak in days
+  rankChange?: number;      // Change since yesterday (+3, -2, 0)
+  lastActive?: Date | null; // Last activity timestamp
 }
 
 export interface LeaderboardResponse {
