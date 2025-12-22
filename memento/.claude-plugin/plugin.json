@@ -1,0 +1,12 @@
+{
+  "name": "memento",
+  "version": "1.0.0",
+  "description": "Persistent memory system for Claude. Provides structured storage, tiered loading, and session continuity across conversations.",
+  "author": {
+    "name": "Claude & Mael",
+    "email": "hello@clawd.gg"
+  },
+  "repository": "https://github.com/mael-ha/memento",
+  "license": "MIT",
+  "keywords": ["memory", "context", "persistence", "brain", "continuity"]
+}
