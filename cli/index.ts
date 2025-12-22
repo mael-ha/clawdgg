@@ -193,7 +193,7 @@ function countLines(str: string): number {
 // Helper: Get file extension from path
 function getExtension(filepath: string): string {
   const match = filepath.match(/\.([a-zA-Z0-9]+)$/);
-  return match ? match[1].toLowerCase() : 'unknown';
+  return match?.[1]?.toLowerCase() ?? 'unknown';
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -249,48 +249,49 @@ const DEFAULT_PRICING = { input: 3.0, output: 15.0, cacheRead: 0.3, cacheWrite: 
 
 function getModelPricing(model: string): typeof DEFAULT_PRICING {
   // Try exact match first
-  if (MODEL_PRICING[model]) return MODEL_PRICING[model];
+  const exact = MODEL_PRICING[model];
+  if (exact) return exact;
 
   // Fuzzy match by model family (handles version date variations)
   const modelLower = model.toLowerCase();
 
   // Opus family
   if (modelLower.includes('opus-4-5') || modelLower.includes('opus-4.5')) {
-    return MODEL_PRICING['claude-opus-4-5-20251101'];
+    return MODEL_PRICING['claude-opus-4-5-20251101']!;
   }
   if (modelLower.includes('opus-4-1') || modelLower.includes('opus-4.1')) {
-    return MODEL_PRICING['claude-opus-4-1-20250429'];
+    return MODEL_PRICING['claude-opus-4-1-20250429']!;
   }
   if (modelLower.includes('opus-4') && !modelLower.includes('opus-4-5') && !modelLower.includes('opus-4-1')) {
-    return MODEL_PRICING['claude-opus-4-20250514'];
+    return MODEL_PRICING['claude-opus-4-20250514']!;
   }
   if (modelLower.includes('opus-3') || modelLower.includes('opus 3')) {
-    return MODEL_PRICING['claude-3-opus-20240229'];
+    return MODEL_PRICING['claude-3-opus-20240229']!;
   }
 
   // Sonnet family
   if (modelLower.includes('sonnet-4-5') || modelLower.includes('sonnet-4.5')) {
-    return MODEL_PRICING['claude-sonnet-4-5-20250929'];
+    return MODEL_PRICING['claude-sonnet-4-5-20250929']!;
   }
   if (modelLower.includes('sonnet-4') && !modelLower.includes('sonnet-4-5')) {
-    return MODEL_PRICING['claude-sonnet-4-20250514'];
+    return MODEL_PRICING['claude-sonnet-4-20250514']!;
   }
   if (modelLower.includes('sonnet-3-7') || modelLower.includes('sonnet-3.7')) {
-    return MODEL_PRICING['claude-3-7-sonnet-20250219'];
+    return MODEL_PRICING['claude-3-7-sonnet-20250219']!;
   }
   if (modelLower.includes('sonnet-3-5') || modelLower.includes('sonnet-3.5') || modelLower.includes('3-5-sonnet')) {
-    return MODEL_PRICING['claude-3-5-sonnet-20241022'];
+    return MODEL_PRICING['claude-3-5-sonnet-20241022']!;
   }
 
   // Haiku family
   if (modelLower.includes('haiku-4-5') || modelLower.includes('haiku-4.5')) {
-    return MODEL_PRICING['claude-haiku-4-5-20251001'];
+    return MODEL_PRICING['claude-haiku-4-5-20251001']!;
   }
   if (modelLower.includes('haiku-3-5') || modelLower.includes('haiku-3.5') || modelLower.includes('3-5-haiku')) {
-    return MODEL_PRICING['claude-3-5-haiku-20241022'];
+    return MODEL_PRICING['claude-3-5-haiku-20241022']!;
   }
   if (modelLower.includes('haiku-3') || modelLower.includes('3-haiku')) {
-    return MODEL_PRICING['claude-3-haiku-20240307'];
+    return MODEL_PRICING['claude-3-haiku-20240307']!;
   }
 
   // Default to Sonnet 4 pricing (most common)
@@ -381,15 +382,16 @@ async function parseSessionFile(filepath: string): Promise<{
         const dayStats = dailyStats[date];
 
         // Count prompts (user messages only) and all messages
+        // IMPORTANT: hourCounts only tracks USER messages to match Claude Code's peak hour calculation
         if (role === 'user') {
           dayStats.promptCount++;
           dayStats.messageCount++;
           sessionMessages++;
-          hourCounts[hour] = (hourCounts[hour] || 0) + 1;
+          hourCounts[hour] = (hourCounts[hour] || 0) + 1;  // Only count user prompts for peak hour
         } else if (role === 'assistant') {
           dayStats.messageCount++;
           sessionMessages++;
-          hourCounts[hour] = (hourCounts[hour] || 0) + 1;
+          // Don't count assistant messages in hourCounts - we want to match Claude Code's peak hour
         }
 
         // Process assistant messages for tool calls and code metrics
@@ -565,8 +567,8 @@ interface SerializedDailyStats {
   toolCallCount: number;
   inputTokens: number;
   outputTokens: number;
-  cacheReadTokens: number;
-  cacheCreationTokens: number;
+  cacheReadTokens: number;       // Cached context reused (0.1x rate)
+  cacheCreationTokens: number;   // New cache created (1.25x rate)
   tokensByModel: Record<string, number>;
   costUsdCents: number;
   linesWritten: number;
@@ -628,7 +630,10 @@ async function saveParsedCache(cache: ParsedStatsCache): Promise<void> {
       toolCallCount: stats.toolCallCount,
       inputTokens: stats.inputTokens,
       outputTokens: stats.outputTokens,
+      cacheReadTokens: stats.cacheReadTokens,
+      cacheCreationTokens: stats.cacheCreationTokens,
       tokensByModel: stats.tokensByModel,
+      costUsdCents: stats.costUsdCents,
       linesWritten: stats.linesWritten,
       filesEditedCount: stats.filesEdited.size,
       commitCount: stats.commitCount,
@@ -766,12 +771,72 @@ interface BadgeData {
   longestSessionMessages?: number;
 }
 
+// Official streak data from stats-cache.json (matches Claude Code's /stats exactly)
+interface OfficialStreakData {
+  officialCurrentStreak?: number;
+  officialLongestStreak?: number;
+  officialActiveDays?: number;
+}
+
+// Helper to calculate streak from sorted dates (same logic as server)
+function calculateStreaksFromDates(dates: string[]): { currentStreak: number; longestStreak: number } {
+  if (dates.length === 0) return { currentStreak: 0, longestStreak: 0 };
+
+  const today = new Date().toISOString().split('T')[0]!;
+  const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0]!;
+
+  let currentStreak = 0;
+  let longestStreak = 0;
+  let streak = 1;
+
+  // Check if the most recent date is today or yesterday (for current streak)
+  const lastDate = dates[dates.length - 1]!;
+  const isActive = lastDate === today || lastDate === yesterday;
+
+  for (let i = 1; i < dates.length; i++) {
+    const prevDateStr = dates[i - 1]!;
+    const currDateStr = dates[i]!;
+    const prevDate = new Date(prevDateStr);
+    const currDate = new Date(currDateStr);
+    const diffDays = (currDate.getTime() - prevDate.getTime()) / 86400000;
+
+    if (diffDays === 1) {
+      streak++;
+    } else {
+      longestStreak = Math.max(longestStreak, streak);
+      streak = 1;
+    }
+  }
+  longestStreak = Math.max(longestStreak, streak);
+
+  // Current streak: count backwards from today/yesterday
+  if (isActive) {
+    currentStreak = 1;
+    for (let i = dates.length - 2; i >= 0; i--) {
+      const currDateStr = dates[i + 1]!;
+      const prevDateStr = dates[i]!;
+      const currDate = new Date(currDateStr);
+      const prevDate = new Date(prevDateStr);
+      const diffDays = (currDate.getTime() - prevDate.getTime()) / 86400000;
+
+      if (diffDays === 1) {
+        currentStreak++;
+      } else {
+        break;
+      }
+    }
+  }
+
+  return { currentStreak, longestStreak };
+}
+
 // API calls
 async function syncStats(
   dailyActivity: DailyActivity[],
   dailyModelTokens: DailyModelTokens[] | undefined,
   firstSessionDate: string | undefined,
   badgeData: BadgeData,
+  officialStreakData: OfficialStreakData,
   token: string
 ): Promise<SyncResponse> {
   try {
@@ -786,6 +851,7 @@ async function syncStats(
         dailyModelTokens,
         firstSessionDate,
         ...badgeData,
+        ...officialStreakData,
       }),
     });
 
@@ -874,7 +940,7 @@ async function initiateLogin(): Promise<void> {
 
 // Helper to get today's date in YYYY-MM-DD format
 function getTodayDate(): string {
-  return new Date().toISOString().split('T')[0];
+  return new Date().toISOString().split('T')[0]!;
 }
 
 // Commands
@@ -967,10 +1033,35 @@ async function cmdSync(forceFullSync: boolean = false): Promise<void> {
   log.info("Uploading to clawd.gg...");
 
   // Extract badge-relevant data
+  // IMPORTANT: Use stats-cache.json for hourCounts to match Claude Code's peak hour
+  // (stats-cache counts session starts, our parsing counts all messages - very different!)
+  const officialStats = await loadStats();
   const badgeData: BadgeData = {
-    hourCounts: rawStats.hourCounts,
+    // Use stats-cache.json hourCounts if available (session-based, matches /stats)
+    // Fall back to our parsed hourCounts (message-based) only if stats-cache unavailable
+    hourCounts: officialStats?.hourCounts || rawStats.hourCounts,
     longestSessionMessages: rawStats.longestSessionMessages,
   };
+
+  // Calculate official streaks from stats-cache.json (matches Claude Code's /stats exactly)
+  // This is critical for accurate streak display that matches what users see in Claude Code
+  let officialStreakData: OfficialStreakData = {};
+  if (officialStats?.dailyActivity) {
+    // Extract unique, sorted dates from stats-cache.json
+    const officialDates = officialStats.dailyActivity
+      .map(d => d.date)
+      .filter((date, i, arr) => arr.indexOf(date) === i) // unique
+      .sort();
+
+    const { currentStreak, longestStreak } = calculateStreaksFromDates(officialDates);
+    officialStreakData = {
+      officialCurrentStreak: currentStreak,
+      officialLongestStreak: longestStreak,
+      officialActiveDays: officialDates.length,
+    };
+
+    log.dim(`Official stats: ${officialDates.length} days, streak ${currentStreak}/${longestStreak}`);
+  }
 
   // Build token data per day (for the API)
   const datesToSync = new Set(activityToSync.map(d => d.date));
@@ -982,7 +1073,7 @@ async function cmdSync(forceFullSync: boolean = false): Promise<void> {
     }));
 
   try {
-    const result = await syncStats(activityToSync, tokensToSync, rawStats.firstSessionDate, badgeData, config.token);
+    const result = await syncStats(activityToSync, tokensToSync, rawStats.firstSessionDate, badgeData, officialStreakData, config.token);
 
     // Update lastSyncDate in config
     if (result.lastDate) {
@@ -1061,15 +1152,36 @@ function formatTokens(n: number): string {
   return n.toString();
 }
 
+// Dashboard V2: Extended profile data
 interface ProfileData {
   username: string;
   rank: number;
   totalUsers: number;
+  percentile: number;
+  // V2: Archetype
+  archetype: string;
+  archetypeDescription: string;
+  // Primary metrics
+  totalPrompts: number;
+  totalTokens: number;
+  totalCostCents: number;
+  // Token breakdown
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCacheReadTokens: number;
+  totalCacheCreationTokens: number;
+  // Code metrics
+  totalLines: number;
+  totalCommits: number;
+  // Derived metrics
+  outputLeverage: number;
+  cacheEfficiency: number;
+  // Legacy
   totalMessages: number;
   totalSessions: number;
   totalToolCalls: number;
-  totalTokens: number;
   currentStreak: number;
+  longestStreak: number;
   badges: string[];
 }
 
@@ -1088,6 +1200,14 @@ async function fetchProfile(token: string): Promise<ProfileData | null> {
   }
 }
 
+// Format cost in dollars
+function formatCost(cents: number): string {
+  const dollars = cents / 100;
+  if (dollars >= 1000) return `$${(dollars / 1000).toFixed(1)}K`;
+  if (dollars >= 1) return `$${dollars.toFixed(0)}`;
+  return `$${dollars.toFixed(2)}`;
+}
+
 async function cmdStatus(): Promise<void> {
   const config = await loadConfig();
 
@@ -1102,35 +1222,24 @@ async function cmdStatus(): Promise<void> {
 
   // Calculate local totals from raw parsed data
   let localPrompts = 0;
-  let localMessages = 0;
   let localTokens = 0;
+  let localCost = 0;
   let localLines = 0;
   let localCommits = 0;
 
   if (rawStats) {
     for (const stats of Object.values(rawStats.dailyStats)) {
       localPrompts += stats.promptCount;
-      localMessages += stats.messageCount;
       localTokens += stats.inputTokens + stats.outputTokens;
+      localCost += stats.costUsdCents;
       localLines += stats.linesWritten;
       localCommits += stats.commitCount;
     }
   }
 
-  // Use local data (more accurate than server for now)
-  const prompts = localPrompts;
-  const tokens = localTokens;
-  const lines = localLines;
-  const commits = localCommits;
-  const filesEdited = rawStats?.totalFilesEdited || 0;
-  const tokensPerPrompt = prompts > 0 ? Math.round(tokens / prompts) : 0;
-
-  // For progress bars, scale based on prompts and lines
-  const maxStat = Math.max(prompts, lines, 1);
-
   // Build the ASCII box
-  const boxWidth = 45;
-  const innerWidth = boxWidth - 4; // Account for "│  " and "  │"
+  const boxWidth = 56;
+  const innerWidth = boxWidth - 4;
 
   console.log();
 
@@ -1138,27 +1247,23 @@ async function cmdStatus(): Promise<void> {
   let celebrations: string[] = [];
 
   if (profile) {
-    // Check for #1 achievement
     if (profile.rank === 1 && config.lastKnownRank !== 1) {
-      celebrations.push(`👑 YOU'RE #1. I'm genuinely impressed.`);
+      celebrations.push(`👑 YOU'RE #1`);
     }
 
-    // Check for new badges
     const lastBadges = new Set(config.lastKnownBadges || []);
     const newBadges = profile.badges.filter(b => !lastBadges.has(b));
     if (newBadges.length > 0) {
-      const badgeName = BADGE_EMOJIS[newBadges[0]] ? `${BADGE_EMOJIS[newBadges[0]]} ${newBadges[0].replace(/_/g, ' ')}` : newBadges[0];
-      celebrations.push(`🎉 NEW BADGE: ${badgeName}`);
+      const badgeName = BADGE_EMOJIS[newBadges[0] ?? ''] ? `${BADGE_EMOJIS[newBadges[0] ?? '']} ${(newBadges[0] ?? '').replace(/_/g, ' ')}` : newBadges[0];
+      celebrations.push(`NEW BADGE: ${badgeName}`);
     }
 
-    // Check for streak record (only if we have a previous record to compare)
     if (config.lastKnownLongestStreak !== undefined &&
         profile.currentStreak > config.lastKnownLongestStreak &&
         profile.currentStreak > 1) {
-      celebrations.push(`🔥 NEW STREAK RECORD: ${profile.currentStreak} days!`);
+      celebrations.push(`🔥 ${profile.currentStreak} DAY STREAK`);
     }
 
-    // Save new state for next time
     await saveConfig({
       ...config,
       lastKnownBadges: profile.badges,
@@ -1171,119 +1276,101 @@ async function cmdStatus(): Promise<void> {
   if (celebrations.length > 0) {
     console.log(`${colors.dim}┌${'─'.repeat(boxWidth - 2)}┐${colors.reset}`);
     for (const celebration of celebrations) {
-      const celebPadding = Math.max(0, innerWidth - celebration.replace(/[^\x00-\x7F]/g, '  ').length + celebration.replace(/[\x00-\x7F]/g, '').length);
+      const celebLen = celebration.replace(/[^\x00-\x7F]/g, '  ').length - celebration.replace(/[\x00-\x7F]/g, '').length;
+      const celebPadding = Math.max(0, innerWidth - celebLen);
       console.log(`${colors.dim}│${colors.reset}  ${colors.bright}${colors.yellow}${celebration}${colors.reset}${' '.repeat(celebPadding)}  ${colors.dim}│${colors.reset}`);
     }
     console.log(`${colors.dim}├${'─'.repeat(boxWidth - 2)}┤${colors.reset}`);
   } else {
-    // Top border (no celebration)
     console.log(`${colors.dim}┌${'─'.repeat(boxWidth - 2)}┐${colors.reset}`);
   }
 
-  // Header line with username and rank
-  if (config.username) {
-    const username = `@${config.username}`;
-    // Show rank as #X/Y for context
-    const rankStr = profile && profile.totalUsers > 0
-      ? `#${profile.rank}/${fmt(profile.totalUsers)}`
-      : (profile ? `#${profile.rank}` : '');
-    const headerPadding = innerWidth - username.length - rankStr.length;
-    console.log(`${colors.dim}│${colors.reset}  ${colors.bright}${colors.cyan}${username}${colors.reset}${' '.repeat(headerPadding)}${colors.yellow}${rankStr}${colors.reset}  ${colors.dim}│${colors.reset}`);
+  // ═══════════════════════════════════════════════════════════════════════════
+  // DASHBOARD V2: ARCHETYPE + COST HERO
+  // ═══════════════════════════════════════════════════════════════════════════
 
-    // Percentile line (the real flex)
-    // rank 1 / 100 users = top 1%, rank 50 / 100 = top 50%
-    if (profile && profile.totalUsers > 0) {
-      const percentile = Math.max(1, Math.ceil((profile.rank / profile.totalUsers) * 100));
-      const percentileStr = `Top ${percentile}%`;
-      const percentilePadding = innerWidth - percentileStr.length;
-      console.log(`${colors.dim}│${colors.reset}${' '.repeat(percentilePadding)}  ${colors.green}${percentileStr}${colors.reset}  ${colors.dim}│${colors.reset}`);
+  // Archetype line (the identity)
+  if (profile) {
+    const archetype = profile.archetype || 'Claude Code User';
+    const archetypeUpper = archetype.toUpperCase();
+    const archetypePadding = Math.floor((innerWidth - archetypeUpper.length) / 2);
+    console.log(`${colors.dim}│${colors.reset}${' '.repeat(archetypePadding)}${colors.cyan}${colors.bright}${archetypeUpper}${colors.reset}${' '.repeat(innerWidth - archetypePadding - archetypeUpper.length)}${colors.dim}│${colors.reset}`);
+
+    // Archetype description
+    if (profile.archetypeDescription) {
+      const desc = profile.archetypeDescription;
+      const descPadding = Math.floor((innerWidth - desc.length) / 2);
+      console.log(`${colors.dim}│${colors.reset}${' '.repeat(descPadding)}${colors.dim}${desc}${colors.reset}${' '.repeat(innerWidth - descPadding - desc.length)}${colors.dim}│${colors.reset}`);
     }
+
+    console.log(`${colors.dim}│${colors.reset}${' '.repeat(innerWidth)}${colors.dim}│${colors.reset}`);
+
+    // COST - The hero stat
+    const cost = profile.totalCostCents > 0 ? profile.totalCostCents : localCost;
+    const costDisplay = formatCost(cost);
+    const costLabel = 'invested in Claude';
+    const costLine = `${costDisplay} ${costLabel}`;
+    const costPadding = Math.floor((innerWidth - costLine.length) / 2);
+    console.log(`${colors.dim}│${colors.reset}${' '.repeat(costPadding)}${colors.bright}${costDisplay}${colors.reset} ${colors.dim}${costLabel}${colors.reset}${' '.repeat(innerWidth - costPadding - costLine.length)}${colors.dim}│${colors.reset}`);
+
+    console.log(`${colors.dim}│${colors.reset}${' '.repeat(innerWidth)}${colors.dim}│${colors.reset}`);
+
+    // Rank + Percentile
+    const rankLine = `#${profile.rank} of ${fmt(profile.totalUsers)}`;
+    const percentileDisplay = profile.percentile < 1 ? `Top ${profile.percentile}%` : `Top ${Math.round(profile.percentile)}%`;
+    const rankPercentile = `${rankLine}  •  ${percentileDisplay}`;
+    const rpPadding = Math.floor((innerWidth - rankPercentile.length) / 2);
+    console.log(`${colors.dim}│${colors.reset}${' '.repeat(rpPadding)}${colors.yellow}${rankLine}${colors.reset}  ${colors.dim}•${colors.reset}  ${colors.green}${percentileDisplay}${colors.reset}${' '.repeat(innerWidth - rpPadding - rankPercentile.length)}${colors.dim}│${colors.reset}`);
+  } else if (config.username) {
+    const msg = `@${config.username}`;
+    const padding = Math.floor((innerWidth - msg.length) / 2);
+    console.log(`${colors.dim}│${colors.reset}${' '.repeat(padding)}${colors.cyan}${msg}${colors.reset}${' '.repeat(innerWidth - padding - msg.length)}${colors.dim}│${colors.reset}`);
   } else {
     const msg = 'Not logged in';
-    const padding = innerWidth - msg.length;
-    console.log(`${colors.dim}│${colors.reset}  ${colors.yellow}${msg}${colors.reset}${' '.repeat(padding)}  ${colors.dim}│${colors.reset}`);
+    const padding = Math.floor((innerWidth - msg.length) / 2);
+    console.log(`${colors.dim}│${colors.reset}${' '.repeat(padding)}${colors.yellow}${msg}${colors.reset}${' '.repeat(innerWidth - padding - msg.length)}${colors.dim}│${colors.reset}`);
   }
 
   // Separator
   console.log(`${colors.dim}├${'─'.repeat(boxWidth - 2)}┤${colors.reset}`);
 
-  // Empty line
-  console.log(`${colors.dim}│${colors.reset}${' '.repeat(boxWidth - 2)}${colors.dim}│${colors.reset}`);
+  // ═══════════════════════════════════════════════════════════════════════════
+  // YOUR NUMBERS (local data, always shown)
+  // ═══════════════════════════════════════════════════════════════════════════
 
-  // Primary stat: Prompts sent (YOUR engagement)
-  const promptsLabel = pad('Prompts', 10);
-  const promptsBar = progressBar(prompts, maxStat, 16);
-  const promptsValue = pad(fmt(prompts), 8, 'right');
-  console.log(`${colors.dim}│${colors.reset}  ${promptsLabel}${promptsBar}  ${colors.cyan}${promptsValue}${colors.reset}  ${colors.dim}│${colors.reset}`);
+  const statLine = (label: string, value: string, color: string = colors.white) => {
+    const line = `${label}${' '.repeat(20 - label.length)}${value}`;
+    const linePadding = innerWidth - line.length;
+    console.log(`${colors.dim}│${colors.reset}  ${colors.dim}${label}${colors.reset}${' '.repeat(20 - label.length)}${color}${value}${colors.reset}${' '.repeat(linePadding - 2)}${colors.dim}│${colors.reset}`);
+  };
 
-  // Lines of code (if any)
-  if (lines > 0) {
-    const linesLabel = pad('Lines', 10);
-    const linesBar = progressBar(lines, maxStat, 16);
-    const linesValue = pad(fmt(lines), 8, 'right');
-    console.log(`${colors.dim}│${colors.reset}  ${linesLabel}${linesBar}  ${colors.green}${linesValue}${colors.reset}  ${colors.dim}│${colors.reset}`);
+  console.log(`${colors.dim}│${colors.reset}${' '.repeat(innerWidth)}${colors.dim}│${colors.reset}`);
+
+  statLine('Tokens', formatTokens(localTokens), colors.yellow);
+  statLine('Lines Written', fmt(localLines), colors.green);
+  statLine('Commits', fmt(localCommits), colors.magenta);
+  statLine('Prompts', fmt(localPrompts), colors.cyan);
+
+  // Derived metrics from profile
+  if (profile && profile.outputLeverage > 0) {
+    console.log(`${colors.dim}│${colors.reset}${' '.repeat(innerWidth)}${colors.dim}│${colors.reset}`);
+    statLine('Output Leverage', `${profile.outputLeverage}x`, colors.dim);
   }
 
-  // Tokens line - the flex stat
-  const tokensLabel = pad('Tokens', 10);
-  const tokensValue = formatTokens(tokens);
-  const tokensPadding = 16 + 2 + 8 - tokensValue.length - 2;
-  console.log(`${colors.dim}│${colors.reset}  ${tokensLabel}${' '.repeat(tokensPadding)}${colors.yellow}${tokensValue} ⚡${colors.reset}  ${colors.dim}│${colors.reset}`);
+  console.log(`${colors.dim}│${colors.reset}${' '.repeat(innerWidth)}${colors.dim}│${colors.reset}`);
 
-  // Tokens per prompt (conversation depth)
-  if (tokensPerPrompt > 0) {
-    const tppLabel = pad('', 10);  // No label, it's a sub-stat
-    const tppValue = `${fmt(tokensPerPrompt)} tok/prompt`;
-    const tppPadding = 16 + 2 + 8 - tppValue.length;
-    console.log(`${colors.dim}│${colors.reset}  ${tppLabel}${' '.repeat(tppPadding)}${colors.dim}${tppValue}${colors.reset}  ${colors.dim}│${colors.reset}`);
-  }
-
-  // Secondary stats: Commits, Files (if any)
-  if (commits > 0 || filesEdited > 0) {
-    console.log(`${colors.dim}│${colors.reset}${' '.repeat(boxWidth - 2)}${colors.dim}│${colors.reset}`);
-    let secondaryLine = '  ';
-    if (commits > 0) {
-      secondaryLine += `📦 ${commits} commits`;
-      if (filesEdited > 0) secondaryLine += '  ';
-    }
-    if (filesEdited > 0) {
-      secondaryLine += `📁 ${filesEdited} files`;
-    }
-    const secondaryPadding = innerWidth - secondaryLine.length + 2;
-    console.log(`${colors.dim}│${colors.reset}${secondaryLine}${' '.repeat(Math.max(0, secondaryPadding))}  ${colors.dim}│${colors.reset}`);
-  }
-
-  // Empty line
-  console.log(`${colors.dim}│${colors.reset}${' '.repeat(boxWidth - 2)}${colors.dim}│${colors.reset}`);
-
-  // Badges and streak line
-  if (profile && (profile.currentStreak > 0 || profile.badges.length > 0)) {
-    let badgeLine = '';
-
-    if (profile.currentStreak > 0) {
-      badgeLine += `🔥 ${profile.currentStreak} day streak`;
-    }
-
-    if (profile.badges.length > 0) {
-      const badgeEmojis = profile.badges
-        .slice(0, 4)
-        .map(b => BADGE_EMOJIS[b] || '')
-        .filter(Boolean)
-        .join(' ');
-      if (badgeLine) badgeLine += '    ';
-      badgeLine += badgeEmojis;
-    }
-
-    const padding = innerWidth - badgeLine.replace(/[^\x00-\x7F]/g, '  ').length + badgeLine.replace(/[\x00-\x7F]/g, '').length;
-    console.log(`${colors.dim}│${colors.reset}  ${badgeLine}${' '.repeat(Math.max(0, padding))}  ${colors.dim}│${colors.reset}`);
-    console.log(`${colors.dim}│${colors.reset}${' '.repeat(boxWidth - 2)}${colors.dim}│${colors.reset}`);
+  // Streak
+  if (profile && profile.currentStreak > 0) {
+    const streakLine = `🔥 ${profile.currentStreak} days`;
+    const streakPadding = innerWidth - streakLine.length + 1;
+    console.log(`${colors.dim}│${colors.reset}  ${streakLine}${' '.repeat(streakPadding - 2)}${colors.dim}│${colors.reset}`);
   }
 
   // Profile link
   if (config.username) {
     const link = `clawd.gg/u/${config.username}`;
-    const padding = innerWidth - link.length;
-    console.log(`${colors.dim}│${colors.reset}  ${colors.dim}${link}${colors.reset}${' '.repeat(padding)}  ${colors.dim}│${colors.reset}`);
+    const linkPadding = innerWidth - link.length;
+    console.log(`${colors.dim}│${colors.reset}  ${colors.dim}${link}${colors.reset}${' '.repeat(linkPadding - 2)}${colors.dim}│${colors.reset}`);
   }
 
   // Bottom border

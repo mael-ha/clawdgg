@@ -3,9 +3,22 @@ import type { FC } from 'hono/jsx';
 import { Layout } from '../components/Layout';
 import { db } from '../db';
 import { dailyStats, users } from '../db/schema';
-import { eq, sql, asc, desc } from 'drizzle-orm';
+import { eq, sql, asc } from 'drizzle-orm';
 import { getBadges, BADGES } from '../lib/badges';
-import { getTokenComparison, getPromptsComparison, getLinesComparison } from '../lib/comparisons';
+import { getTokenComparison } from '../lib/comparisons';
+import {
+  calculateArchetypes,
+  formatArchetypeDisplay,
+  getArchetypeDescription,
+  calculateDerivedMetrics,
+  getPeakHour,
+  type ArchetypeInput,
+  type ArchetypeScore,
+  type DerivedMetrics,
+  type PeakHourInfo
+} from '../lib/archetypes';
+import { TokenOrbit } from '../components/TokenOrbit';
+import { ActivityRadar } from '../components/ActivityRadar';
 import type { SessionUser } from '../types';
 
 type Variables = {
@@ -14,7 +27,39 @@ type Variables = {
 
 const app = new Hono<{ Variables: Variables }>();
 
-// Contribution graph component (GitHub-style, 365 days)
+// ═══════════════════════════════════════════════════════════════════════════
+// UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Format tokens with K/M/B suffix
+function formatTokens(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
+  return n.toString();
+}
+
+// Format cost in dollars
+function formatCost(cents: number): string {
+  const dollars = cents / 100;
+  if (dollars >= 1000) return `$${(dollars / 1000).toFixed(1)}K`;
+  if (dollars >= 1) return `$${dollars.toFixed(0)}`;
+  return `$${dollars.toFixed(2)}`;
+}
+
+// Format hours as readable string
+function formatHours(seconds: number): string {
+  const hours = Math.floor(seconds / 3600);
+  if (hours >= 1) return `${hours}h`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMPONENTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Contribution graph (GitHub-style, 365 days)
 interface ContributionDay {
   date: string;
   count: number;
@@ -22,26 +67,23 @@ interface ContributionDay {
 }
 
 const ContributionGraph: FC<{ days: ContributionDay[] }> = ({ days }) => {
-  // Build a map for quick lookup
   const dayMap = new Map(days.map(d => [d.date, d]));
-
-  // Generate all dates for the last 365 days
   const allDays: ContributionDay[] = [];
   const today = new Date();
+
   for (let i = 364; i >= 0; i--) {
     const date = new Date(today);
     date.setDate(date.getDate() - i);
-    const dateStr = date.toISOString().split('T')[0];
+    const dateStr = date.toISOString().split('T')[0] as string;
     const existing = dayMap.get(dateStr);
-    allDays.push(existing || { date: dateStr, count: 0, level: 0 });
+    allDays.push(existing || { date: dateStr, count: 0, level: 0 as const });
   }
 
-  // Group by weeks (columns)
   const weeks: ContributionDay[][] = [];
   let currentWeek: ContributionDay[] = [];
+  const firstDay = allDays[0];
+  const firstDayOfWeek = firstDay ? new Date(firstDay.date).getDay() : 0;
 
-  // Pad first week to start on Sunday
-  const firstDayOfWeek = new Date(allDays[0].date).getDay();
   for (let i = 0; i < firstDayOfWeek; i++) {
     currentWeek.push({ date: '', count: 0, level: 0 });
   }
@@ -53,16 +95,14 @@ const ContributionGraph: FC<{ days: ContributionDay[] }> = ({ days }) => {
       currentWeek = [];
     }
   }
-  if (currentWeek.length > 0) {
-    weeks.push(currentWeek);
-  }
+  if (currentWeek.length > 0) weeks.push(currentWeek);
 
   const levelColors = [
-    'bg-gray-800',           // 0 - no activity
-    'bg-cyan-900',           // 1 - low
-    'bg-cyan-700',           // 2 - medium
-    'bg-cyan-500',           // 3 - high
-    'bg-cyan-300',           // 4 - very high
+    'bg-gray-800',
+    'bg-cyan-900',
+    'bg-cyan-700',
+    'bg-cyan-500',
+    'bg-cyan-300',
   ];
 
   const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -70,7 +110,6 @@ const ContributionGraph: FC<{ days: ContributionDay[] }> = ({ days }) => {
   return (
     <div class="overflow-x-auto">
       <div class="inline-block min-w-max">
-        {/* Month labels */}
         <div class="flex mb-1 ml-8">
           {weeks.map((week, i) => {
             if (i === 0 || i % 4 === 0) {
@@ -83,9 +122,7 @@ const ContributionGraph: FC<{ days: ContributionDay[] }> = ({ days }) => {
             return null;
           })}
         </div>
-
         <div class="flex gap-[2px]">
-          {/* Day labels */}
           <div class="flex flex-col gap-[2px] mr-2 text-xs text-gray-500">
             <span class="h-[10px]"></span>
             <span class="h-[10px]">Mon</span>
@@ -95,26 +132,22 @@ const ContributionGraph: FC<{ days: ContributionDay[] }> = ({ days }) => {
             <span class="h-[10px]">Fri</span>
             <span class="h-[10px]"></span>
           </div>
-
-          {/* Grid */}
           {weeks.map((week, weekIdx) => (
             <div key={weekIdx} class="flex flex-col gap-[2px]">
               {week.map((day, dayIdx) => (
                 <div
                   key={dayIdx}
-                  class={`w-[10px] h-[10px] rounded-sm ${day.date ? levelColors[day.level] : 'bg-transparent'} ${day.date ? 'hover:ring-1 hover:ring-gray-600' : ''}`}
+                  class={`w-[10px] h-[10px] rounded-sm ${day.date ? levelColors[day.level] : 'bg-transparent'} ${day.date ? 'hover:ring-1 hover:ring-gray-600 transition-all' : ''}`}
                   title={day.date ? `${day.date}: ${day.count} messages` : ''}
-                ></div>
+                />
               ))}
             </div>
           ))}
         </div>
-
-        {/* Legend */}
         <div class="flex items-center gap-1 mt-2 justify-end text-xs text-gray-500">
           <span>Less</span>
           {levelColors.map((color, i) => (
-            <div key={i} class={`w-[10px] h-[10px] rounded-sm ${color}`}></div>
+            <div key={i} class={`w-[10px] h-[10px] rounded-sm ${color}`} />
           ))}
           <span>More</span>
         </div>
@@ -123,289 +156,396 @@ const ContributionGraph: FC<{ days: ContributionDay[] }> = ({ days }) => {
   );
 };
 
-// Badge showcase component
-interface BadgeShowcaseProps {
-  badgeIds: string[];
+// Stat row for the two-column grid
+interface StatRowProps {
+  label: string;
+  value: string;
+  percentile?: string;
+  detail?: string;
 }
 
-const BadgeShowcase: FC<BadgeShowcaseProps> = ({ badgeIds }) => {
-  const badges = getBadges(badgeIds);
-
-  if (badges.length === 0) {
-    return (
-      <div class="text-center py-8 text-gray-500">
-        <div class="text-4xl mb-2">🏆</div>
-        <p class="font-mono text-sm">No badges yet. Keep coding!</p>
-      </div>
-    );
-  }
-
-  return (
-    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-      {badges.map((badge) => (
-        <div
-          key={badge.id}
-          class="flex items-center gap-4 p-4 bg-gray-900/50 border border-gray-800 rounded-lg hover:border-cyan-500/30 transition-colors"
-        >
-          <div class="text-3xl">{badge.emoji}</div>
-          <div>
-            <div class="font-bold text-gray-100">{badge.name}</div>
-            <div class="text-sm text-gray-500">{badge.description}</div>
-          </div>
-        </div>
-      ))}
+const StatRow: FC<StatRowProps> = ({ label, value, percentile, detail }) => (
+  <div class="flex items-center justify-between py-3 border-b border-gray-800/50 last:border-0">
+    <div class="flex flex-col">
+      <span class="text-gray-400 text-sm">{label}</span>
+      {detail && <span class="text-gray-600 text-xs">{detail}</span>}
     </div>
-  );
-};
-
-// Stat card component
-const StatCard: FC<{ label: string; value: string | number; icon: string; color: string }> = ({ label, value, icon, color }) => (
-  <div class="p-4 bg-gray-900/50 border border-gray-800 rounded-lg">
-    <div class="flex items-center gap-2 mb-2">
-      <span class={`text-lg ${color}`}>{icon}</span>
-      <span class="text-xs text-gray-500 uppercase tracking-wide">{label}</span>
-    </div>
-    <div class={`text-2xl font-bold ${color}`}>
-      {typeof value === 'number' ? value.toLocaleString() : value}
+    <div class="flex items-center gap-3">
+      <span class="text-gray-100 font-mono text-lg">{value}</span>
+      {percentile && (
+        <span class="text-xs px-2 py-0.5 bg-cyan-500/10 text-cyan-400 rounded-full border border-cyan-500/20">
+          {percentile}
+        </span>
+      )}
     </div>
   </div>
 );
 
-// Format tokens with K/M/B suffix
-function formatTokens(n: number): string {
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
-  return n.toString();
+// Style row for "Your Style" section
+interface StyleRowProps {
+  label: string;
+  value: string;
+  subvalue?: string;
+  icon?: string;
 }
 
-// Profile page component
+const StyleRow: FC<StyleRowProps> = ({ label, value, subvalue, icon }) => (
+  <div class="flex items-center justify-between py-3 border-b border-gray-800/50 last:border-0">
+    <span class="text-gray-400 text-sm">{label}</span>
+    <div class="flex items-center gap-2">
+      {icon && <span>{icon}</span>}
+      <div class="text-right">
+        <div class="text-gray-100 font-mono">{value}</div>
+        {subvalue && <div class="text-gray-500 text-xs">{subvalue}</div>}
+      </div>
+    </div>
+  </div>
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PROFILE PAGE
+// ═══════════════════════════════════════════════════════════════════════════
+
+interface ProfileData {
+  username: string;
+  avatarUrl: string | null;
+  firstSessionDate: string | null;
+  badges: string[];
+  currentStreak: number;
+  longestStreak: number;
+
+  // Core metrics
+  totalPrompts: number;
+  totalTokens: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCacheReadTokens: number;
+  totalCacheCreationTokens: number;
+  totalCostCents: number;
+  totalLinesWritten: number;
+  totalCommits: number;
+  totalActiveSeconds: number;
+
+  // Legacy (backward compat)
+  totalMessages: number;
+  totalToolCalls: number;
+
+  // Ranking
+  rank: number;
+  totalUsers: number;
+
+  // Activity patterns
+  hourCounts: Record<string, number> | null;
+}
+
 interface ProfileProps {
-  profile: {
-    username: string;
-    avatarUrl: string | null;
-    firstSessionDate: string | null;
-    badges: string[];
-    currentStreak: number;
-    longestStreak: number;
-    // New primary metrics
-    totalPrompts: number;
-    totalLinesWritten: number;
-    totalCommits: number;
-    totalTokens: number;
-    // Legacy (kept for backward compat)
-    totalMessages: number;
-    totalSessions: number;
-    totalToolCalls: number;
-    rank: number;
-    totalUsers: number;
-  };
+  profile: ProfileData;
+  archetypes: ArchetypeScore[];
+  derivedMetrics: DerivedMetrics;
+  peakHour: PeakHourInfo | null;
   contributions: ContributionDay[];
   currentUser: SessionUser | null;
 }
 
-const Profile: FC<ProfileProps> = ({ profile, contributions, currentUser }) => {
+const Profile: FC<ProfileProps> = ({
+  profile,
+  archetypes,
+  derivedMetrics,
+  peakHour,
+  contributions,
+  currentUser
+}) => {
   const isOwnProfile = currentUser?.githubUsername === profile.username;
   const memberSince = profile.firstSessionDate
-    ? new Date(profile.firstSessionDate).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
-    : 'Unknown';
+    ? new Date(profile.firstSessionDate).toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
+    : null;
 
-  // Calculate percentile (rank 1 / 100 = top 1%)
+  // Calculate percentile
   const percentile = profile.totalUsers > 0
-    ? Math.max(1, Math.ceil((profile.rank / profile.totalUsers) * 100))
+    ? Math.max(0.1, Math.ceil((profile.rank / profile.totalUsers) * 1000) / 10)
     : 100;
+  const percentileDisplay = percentile < 1 ? `Top ${percentile}%` : `Top ${Math.round(percentile)}%`;
 
-  // Get fun comparison
+  // Archetype display
+  const archetypeDisplay = formatArchetypeDisplay(archetypes);
+  const archetypeDescription = getArchetypeDescription(archetypes);
+
+  // Fun comparison for share text
   const funComparison = getTokenComparison(profile.totalTokens);
 
-  // Generate share text with new metrics
-  const shareText = `I'm #${profile.rank} on clawd.gg — Top ${percentile}% of Claude Code users 🤖
+  // Share text
+  const shareText = `${archetypeDisplay}
 
-📨 ${profile.totalPrompts.toLocaleString()} prompts sent
-📝 ${formatTokens(profile.totalLinesWritten)} lines written
-⚡ ${formatTokens(profile.totalTokens)} tokens
-🔥 ${profile.currentStreak} day streak
+${formatCost(profile.totalCostCents)} invested in Claude
+#${profile.rank} • ${percentileDisplay} of users
 
 ${funComparison}
 
 clawd.gg/u/${profile.username}`;
 
+  // Check if we have token data for the orbit visualization
+  const hasTokenData = profile.totalInputTokens > 0 || profile.totalOutputTokens > 0 || profile.totalCacheReadTokens > 0;
+  const hasHourData = profile.hourCounts && Object.keys(profile.hourCounts).length > 0;
+
   return (
     <div class="min-h-screen bg-black">
       {/* Header */}
-      <header class="border-b border-gray-800 py-6 px-4">
+      <header class="border-b border-gray-800/50 py-4 px-4">
         <div class="max-w-5xl mx-auto flex justify-between items-center">
-          <a href="/" class="text-gray-500 hover:text-cyan-400 font-mono text-sm transition-colors">
-            &larr; Back to Leaderboard
+          <a href="/" class="text-gray-600 hover:text-cyan-400 font-mono text-sm transition-colors">
+            ← back
           </a>
           {isOwnProfile && (
             <button
               data-share-text={shareText}
-              onclick="navigator.clipboard.writeText(this.dataset.shareText).then(() => { this.textContent = '✓ Copied!'; setTimeout(() => this.textContent = '📋 Share Stats', 2000); }).catch(err => console.error('Copy failed:', err));"
-              class="flex items-center gap-2 px-4 py-2 bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/30 rounded-lg text-cyan-400 font-mono text-sm transition-colors"
+              onclick="navigator.clipboard.writeText(this.dataset.shareText).then(() => { this.textContent = '✓ copied'; setTimeout(() => this.textContent = 'copy stats', 2000); });"
+              class="px-3 py-1.5 bg-transparent hover:bg-gray-900 border border-gray-800 hover:border-gray-700 rounded text-gray-500 hover:text-gray-300 font-mono text-xs transition-all"
             >
-              📋 Share Stats
+              copy stats
             </button>
           )}
         </div>
       </header>
 
-      <main class="max-w-5xl mx-auto px-4 py-12">
-        {/* HERO: The Big Flex */}
-        <div class="text-center py-12 mb-12 relative">
-          {/* Glowing background effect */}
-          <div class="absolute inset-0 flex items-center justify-center opacity-20">
-            <div class="w-64 h-64 bg-cyan-500 rounded-full blur-3xl"></div>
+      <main class="max-w-5xl mx-auto px-4 py-8">
+        {/* ════════════════════════════════════════════════════════════════════
+            COMMAND CENTER HERO
+            Dramatic centered layout with glowing accents
+            ════════════════════════════════════════════════════════════════════ */}
+        <div class="relative mb-16 text-center">
+          {/* Background glow effects */}
+          <div class="absolute inset-0 flex items-center justify-center pointer-events-none overflow-hidden">
+            <div class="w-[600px] h-[600px] bg-cyan-500/5 rounded-full blur-3xl" />
           </div>
-
-          {/* Crown for #1 */}
-          {profile.rank === 1 && (
-            <div class="text-6xl mb-4 animate-bounce">👑</div>
-          )}
-
-          {/* Giant percentile */}
-          <div class="relative">
-            <div class="text-7xl sm:text-8xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-cyan-200 mb-4"
-                 style="text-shadow: 0 0 40px rgba(34, 211, 238, 0.4), 0 0 80px rgba(34, 211, 238, 0.2);">
-              TOP {percentile}%
-            </div>
-          </div>
-
-          {/* Rank context */}
-          <div class="text-xl sm:text-2xl text-gray-400 mb-8">
-            #{profile.rank.toLocaleString()} of {profile.totalUsers.toLocaleString()} Claude Code users
-          </div>
+          <div class="absolute top-0 left-1/2 -translate-x-1/2 w-px h-20 bg-gradient-to-b from-transparent via-cyan-500/30 to-transparent" />
 
           {/* User identity */}
-          <div class="flex items-center justify-center gap-4">
-            {profile.avatarUrl ? (
-              <img
-                src={profile.avatarUrl}
-                alt={profile.username}
-                class="w-16 h-16 rounded-full ring-2 ring-gray-700"
-              />
-            ) : (
-              <div class="w-16 h-16 rounded-full bg-gray-800 flex items-center justify-center text-xl font-bold text-gray-500">
-                {profile.username.slice(0, 2).toUpperCase()}
-              </div>
+          <div class="relative inline-flex flex-col items-center mb-8">
+            {profile.rank === 1 && (
+              <div class="absolute -top-6 text-3xl animate-pulse">👑</div>
             )}
-            <div class="text-left">
-              <div class="flex items-center gap-2">
-                <h1 class="text-2xl font-bold text-gray-100">@{profile.username}</h1>
-                {profile.badges.length > 0 && (
-                  <span class="text-lg">
-                    {getBadges(profile.badges).slice(0, 3).map(b => b.emoji).join('')}
-                  </span>
-                )}
-              </div>
-              <div class="text-gray-500 font-mono text-sm flex items-center gap-3">
-                <span>Since {memberSince}</span>
-                {profile.currentStreak > 0 && (
-                  <span class="text-orange-400">🔥 {profile.currentStreak}d streak</span>
-                )}
-              </div>
+            <div class="relative">
+              {profile.avatarUrl ? (
+                <img
+                  src={profile.avatarUrl}
+                  alt={profile.username}
+                  class="w-20 h-20 rounded-full ring-2 ring-cyan-500/30 ring-offset-4 ring-offset-black"
+                />
+              ) : (
+                <div class="w-20 h-20 rounded-full bg-gray-900 ring-2 ring-cyan-500/30 ring-offset-4 ring-offset-black flex items-center justify-center text-2xl font-bold text-gray-500">
+                  {profile.username.slice(0, 2).toUpperCase()}
+                </div>
+              )}
+              {/* Status indicator */}
+              <div class="absolute -bottom-1 -right-1 w-5 h-5 bg-green-500 rounded-full border-4 border-black" />
+            </div>
+            <div class="mt-4">
+              <div class="text-white font-mono text-lg">@{profile.username}</div>
+              {memberSince && (
+                <div class="text-gray-600 text-xs font-mono mt-1">since {memberSince}</div>
+              )}
             </div>
           </div>
 
-          {/* GitHub link */}
-          <div class="mt-6">
-            <a
-              href={`https://github.com/${profile.username}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              class="inline-flex items-center gap-2 px-4 py-2 border border-gray-700 hover:border-gray-600 rounded-lg text-gray-400 hover:text-gray-300 transition-colors text-sm"
-            >
-              <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
-              </svg>
-              View on GitHub
-            </a>
+          {/* Archetype - The star of the show */}
+          <div class="relative mb-8">
+            <h1 class="text-3xl md:text-4xl lg:text-5xl font-bold tracking-[0.2em] uppercase"
+                style="background: linear-gradient(135deg, #22d3ee 0%, #a855f7 50%, #22d3ee 100%); background-size: 200% auto; -webkit-background-clip: text; -webkit-text-fill-color: transparent; animation: gradient-shift 8s ease infinite;">
+              {archetypeDisplay.replace(/^The\s+/i, '')}
+            </h1>
+            <p class="text-gray-500 text-sm font-mono mt-3 tracking-wider">
+              {archetypeDescription}
+            </p>
+          </div>
+
+          {/* Hero stat: Cost - massive and glowing */}
+          <div class="relative inline-block mb-6">
+            <div class="text-6xl md:text-7xl lg:text-8xl font-bold text-white"
+                 style="text-shadow: 0 0 60px rgba(34, 211, 238, 0.4), 0 0 120px rgba(34, 211, 238, 0.2);">
+              {formatCost(profile.totalCostCents)}
+            </div>
+            <div class="text-gray-600 text-sm font-mono mt-2 tracking-widest uppercase">invested in claude</div>
+          </div>
+
+          {/* Rank and percentile */}
+          <div class="flex items-center justify-center gap-6 text-sm">
+            <div class="flex items-center gap-2">
+              <span class="text-gray-600 font-mono">rank</span>
+              <span class="text-white font-mono font-bold">#{profile.rank.toLocaleString()}</span>
+              <span class="text-gray-700">of {profile.totalUsers.toLocaleString()}</span>
+            </div>
+            <div class="w-px h-4 bg-gray-800" />
+            <div class="px-3 py-1 bg-cyan-500/10 border border-cyan-500/30 rounded-full">
+              <span class="text-cyan-400 font-mono text-sm">{percentileDisplay}</span>
+            </div>
+          </div>
+
+          {/* Fun comparison */}
+          <div class="mt-8 text-gray-600 text-xs font-mono">
+            {funComparison}
           </div>
         </div>
 
-        {/* Stats cards - New metrics */}
-        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-          <StatCard
-            label="Prompts Sent"
-            value={profile.totalPrompts}
-            icon="📨"
-            color="text-cyan-400"
-          />
-          <StatCard
-            label="Lines Written"
-            value={profile.totalLinesWritten}
-            icon="📝"
-            color="text-green-400"
-          />
-          <StatCard
-            label="Tokens"
-            value={formatTokens(profile.totalTokens)}
-            icon="⚡"
-            color="text-yellow-400"
-          />
-          <StatCard
-            label="Commits"
-            value={profile.totalCommits}
-            icon="📦"
-            color="text-purple-400"
-          />
+        {/* ════════════════════════════════════════════════════════════════════
+            RADAR DISPLAYS - The cockpit instruments
+            ════════════════════════════════════════════════════════════════════ */}
+        {(hasTokenData || hasHourData) && (
+          <div class="grid md:grid-cols-2 gap-8 mb-16">
+            {/* Token Orbit */}
+            {hasTokenData && (
+              <div class="p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
+                <h2 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-6 font-mono flex items-center gap-2">
+                  <span class="w-2 h-2 bg-cyan-500 rounded-full animate-pulse" />
+                  Token Flow
+                </h2>
+                <TokenOrbit
+                  inputTokens={profile.totalInputTokens}
+                  outputTokens={profile.totalOutputTokens}
+                  cacheReadTokens={profile.totalCacheReadTokens}
+                  cacheCreationTokens={profile.totalCacheCreationTokens}
+                />
+              </div>
+            )}
+
+            {/* Activity Radar */}
+            {hasHourData && profile.hourCounts && (
+              <div class="p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
+                <h2 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-6 font-mono flex items-center gap-2">
+                  <span class="w-2 h-2 bg-purple-500 rounded-full animate-pulse" />
+                  Activity Patterns
+                </h2>
+                <ActivityRadar hourCounts={profile.hourCounts} />
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ════════════════════════════════════════════════════════════════════
+            METRICS GRID - Quick stats with terminal aesthetic
+            ════════════════════════════════════════════════════════════════════ */}
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-16">
+          <div class="p-4 bg-gray-950/30 border border-gray-800/30 rounded-xl text-center">
+            <div class="text-2xl font-bold text-white font-mono">{formatTokens(profile.totalTokens)}</div>
+            <div class="text-gray-600 text-xs font-mono mt-1">tokens</div>
+          </div>
+          <div class="p-4 bg-gray-950/30 border border-gray-800/30 rounded-xl text-center">
+            <div class="text-2xl font-bold text-white font-mono">{formatTokens(profile.totalLinesWritten)}</div>
+            <div class="text-gray-600 text-xs font-mono mt-1">lines</div>
+          </div>
+          <div class="p-4 bg-gray-950/30 border border-gray-800/30 rounded-xl text-center">
+            <div class="text-2xl font-bold text-white font-mono">{profile.totalCommits.toLocaleString()}</div>
+            <div class="text-gray-600 text-xs font-mono mt-1">commits</div>
+          </div>
+          <div class="p-4 bg-gray-950/30 border border-gray-800/30 rounded-xl text-center">
+            <div class="text-2xl font-bold text-white font-mono">{profile.totalPrompts.toLocaleString()}</div>
+            <div class="text-gray-600 text-xs font-mono mt-1">prompts</div>
+          </div>
         </div>
 
-        {/* Fun comparison */}
-        <div class="mb-12 p-4 bg-gray-900/50 border border-gray-800 rounded-lg text-center">
-          <p class="text-gray-400 font-mono text-sm">
-            <span class="text-cyan-400">// fun fact:</span> You've exchanged {funComparison}
-          </p>
+        {/* ════════════════════════════════════════════════════════════════════
+            DERIVED METRICS - The efficiency story
+            ════════════════════════════════════════════════════════════════════ */}
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-16">
+          {derivedMetrics.outputLeverage > 0 && (
+            <div class="p-4 bg-gradient-to-br from-cyan-500/5 to-transparent border border-cyan-500/10 rounded-xl">
+              <div class="text-3xl font-bold text-cyan-400 font-mono">{Math.round(derivedMetrics.outputLeverage)}×</div>
+              <div class="text-gray-500 text-xs font-mono mt-1">output leverage</div>
+            </div>
+          )}
+          {derivedMetrics.cacheEfficiency > 0 && (
+            <div class="p-4 bg-gradient-to-br from-amber-500/5 to-transparent border border-amber-500/10 rounded-xl">
+              <div class="text-3xl font-bold text-amber-400 font-mono">{Math.round(derivedMetrics.cacheEfficiency)}%</div>
+              <div class="text-gray-500 text-xs font-mono mt-1">cache efficiency</div>
+            </div>
+          )}
+          {derivedMetrics.costPerLine !== null && derivedMetrics.costPerLine > 0 && (
+            <div class="p-4 bg-gradient-to-br from-green-500/5 to-transparent border border-green-500/10 rounded-xl">
+              <div class="text-3xl font-bold text-green-400 font-mono">${derivedMetrics.costPerLine.toFixed(2)}</div>
+              <div class="text-gray-500 text-xs font-mono mt-1">per line</div>
+            </div>
+          )}
+          {derivedMetrics.costPerCommit !== null && derivedMetrics.costPerCommit > 0 && (
+            <div class="p-4 bg-gradient-to-br from-purple-500/5 to-transparent border border-purple-500/10 rounded-xl">
+              <div class="text-3xl font-bold text-purple-400 font-mono">${derivedMetrics.costPerCommit.toFixed(0)}</div>
+              <div class="text-gray-500 text-xs font-mono mt-1">per commit</div>
+            </div>
+          )}
         </div>
 
-        {/* Additional stats row */}
-        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-12">
-          <StatCard
-            label="Current Streak"
-            value={`${profile.currentStreak} days`}
-            icon="🔥"
-            color="text-orange-400"
-          />
-          <StatCard
-            label="Best Streak"
-            value={`${profile.longestStreak} days`}
-            icon="🏆"
-            color="text-amber-400"
-          />
-          <StatCard
-            label="Messages"
-            value={profile.totalMessages}
-            icon=">_"
-            color="text-gray-400"
-          />
-          <StatCard
-            label="Tool Calls"
-            value={profile.totalToolCalls}
-            icon="()"
-            color="text-gray-400"
-          />
-        </div>
-
-        {/* Contribution graph */}
-        <section class="mb-12">
-          <h2 class="text-xl font-bold text-gray-100 mb-4 flex items-center gap-2">
-            <span class="text-gray-500">//</span> Activity
+        {/* ════════════════════════════════════════════════════════════════════
+            ACTIVITY TIMELINE
+            ════════════════════════════════════════════════════════════════════ */}
+        <section class="mb-16">
+          <h2 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-6 font-mono flex items-center gap-2">
+            <span class="w-2 h-2 bg-green-500 rounded-full" />
+            Activity Timeline
           </h2>
-          <div class="p-6 bg-gray-950 border border-gray-800 rounded-lg">
+          <div class="p-6 bg-gray-950/30 border border-gray-800/30 rounded-2xl">
             <ContributionGraph days={contributions} />
+
+            {/* Streak stats */}
+            <div class="mt-6 pt-6 border-t border-gray-800/50 grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div class="text-center">
+                <div class="text-2xl font-bold text-orange-400 font-mono">{profile.currentStreak}</div>
+                <div class="text-gray-600 text-xs font-mono">streak</div>
+              </div>
+              <div class="text-center">
+                <div class="text-2xl font-bold text-amber-400 font-mono">{profile.longestStreak}</div>
+                <div class="text-gray-600 text-xs font-mono">best</div>
+              </div>
+              <div class="text-center">
+                <div class="text-2xl font-bold text-gray-300 font-mono">
+                  {contributions.filter(d => d.count > 0).length}
+                </div>
+                <div class="text-gray-600 text-xs font-mono">active days</div>
+              </div>
+              <div class="text-center">
+                <div class="text-2xl font-bold text-gray-300 font-mono">{profile.totalToolCalls || '—'}</div>
+                <div class="text-gray-600 text-xs font-mono">tool calls</div>
+              </div>
+            </div>
           </div>
         </section>
 
-        {/* Badges */}
-        <section>
-          <h2 class="text-xl font-bold text-gray-100 mb-4 flex items-center gap-2">
-            <span class="text-gray-500">//</span> Badges Earned
-            <span class="text-gray-500 text-sm font-normal">({profile.badges.length}/{Object.keys(BADGES).length})</span>
-          </h2>
-          <div class="p-6 bg-gray-950 border border-gray-800 rounded-lg">
-            <BadgeShowcase badgeIds={profile.badges} />
-          </div>
-        </section>
+        {/* ════════════════════════════════════════════════════════════════════
+            BADGES (if any)
+            ════════════════════════════════════════════════════════════════════ */}
+        {profile.badges.length > 0 && (
+          <section>
+            <h2 class="text-gray-500 text-xs uppercase tracking-wider mb-4 font-mono">
+              // badges <span class="text-gray-600">({profile.badges.length}/{Object.keys(BADGES).length})</span>
+            </h2>
+            <div class="p-6 bg-gray-950 border border-gray-800 rounded-xl">
+              <div class="flex flex-wrap gap-3">
+                {getBadges(profile.badges).map((badge) => (
+                  <div
+                    key={badge.id}
+                    class="flex items-center gap-2 px-3 py-2 bg-gray-900/50 border border-gray-800 rounded-lg"
+                    title={badge.description}
+                  >
+                    <span class="text-xl">{badge.emoji}</span>
+                    <span class="text-gray-300 text-sm">{badge.name}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* GitHub link */}
+        <div class="mt-12 text-center">
+          <a
+            href={`https://github.com/${profile.username}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            class="inline-flex items-center gap-2 px-4 py-2 border border-gray-800 hover:border-gray-700 rounded-lg text-gray-500 hover:text-gray-400 transition-colors text-sm"
+          >
+            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+            </svg>
+            View on GitHub
+          </a>
+        </div>
       </main>
     </div>
   );
@@ -422,7 +562,7 @@ const NotFound: FC<{ username: string }> = ({ username }) => (
       </p>
       <a
         href="/"
-        class="inline-flex items-center gap-2 px-4 py-2 text-cyan-400 hover:text-cyan-300 font-mono transition-colors"
+        class="inline-flex items-center gap-2 text-cyan-400 hover:text-cyan-300 font-mono transition-colors"
       >
         &larr; Back to Leaderboard
       </a>
@@ -430,8 +570,10 @@ const NotFound: FC<{ username: string }> = ({ username }) => (
   </div>
 );
 
-// Profile route
-// V2: Supports both OTel users (users.total_*) and legacy users (daily_stats)
+// ═══════════════════════════════════════════════════════════════════════════
+// ROUTE HANDLER
+// ═══════════════════════════════════════════════════════════════════════════
+
 app.get('/:username', async (c) => {
   const username = c.req.param('username');
   const currentUser = c.get('user');
@@ -460,19 +602,29 @@ app.get('/:username', async (c) => {
   let totalLinesWritten: number;
   let totalCommits: number;
   let totalTokens: number;
+  let totalInputTokens: number;
+  let totalOutputTokens: number;
+  let totalCacheReadTokens: number;
+  let totalCacheCreationTokens: number;
+  let totalCostCents: number;
+  let totalActiveSeconds: number;
   let totalMessages: number;
-  let totalSessions: number;
   let totalToolCalls: number;
 
   if (isOtelUser) {
-    // V2: Use cached totals from users table (synced from ClickHouse)
+    // V2: Use cached totals from users table
     totalPrompts = userData.totalPrompts ?? 0;
     totalLinesWritten = userData.totalLinesAdded ?? 0;
     totalCommits = userData.totalCommits ?? 0;
     totalTokens = userData.totalTokens ?? 0;
-    totalMessages = totalPrompts; // For OTel, prompts = messages
-    totalSessions = 0; // Not tracked in OTel v2
-    totalToolCalls = 0; // Not tracked in OTel v2
+    totalInputTokens = userData.totalInputTokens ?? 0;
+    totalOutputTokens = userData.totalOutputTokens ?? 0;
+    totalCacheReadTokens = userData.totalCacheReadTokens ?? 0;
+    totalCacheCreationTokens = userData.totalCacheCreationTokens ?? 0;
+    totalCostCents = userData.totalCostUsd ?? 0;
+    totalActiveSeconds = userData.totalActiveSeconds ?? 0;
+    totalMessages = totalPrompts;
+    totalToolCalls = 0;
   } else {
     // V1: Sum from daily_stats
     const statsResult = await db
@@ -481,9 +633,13 @@ app.get('/:username', async (c) => {
         totalLinesWritten: sql<number>`sum(${dailyStats.linesWritten})`,
         totalCommits: sql<number>`sum(${dailyStats.commitCount})`,
         totalMessages: sql<number>`sum(${dailyStats.messageCount})`,
-        totalSessions: sql<number>`sum(${dailyStats.sessionCount})`,
         totalToolCalls: sql<number>`sum(${dailyStats.toolCallCount})`,
         totalTokens: sql<number>`sum(${dailyStats.tokenCount})`,
+        totalInputTokens: sql<number>`sum(${dailyStats.inputTokens})`,
+        totalOutputTokens: sql<number>`sum(${dailyStats.outputTokens})`,
+        totalCacheReadTokens: sql<number>`sum(${dailyStats.cacheReadTokens})`,
+        totalCacheCreationTokens: sql<number>`sum(${dailyStats.cacheCreationTokens})`,
+        totalCostCents: sql<number>`sum(${dailyStats.costUsdCents})`,
       })
       .from(dailyStats)
       .where(eq(dailyStats.userId, userData.id));
@@ -492,13 +648,17 @@ app.get('/:username', async (c) => {
     totalLinesWritten = statsResult[0]?.totalLinesWritten ?? 0;
     totalCommits = statsResult[0]?.totalCommits ?? 0;
     totalTokens = statsResult[0]?.totalTokens ?? 0;
+    totalInputTokens = statsResult[0]?.totalInputTokens ?? 0;
+    totalOutputTokens = statsResult[0]?.totalOutputTokens ?? 0;
+    totalCacheReadTokens = statsResult[0]?.totalCacheReadTokens ?? 0;
+    totalCacheCreationTokens = statsResult[0]?.totalCacheCreationTokens ?? 0;
+    totalCostCents = statsResult[0]?.totalCostCents ?? 0;
+    totalActiveSeconds = 0;
     totalMessages = statsResult[0]?.totalMessages ?? 0;
-    totalSessions = statsResult[0]?.totalSessions ?? 0;
     totalToolCalls = statsResult[0]?.totalToolCalls ?? 0;
   }
 
   // Fetch daily activity for contribution graph
-  // TODO: For OTel users, query ClickHouse when available
   const dailyActivity = await db
     .select({
       date: dailyStats.date,
@@ -508,7 +668,7 @@ app.get('/:username', async (c) => {
     .where(eq(dailyStats.userId, userData.id))
     .orderBy(asc(dailyStats.date));
 
-  // Calculate contribution levels (0-4 based on message count)
+  // Calculate contribution levels
   const maxCount = Math.max(...dailyActivity.map(d => d.count), 1);
   const contributions: ContributionDay[] = dailyActivity.map(d => {
     let level: 0 | 1 | 2 | 3 | 4 = 0;
@@ -523,7 +683,6 @@ app.get('/:username', async (c) => {
   });
 
   // Get user rank
-  // V2: Count users with higher totalPrompts (mix of OTel and legacy)
   const rankResult = await db.all(sql`
     SELECT (
       SELECT COUNT(*) + 1 FROM (
@@ -552,37 +711,70 @@ app.get('/:username', async (c) => {
   `) as any[];
   const totalUsers = totalUsersResult[0]?.count ?? 1;
 
-  // Parse badges
+  // Parse badges and hourCounts
   let badges: string[] = [];
+  let hourCounts: Record<string, number> | null = null;
   try {
     badges = userData.badges ? JSON.parse(userData.badges) : [];
+    hourCounts = userData.hourCounts ? JSON.parse(userData.hourCounts) : null;
   } catch {
     badges = [];
   }
 
-  const profile = {
+  // Calculate archetypes
+  const archetypeInput: ArchetypeInput = {
+    totalInputTokens,
+    totalOutputTokens,
+    totalCacheReadTokens,
+    totalCacheCreationTokens,
+    hourCounts,
+    totalPrompts,
+    totalLinesWritten,
+    totalCommits,
+    firstSessionDate: userData.firstSessionDate || undefined,
+  };
+  const archetypes = calculateArchetypes(archetypeInput);
+
+  // Calculate derived metrics
+  const derivedMetrics = calculateDerivedMetrics(archetypeInput, totalCostCents);
+
+  // Get peak hour
+  const peakHour = getPeakHour(hourCounts);
+
+  const profile: ProfileData = {
     username: userData.githubUsername,
     avatarUrl: userData.avatarUrl,
     firstSessionDate: userData.firstSessionDate,
     badges,
     currentStreak: userData.currentStreak ?? 0,
     longestStreak: userData.longestStreak ?? 0,
-    // Primary metrics
     totalPrompts,
+    totalTokens,
+    totalInputTokens,
+    totalOutputTokens,
+    totalCacheReadTokens,
+    totalCacheCreationTokens,
+    totalCostCents,
     totalLinesWritten,
     totalCommits,
-    totalTokens,
-    // Legacy metrics
+    totalActiveSeconds,
     totalMessages,
-    totalSessions,
     totalToolCalls,
     rank,
     totalUsers,
+    hourCounts,
   };
 
   return c.html(
     <Layout title={`@${username} - clawd.gg`} user={currentUser}>
-      <Profile profile={profile} contributions={contributions} currentUser={currentUser} />
+      <Profile
+        profile={profile}
+        archetypes={archetypes}
+        derivedMetrics={derivedMetrics}
+        peakHour={peakHour}
+        contributions={contributions}
+        currentUser={currentUser}
+      />
     </Layout>
   );
 });

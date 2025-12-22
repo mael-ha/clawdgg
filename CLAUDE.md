@@ -1,12 +1,12 @@
 # clawd.gg
 
 ## Now (sync with now.md at session end)
-🟢 HTTP | Blocked: domain | Next: Dashboard V2 Phase 1 (archetype system, hero redesign)
-Last: Deep planning for Dashboard V2. Full plan in `.claude/memento/knowledge/dashboard-v2-plan.md`
+🟢 HTTP | Blocked: domain | Data Integrity Fix Complete
+Last: Streaks now match Claude Code /stats exactly. Uses stats-cache.json for official values.
 
 ## Deploy
 ```bash
-rsync -avz src/ clawdgg:/opt/clawdgg/src/ && ssh clawdgg 'cd /opt/clawdgg && docker compose -f docker-compose.staging.yml up -d --force-recreate app'
+rsync -avz src/ clawdgg:/opt/clawdgg/src/ && rsync -avz cli/ clawdgg:/opt/clawdgg/cli/ && ssh clawdgg 'cd /opt/clawdgg && docker compose -f docker-compose.staging.yml build app && docker compose -f docker-compose.staging.yml up -d app'
 ```
 
 ## Burned In
@@ -15,7 +15,8 @@ rsync -avz src/ clawdgg:/opt/clawdgg/src/ && ssh clawdgg 'cd /opt/clawdgg && doc
 secure: APP_URL.startsWith('https://')
 ```
 ```bash
-# Docker — restart WON'T reload .env
+# Docker — restart WON'T reload .env OR source changes
+# Must rebuild: docker compose build app && docker compose up -d app
 docker compose down && docker compose up -d
 ```
 

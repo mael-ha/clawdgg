@@ -33,6 +33,13 @@ export const users = sqliteTable('users', {
   totalActiveSeconds: integer('total_active_seconds').default(0),
   avgPromptLength: integer('avg_prompt_length').default(0), // Average chars per prompt
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // Dashboard V2: Archetype system
+  // ═══════════════════════════════════════════════════════════════════════
+  archetype: text('archetype'),           // Primary archetype ID (e.g., "night_owl")
+  archetypeSecondary: text('archetype_secondary'),  // Secondary archetype ID
+  archetypeUpdatedAt: integer('archetype_updated_at', { mode: 'timestamp' }),
+
   // OTel status
   otelEnabled: integer('otel_enabled', { mode: 'boolean' }).default(false),
   otelSetupAt: integer('otel_setup_at', { mode: 'timestamp' }), // When user ran `clawd setup`

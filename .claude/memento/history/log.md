@@ -4,6 +4,74 @@ Append-only log of work sessions.
 
 ---
 
+## 2025-12-22 (late night): Dashboard V2 Phase 2 Implementation
+
+**What I did:**
+- Created TokenBreakdown component with log-scale SVG bars
+  - Shows cache reads, output, cache write, input tokens
+  - Uses log scale when disparity > 50x (e.g., 2B cache vs 5M input)
+  - Color-coded: cyan (cache read), purple (output), amber (cache write), green (input)
+- Created HourlyActivity bar chart
+  - 24-hour distribution with time-of-day coloring
+  - Shows morning (amber), afternoon (green), evening (purple), night (blue)
+  - Includes peak hour callout and dominant period insight
+- Added expandable sections using CSS-only details/summary
+  - Token Breakdown section (Tier 2 - on demand)
+  - Hourly Patterns section (Tier 2 - on demand)
+- Deployed to VPS and verified working
+
+**Files created:**
+- `src/components/TokenBreakdown.tsx` (130+ lines)
+- `src/components/HourlyActivity.tsx` (100+ lines)
+
+**Files modified:**
+- `src/routes/profile.tsx` — Added imports and expandable sections
+
+**Token Breakdown features:**
+- Log-scale bars for extreme disparities
+- Percentage breakdown
+- Summary stats (total tokens, output leverage, cache efficiency)
+- Scale indicator when using logarithmic scale
+
+---
+
+## 2025-12-22 (late night): Dashboard V2 Phase 1 Implementation
+
+**What I did:**
+- Implemented complete archetype system (`src/lib/archetypes.ts`)
+- 9 archetypes: Context Maximizer, Night Owl, Early Bird, Marathoner, Sprinter, Opus Connoisseur, Efficiency Expert, Code Machine, Pioneer
+- Added derived metrics: outputLeverage, cacheEfficiency, costPerLine, costPerCommit, contextReuse
+- Redesigned profile page with new hero section (archetype + cost + percentile)
+- Created two-column grid: "Your Numbers" + "Your Style"
+- Added peak hour detection and display
+- Updated CLI status output to match Dashboard V2 design
+- Applied database migration (archetype fields)
+- Deployed to VPS and verified working
+
+**Files created/modified:**
+- `src/lib/archetypes.ts` — NEW: 480+ lines of archetype calculation logic
+- `src/db/schema.ts` — Added archetype, archetypeSecondary, archetypeUpdatedAt
+- `src/routes/profile.tsx` — Complete rewrite with Dashboard V2 design
+- `src/routes/api.ts` — Updated /api/me with new fields
+- `cli/index.ts` — Updated cmdStatus with new design
+- `drizzle/0004_dashboard_v2_archetypes.sql` — Migration
+- `scripts/migrate-0004.ts` — Migration runner
+
+**Dashboard V2 features:**
+- Archetype as identity ("CODE MACHINE")
+- Cost as hero stat ("$2.1K invested in Claude")
+- Rank + percentile badge
+- Token breakdown with in/out split
+- Output Leverage, Cache Efficiency, Peak Hour
+- Cost per Line, Cost per Commit
+- Fun comparison text ("13x the King James Bible")
+
+**Live at:** http://46.224.85.32:3000/u/mael-ha
+
+**Next:** Domain purchase, HTTPS, Phase 2 (token insights)
+
+---
+
 ## 2025-12-22 (night): Dashboard V2 Deep Planning
 
 **What I did:**

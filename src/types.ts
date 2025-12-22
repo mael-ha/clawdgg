@@ -63,6 +63,11 @@ export interface StatsSubmission {
   // Badge-relevant data
   hourCounts?: Record<string, number>;
   longestSessionMessages?: number;
+  // Official stats-cache.json data (to match Claude Code's /stats exactly)
+  officialDates?: string[];  // Dates from stats-cache.json for accurate streak calculation
+  officialCurrentStreak?: number;  // Calculated from stats-cache.json
+  officialLongestStreak?: number;  // Calculated from stats-cache.json
+  officialActiveDays?: number;     // Count of unique days in stats-cache.json
 }
 
 export interface LeaderboardEntry {

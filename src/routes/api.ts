@@ -172,17 +172,28 @@ api.post('/stats', requireAuth, async (c) => {
       .from(dailyStats)
       .where(eq(dailyStats.userId, user.id));
 
-    // Get all dates for streak calculation
-    const allDates = await db
-      .select({ date: dailyStats.date })
-      .from(dailyStats)
-      .where(eq(dailyStats.userId, user.id))
-      .orderBy(asc(dailyStats.date));
-
     // Calculate streaks
-    const { currentStreak, longestStreak } = calculateStreaks(
-      allDates.map((d) => d.date)
-    );
+    // Priority: Use official stats-cache.json values if provided (matches Claude Code's /stats)
+    // Fallback: Calculate from our dailyStats table (may differ due to agent sessions)
+    let currentStreak: number;
+    let longestStreak: number;
+
+    if (body.officialCurrentStreak !== undefined && body.officialLongestStreak !== undefined) {
+      // Use CLI-calculated values from stats-cache.json (matches Claude Code exactly)
+      currentStreak = body.officialCurrentStreak;
+      longestStreak = body.officialLongestStreak;
+    } else {
+      // Fallback: Calculate from our database (legacy behavior)
+      const allDates = await db
+        .select({ date: dailyStats.date })
+        .from(dailyStats)
+        .where(eq(dailyStats.userId, user.id))
+        .orderBy(asc(dailyStats.date));
+
+      const calculated = calculateStreaks(allDates.map((d) => d.date));
+      currentStreak = calculated.currentStreak;
+      longestStreak = calculated.longestStreak;
+    }
 
     // Get user count for OG badge
     const userCountResult = await db
@@ -592,6 +603,7 @@ function formatTokensCompact(n: number): string {
 }
 
 // GET /api/me - Get current user's profile data (requires auth)
+// Dashboard V2: Now includes archetype, cost, and derived metrics
 api.get('/me', requireAuth, async (c) => {
   try {
     const user = c.get('user');
@@ -610,9 +622,9 @@ api.get('/me', requireAuth, async (c) => {
       return c.json({ error: 'User not found' }, 404);
     }
 
-    const profile = userData[0];
+    const profile = userData[0]!;
 
-    // Get aggregate stats
+    // Get aggregate stats with V3 token breakdown
     const statsResult = await db
       .select({
         totalPrompts: sql<number>`sum(${dailyStats.promptCount})`,
@@ -622,57 +634,132 @@ api.get('/me', requireAuth, async (c) => {
         totalLines: sql<number>`sum(${dailyStats.linesWritten})`,
         totalCommits: sql<number>`sum(${dailyStats.commitCount})`,
         totalSessions: sql<number>`sum(${dailyStats.sessionCount})`,
+        // V3: Full token breakdown
+        totalInputTokens: sql<number>`sum(${dailyStats.inputTokens})`,
+        totalOutputTokens: sql<number>`sum(${dailyStats.outputTokens})`,
+        totalCacheReadTokens: sql<number>`sum(${dailyStats.cacheReadTokens})`,
+        totalCacheCreationTokens: sql<number>`sum(${dailyStats.cacheCreationTokens})`,
+        totalCostCents: sql<number>`sum(${dailyStats.costUsdCents})`,
       })
       .from(dailyStats)
       .where(eq(dailyStats.userId, user.id));
 
-    // Get user rank (by total messages)
-    const rankResult = await db
-      .select({
-        rank: sql<number>`(
-          SELECT COUNT(*) + 1 FROM (
-            SELECT user_id, SUM(message_count) as total
-            FROM daily_stats
-            GROUP BY user_id
-            HAVING total > (
-              SELECT COALESCE(SUM(message_count), 0)
-              FROM daily_stats
-              WHERE user_id = ${user.id}
-            )
-          )
-        )`,
-      })
-      .from(users)
-      .where(eq(users.id, user.id));
+    const stats = statsResult[0];
+    const totalPrompts = stats?.totalPrompts || 0;
+
+    // Get user rank (by total prompts - V2)
+    const rankResult = await db.all(sql`
+      SELECT (
+        SELECT COUNT(*) + 1 FROM (
+          SELECT subq.id FROM (
+            SELECT u.id,
+              CASE
+                WHEN u.otel_enabled = 1 THEN u.total_prompts
+                ELSE COALESCE((SELECT SUM(prompt_count) FROM daily_stats WHERE user_id = u.id), 0)
+              END as total_prompts
+            FROM users u
+            WHERE u.otel_enabled = 1
+               OR EXISTS (SELECT 1 FROM daily_stats WHERE user_id = u.id)
+          ) subq
+          WHERE subq.total_prompts > ${totalPrompts}
+        )
+      ) as rank
+    `) as { rank: number }[];
 
     // Get total users count
-    const totalUsersResult = await db
-      .select({ count: sql<number>`count(distinct user_id)` })
-      .from(dailyStats);
+    const totalUsersResult = await db.all(sql`
+      SELECT COUNT(*) as count
+      FROM users u
+      WHERE u.otel_enabled = 1
+         OR EXISTS (SELECT 1 FROM daily_stats WHERE user_id = u.id)
+    `) as { count: number }[];
 
-    // Parse badges
+    // Parse badges and hourCounts
     let badges: string[] = [];
+    let hourCounts: Record<string, number> | null = null;
     try {
       badges = profile.badges ? JSON.parse(profile.badges) : [];
+      hourCounts = profile.hourCounts ? JSON.parse(profile.hourCounts) : null;
     } catch {
       badges = [];
     }
 
+    // Calculate derived metrics
+    const totalInputTokens = stats?.totalInputTokens || 0;
+    const totalOutputTokens = stats?.totalOutputTokens || 0;
+    const totalCacheReadTokens = stats?.totalCacheReadTokens || 0;
+    const totalCacheCreationTokens = stats?.totalCacheCreationTokens || 0;
+    const totalCostCents = stats?.totalCostCents || 0;
+    const totalLines = stats?.totalLines || 0;
+    const totalCommits = stats?.totalCommits || 0;
+
+    // Simple archetype calculation for API
+    let archetype = 'Claude Code User';
+    let archetypeDescription = '';
+
+    // Night owl check
+    if (hourCounts) {
+      const nightHours = ['20', '21', '22', '23', '0', '1', '2', '3', '4'];
+      const nightActivity = nightHours.reduce((sum, h) => sum + (hourCounts![h] || 0), 0);
+      const totalActivity = Object.values(hourCounts).reduce((a, b) => a + b, 0);
+      if (totalActivity > 0 && nightActivity / totalActivity >= 0.5) {
+        archetype = 'Night Owl';
+        archetypeDescription = `${Math.round((nightActivity / totalActivity) * 100)}% activity after 8pm`;
+      }
+    }
+
+    // Context maximizer check (overrides if stronger)
+    const freshInput = totalInputTokens + totalCacheCreationTokens;
+    if (freshInput > 0) {
+      const cacheRatio = totalCacheReadTokens / freshInput;
+      if (cacheRatio >= 10) {
+        archetype = 'Context Maximizer';
+        archetypeDescription = `${Math.round(cacheRatio)}x cache reuse ratio`;
+      }
+    }
+
+    // Derived metrics
+    const outputLeverage = totalInputTokens > 0
+      ? Math.round(totalOutputTokens / totalInputTokens)
+      : 0;
+    const cacheEfficiency = freshInput > 0
+      ? Math.round((totalCacheReadTokens / freshInput) * 100)
+      : 0;
+
+    const rank = rankResult[0]?.rank || 1;
+    const totalUsers = totalUsersResult[0]?.count || 1;
+    const percentile = totalUsers > 0
+      ? Math.max(0.1, Math.ceil((rank / totalUsers) * 1000) / 10)
+      : 100;
+
     return c.json({
       username: profile.githubUsername,
       avatarUrl: profile.avatarUrl,
-      rank: rankResult[0]?.rank || 1,
-      totalUsers: totalUsersResult[0]?.count || 1,
+      rank,
+      totalUsers,
+      percentile,
+      // Dashboard V2: Archetype
+      archetype,
+      archetypeDescription,
       // Primary metrics
-      totalPrompts: statsResult[0]?.totalPrompts || 0,
-      totalTokens: statsResult[0]?.totalTokens || 0,
+      totalPrompts,
+      totalTokens: stats?.totalTokens || 0,
+      totalCostCents,
+      // Token breakdown (V3)
+      totalInputTokens,
+      totalOutputTokens,
+      totalCacheReadTokens,
+      totalCacheCreationTokens,
       // Code metrics
-      totalLines: statsResult[0]?.totalLines || 0,
-      totalCommits: statsResult[0]?.totalCommits || 0,
+      totalLines,
+      totalCommits,
+      // Derived metrics
+      outputLeverage,
+      cacheEfficiency,
       // Legacy (kept for backward compat)
-      totalMessages: statsResult[0]?.totalMessages || 0,
-      totalToolCalls: statsResult[0]?.totalToolCalls || 0,
-      totalSessions: statsResult[0]?.totalSessions || 0,
+      totalMessages: stats?.totalMessages || 0,
+      totalToolCalls: stats?.totalToolCalls || 0,
+      totalSessions: stats?.totalSessions || 0,
       // Streaks and badges
       currentStreak: profile.currentStreak || 0,
       longestStreak: profile.longestStreak || 0,
