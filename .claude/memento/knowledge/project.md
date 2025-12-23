@@ -3,10 +3,26 @@
 ## What clawd.gg Is
 
 Gamified leaderboard for Claude Code users to track/compare usage stats.
+Plus: Automated X account for Claude Code updates.
 
 - **Domain:** clawd.gg (pending purchase)
 - **CLI:** `clawdgg` (npm) → binary `clawd`
 - **GitHub:** github.com/mael-ha/clawdgg
+
+## Three Codebases
+
+```
+clawdgg/
+├── src/    # Web app (Hono + JSX)
+├── cli/    # CLI tool (clawd)
+└── bot/    # X bot (changelog + Reddit)
+```
+
+| Codebase | Purpose | Entry Point |
+|----------|---------|-------------|
+| `src/` | Web app, API, leaderboard | `src/index.ts` |
+| `cli/` | User stats sync tool | `cli/index.ts` |
+| `bot/` | Automated X account | `bot/src/index.ts` |
 
 ## Tech Stack
 
@@ -18,6 +34,8 @@ Gamified leaderboard for Claude Code users to track/compare usage stats.
 | Database | SQLite (Drizzle ORM) |
 | Time-series | ClickHouse |
 | Auth | GitHub OAuth (Arctic) |
+| AI | Claude API (Sonnet 4.5 + Haiku 4.5) |
+| Twitter | twitter-api-v2 |
 | Deployment | Docker + Caddy |
 | VPS | Hetzner CX23 (~$3.59/mo) |
 

@@ -4,6 +4,120 @@ Append-only log of work sessions.
 
 ---
 
+## 2025-12-23 (evening): X Bot Thread Structure & Orchestration
+
+**What I did:**
+- Redesigned tweet thread structure with summary hook + all items
+- Implemented X Premium support (no splits, 4000 char limit)
+- Added "changelog pending" flow for when GitHub lags behind brew
+- Added 48h timeout for missing changelogs (closes thread gracefully)
+- Fixed model IDs (Opus 4.5 + Haiku 4.5)
+- Tested full orchestration flow with AI validation
+- Updated formatter.ts to 670+ lines with new structure
+
+**Thread structure finalized:**
+```
+Tweet 1: Summary Hook
+  "Claude Code 2.0.74
+   ✨ 5 new (LSP, terminal setup, shortcuts)
+   🐛 6 fixed (allowed-tools, Opus tip)
+   🤖 Prompt: +47/-12 lines
+   Details ↓"
+
+Tweet 2: What's New (ALL items)
+Tweet 3: Fixes (ALL items)
+Tweet 4: Prompt Changes (w/ cchistory)
+Tweet 5: Links (changelog, gist, clawd.gg)
+```
+
+**Orchestration flow:**
+```
+detected → wait 15min for GitHub → ready → posted
+    │                                 │
+    └──────(timeout)──────────────────┘
+
+If pending (no GitHub):
+  - Post "Changelog incoming..." summary
+  - When GitHub arrives: Post "Update" + details
+  - After 48h: Close thread, move on
+```
+
+**Key decisions:**
+- X Premium recommended (~$8/mo) for no splits
+- Opus 4.5 for all writing (account doesn't have Sonnet 4.5 access)
+- ~$4-5/month API costs at 7 releases/week
+
+**Files modified:**
+- `bot/src/ai/formatter.ts` — Complete rewrite (670+ lines)
+- `bot/src/jobs/version-check.ts` — New orchestration (560+ lines)
+- `.claude/memento/knowledge/bot.md` — Updated docs
+
+**Next:** X Developer credentials, live testing
+
+---
+
+## 2025-12-23: X Bot Scaffolding
+
+**What I did:**
+- Designed X bot strategy for Claude Code community building
+- Researched data sources: brew commits, GitHub releases, cchistory, npm stats
+- Scaffolded complete `bot/` codebase (14 TypeScript files)
+- Implemented version detection and lifecycle state machine
+- Created AI formatter with Sonnet 4.5 + extended thinking
+- Added few-shot examples for consistent bot voice
+- Weekly summary with download stats + WoW comparison
+
+**Files created (14):**
+```
+bot/src/index.ts              # Entry point (daemon + one-shot)
+bot/src/db/schema.ts          # versions, download_stats, reddit_posts
+bot/src/db/index.ts           # SQLite connection
+bot/src/db/init.ts            # Schema initialization
+bot/src/watchers/brew.ts      # Homebrew cask monitoring
+bot/src/watchers/github.ts    # Releases API + note parser
+bot/src/watchers/npm.ts       # Download stats
+bot/src/watchers/cchistory.ts # Prompt diff extraction
+bot/src/publishers/twitter.ts # X API with threading + mock mode
+bot/src/publishers/gist.ts    # Prompt diff hosting
+bot/src/jobs/version-check.ts # Main orchestration
+bot/src/jobs/stats.ts         # Weekly summary + stats collection
+bot/src/ai/formatter.ts       # Claude-powered formatting (480+ lines)
+bot/drizzle.config.ts         # Drizzle config for bot db
+```
+
+**AI model decisions:**
+- Sonnet 4.5 + extended thinking (4K budget) for ALL tweet writing
+- Haiku 4.5 (no thinking) only for Reddit post classification
+- ~$1.30/month estimated cost
+
+**Bot voice examples (in TONE_EXAMPLES):**
+```
+✅ "Claude Code 2.0.74 just shipped. Thread incoming."
+✅ "LSP support. Finally."
+❌ "We're thrilled to announce..." (corporate)
+```
+
+**Version lifecycle:**
+```
+detected → announced → detailed → complete
+  (brew)    (tweet)    (github + prompt diff)
+```
+
+**Data sources:**
+- Homebrew cask commits (fastest for version detection)
+- GitHub releases (detailed changelog)
+- cchistory npm package (prompt diffs)
+- npm registry + brew API (download stats)
+
+**Updated memento:**
+- Created `knowledge/bot.md` (comprehensive bot docs)
+- Updated `knowledge/project.md` (three-codebase architecture)
+- Updated `now.md` with bot status
+
+**Next:** X Developer credentials, dry-run testing, Reddit integration
+
+---
+
 ## 2025-12-22 (late night): Dashboard V2 Phase 2 Implementation
 
 **What I did:**

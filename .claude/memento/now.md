@@ -1,83 +1,110 @@
 # Now
 
-## Status: 🟢 Deployed | Dashboard V2 Phase 2 Complete
+## Status: 🟢 Deployed | X Bot Ready for Testing
 
 **Live at:** http://46.224.85.32:3000
-**Blockers:** Domain purchase for HTTPS
-**Focus:** Phase 3 (Share features), domain setup
+**Blockers:** X Developer account credentials
+**Focus:** Get X credentials, test bot live, then Reddit integration
 
-## Last Session (2025-12-22)
+## Last Session (2025-12-23)
 
 **What happened:**
-1. Implemented Dashboard V2 Phase 2 — Token & Activity Insights
-2. Created TokenBreakdown component with log-scale bars
-3. Created HourlyActivity bar chart with time-of-day colors
-4. Added expandable sections (CSS-only with details/summary)
-5. Deployed to VPS and verified working
+1. Redesigned tweet thread structure (summary hook + all items)
+2. Implemented X Premium support (no splits, 4000 char limit)
+3. Added "changelog pending" flow for when GitHub lags
+4. Added 48h timeout for missing changelogs
+5. Tested full orchestration flow with AI validation
+6. Fixed model IDs (using Opus 4.5 + Haiku 4.5)
 
-**Files created/modified:**
-- `src/components/TokenBreakdown.tsx` — NEW: Log-scale token visualization
-- `src/components/HourlyActivity.tsx` — NEW: Hourly bar chart
-- `src/routes/profile.tsx` — Added expandable sections
-- `src/routes/profile.tsx` — Complete rewrite with Dashboard V2 design
-- `src/routes/api.ts` — Updated /api/me with new fields
-- `cli/index.ts` — Updated cmdStatus with new design
-- `drizzle/0004_dashboard_v2_archetypes.sql` — Migration (applied)
-- `scripts/migrate-0004.ts` — Migration runner script
+**Thread structure finalized:**
+```
+Tweet 1: Summary Hook
+  "Claude Code 2.0.74
+   ✨ 5 new (LSP, terminal setup, shortcuts)
+   🐛 6 fixed (allowed-tools, Opus tip)
+   🤖 Prompt: +47/-12 lines
+   Details ↓"
 
-**Dashboard V2 Profile Features:**
-- Archetype as identity ("CODE MACHINE", not "User #123")
-- Cost as hero stat ($2.1K invested in Claude)
-- Two-column grid: "Your Numbers" + "Your Style"
-- Derived metrics: Output Leverage, Cache Efficiency, Peak Hour
-- Fun comparison text ("13x the King James Bible")
-- Activity contribution graph
+Tweet 2: What's New (ALL items)
+Tweet 3: Fixes (ALL items)
+Tweet 4: Prompt Changes (w/ cchistory)
+Tweet 5: Links (changelog, gist, clawd.gg)
+```
+
+**Orchestration flow:**
+- Brew detects version → Wait 15min for GitHub
+- If GitHub ready: Post full thread
+- If timeout: Post "Changelog incoming..." summary
+- When GitHub arrives later: Post "Update" + details
+- After 48h with no GitHub: Close thread, move on
+
+**Key decisions:**
+- X Premium recommended (~$8/mo) for no splits, better UX
+- Opus 4.5 for all writing, Haiku 4.5 for classification only
+- ~$4-5/month API costs at 7 releases/week
 
 ## Current State
 
 | Component | Status |
 |-----------|--------|
-| App | Running (healthy) |
-| ClickHouse | Running (healthy) |
-| Dashboard V2 Phase 1 | ✅ Complete |
-| GitHub OAuth | ✅ Working (prod credentials) |
-| V3 Pipeline | ✅ All 4 token types + cost |
-| Domain | Not purchased |
-| HTTPS | Blocked on domain |
+| Web App | ✅ Running (healthy) |
+| CLI | ✅ Working |
+| Bot | ✅ Ready (needs X creds) |
+| ClickHouse | ✅ Running (healthy) |
+| Dashboard V2 | ✅ Complete |
+| Domain | ❌ Not purchased |
+| HTTPS | ❌ Blocked on domain |
 
-## Archetypes Implemented
+## Bot Status
 
-| Archetype | Trigger |
-|-----------|---------|
-| Context Maximizer | 10x+ cache reuse ratio |
-| Night Owl | 50%+ activity after 8pm |
-| Early Bird | 40%+ activity before 10am |
-| Marathoner | Longest session 4h+ OR avg 2h+ |
-| Sprinter | Avg session <30min, 50+ prompts |
-| Opus Connoisseur | 50%+ Opus usage |
-| Efficiency Expert | 30x+ output leverage |
-| Code Machine | 5+ lines per prompt |
-| Pioneer | Beta user or early adopter |
+| Feature | Status |
+|---------|--------|
+| Summary Hook | ✅ Ready |
+| What's New | ✅ Ready (with split support) |
+| Fixes | ✅ Ready (with split support) |
+| Prompt Changes | ✅ Ready (w/ cchistory) |
+| Pending flow | ✅ Ready |
+| Update flow | ✅ Ready |
+| 48h timeout | ✅ Ready |
+| X Premium mode | ✅ Ready |
+| Twitter client | ✅ Ready (needs creds) |
+| Weekly summary | ✅ Ready |
+| Reddit integration | 🟡 Schema only |
 
 ## Next Priority
 
-1. **Domain** — Purchase clawd.gg, configure DNS
-2. **HTTPS** — Setup Caddy with auto-SSL
-3. **Dashboard V2 Phase 2** — Token & model insights
-4. **Share features** — OG image generation
+1. **X Developer Account** — Get API credentials
+2. **Test bot live** — `bun bot` with real credentials
+3. **X Premium** — Subscribe for better UX (~$8/mo)
+4. **Domain** — Purchase clawd.gg, configure DNS
+5. **Reddit integration** — Wire up watcher + poster
 
 ## Quick Commands
 
 ```bash
-# Check app
-ssh clawdgg 'docker ps'
+# Web app
+bun dev                    # Local dev
+ssh clawdgg 'docker ps'    # Check containers
 
-# Deploy
-rsync -avz src/ clawdgg:/opt/clawdgg/src/ && ssh clawdgg 'cd /opt/clawdgg && docker compose -f docker-compose.staging.yml up -d --build --force-recreate app'
+# Bot
+bun bot                    # Run once
+bun bot:daemon             # Continuous
+DRY_RUN=true bun bot       # Test without posting
 
-# Sync CLI too
-rsync -avz cli/ clawdgg:/opt/clawdgg/cli/
+# Deploy web
+rsync -avz src/ clawdgg:/opt/clawdgg/src/ && ssh clawdgg 'cd /opt/clawdgg && docker compose -f docker-compose.staging.yml up -d --force-recreate app'
 
-# Run migration (if needed)
-rsync -avz scripts/ clawdgg:/opt/clawdgg/scripts/ && ssh clawdgg 'cd /opt/clawdgg && docker cp scripts/migrate-0004.ts clawdgg-app-1:/app/migrate-0004.ts && docker exec clawdgg-app-1 bun /app/migrate-0004.ts'
+# Init bot db
+bun bot/src/db/init.ts
+```
+
+## Environment Variables Needed
+
+```bash
+# .env additions for bot
+TWITTER_API_KEY=
+TWITTER_API_SECRET=
+TWITTER_ACCESS_TOKEN=
+TWITTER_ACCESS_SECRET=
+X_PREMIUM=true  # Optional, enables long tweets
 ```
