@@ -248,11 +248,16 @@ function parseOtlpEvents(body: OtlpLogsRequest, userId: string): EventRow[] {
         // Skip non-events
         if (!eventName) continue;
 
+        // Normalize event names to include claude_code. prefix for schema compatibility
+        const normalizedEventName = eventName.startsWith('claude_code.')
+          ? eventName
+          : `claude_code.${eventName}`;
+
         events.push({
           timestamp: parseTimestamp(logRecord.timeUnixNano),
           user_id: userId,
           session_id: sessionId,
-          event_name: eventName,
+          event_name: normalizedEventName,
           prompt_length: safeNumber(getAttr(attrs, 'prompt_length'), 0, 1_000_000), // Max 1M chars
           tool_name: safeString(getAttr(attrs, 'tool_name'), 200),
           tool_success: getAttr(attrs, 'success') === true || getAttr(attrs, 'success') === 'true' ? 1 : 0,
