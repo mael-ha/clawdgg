@@ -280,9 +280,12 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         }
         const hasExistingHourCounts = Object.keys(existingHourCounts).length > 0;
 
-        // Merge hourCounts: Use OTEL if available, otherwise preserve CLI-synced
-        // When both exist, we could merge them, but for now prefer OTEL (newer data)
-        const finalHourCounts = hasOtelHourCounts ? otelHourCounts : existingHourCounts;
+        // Merge hourCounts: SUM by hour (historical CLI + recent OTEL)
+        // This preserves complete activity patterns across the transition
+        const finalHourCounts: Record<string, number> = { ...existingHourCounts };
+        for (const [hour, count] of Object.entries(otelHourCounts)) {
+          finalHourCounts[hour] = (finalHourCounts[hour] || 0) + count;
+        }
 
         // Streaks: Use max of OTEL vs existing (don't lose CLI-synced data)
         // OTEL streaks start fresh, so existing may be higher until enough OTEL data accumulates
