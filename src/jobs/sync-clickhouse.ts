@@ -184,6 +184,11 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         legacyLines: users.legacyTotalLinesAdded,
         legacyCommits: users.legacyTotalCommits,
         legacyToolCalls: users.legacyTotalToolCalls,
+        // Legacy token breakdown (for TokenOrbit visualization)
+        legacyInputTokens: users.legacyTotalInputTokens,
+        legacyOutputTokens: users.legacyTotalOutputTokens,
+        legacyCacheReadTokens: users.legacyTotalCacheReadTokens,
+        legacyCacheCreationTokens: users.legacyTotalCacheCreationTokens,
         // Current values (may have been set by CLI sync - preserve if OTEL has no data)
         currentHourCounts: users.hourCounts,
         currentLongestSession: users.longestSessionMessages,
@@ -213,6 +218,11 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         legacyLines = 0,
         legacyCommits = 0,
         legacyToolCalls = 0,
+        // Legacy token breakdown
+        legacyInputTokens = 0,
+        legacyOutputTokens = 0,
+        legacyCacheReadTokens = 0,
+        legacyCacheCreationTokens = 0,
         // Current values from CLI sync (preserve if OTEL has no data)
         currentHourCounts,
         currentLongestSession = 0,
@@ -298,6 +308,13 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
       const combinedLines = Math.round(userTotals.total_lines_added) + (legacyLines ?? 0);
       const combinedCommits = Math.round(userTotals.total_commits) + (legacyCommits ?? 0);
 
+      // Token breakdown (legacy for now, OTEL breakdown TBD)
+      // These are needed for the TokenOrbit visualization
+      const combinedInputTokens = legacyInputTokens ?? 0;
+      const combinedOutputTokens = legacyOutputTokens ?? 0;
+      const combinedCacheReadTokens = legacyCacheReadTokens ?? 0;
+      const combinedCacheCreationTokens = legacyCacheCreationTokens ?? 0;
+
       // Compute badges with COMBINED totals and PRESERVED metadata
       const badges = computeBadges({
         totalMessages: combinedPrompts,
@@ -322,6 +339,12 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
           totalPrs: Math.round(userTotals.total_prs), // No legacy PRs tracked
           totalActiveSeconds: Math.round(userTotals.total_active_seconds), // OTEL only
           avgPromptLength: Math.round(userTotals.avg_prompt_length), // OTEL only
+
+          // Token breakdown (for TokenOrbit visualization)
+          totalInputTokens: combinedInputTokens,
+          totalOutputTokens: combinedOutputTokens,
+          totalCacheReadTokens: combinedCacheReadTokens,
+          totalCacheCreationTokens: combinedCacheCreationTokens,
 
           // Streak data (max of OTEL vs CLI-synced)
           currentStreak: finalCurrentStreak,
