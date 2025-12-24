@@ -151,6 +151,11 @@ export interface UserTotals {
   user_id: string;
   total_prompts: number;
   total_tokens: number;
+  // Token breakdown (for TokenOrbit visualization)
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_read_tokens: number;
+  total_cache_write_tokens: number;
   total_cost_usd: number;
   total_lines_added: number;
   total_commits: number;
@@ -196,6 +201,7 @@ export async function insertEvents(events: EventRow[]): Promise<void> {
 
 /**
  * Get user totals for leaderboard sync
+ * Includes token breakdown for TokenOrbit visualization
  */
 export async function getUserTotals(userId?: string): Promise<UserTotals[]> {
   const whereClause = userId ? `WHERE md.user_id = {userId:String}` : '';
@@ -205,6 +211,11 @@ export async function getUserTotals(userId?: string): Promise<UserTotals[]> {
       md.user_id,
       SUM(ps.prompt_count) as total_prompts,
       SUM(md.input_tokens + md.output_tokens) as total_tokens,
+      -- Token breakdown for TokenOrbit
+      SUM(md.input_tokens) as total_input_tokens,
+      SUM(md.output_tokens) as total_output_tokens,
+      SUM(md.cache_read_tokens) as total_cache_read_tokens,
+      SUM(md.cache_write_tokens) as total_cache_write_tokens,
       SUM(md.cost_usd) as total_cost_usd,
       SUM(md.lines_added) as total_lines_added,
       SUM(md.commits) as total_commits,
@@ -396,6 +407,227 @@ export async function getUserRank(
   return result[0] || null;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Real-time & Insights Queries (OTEL Full Potential)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Real-time today's metrics (for live dashboard)
+ * Updated every ~60 seconds as OTEL data flows in
+ */
+export interface TodayMetrics {
+  prompts: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costUsd: number;
+  linesAdded: number;
+  linesRemoved: number;
+  commits: number;
+  activeSeconds: number;
+  lastActivity: string | null;
+}
+
+export async function getUserTodayMetrics(userId: string): Promise<TodayMetrics | null> {
+  const sql = `
+    SELECT
+      COALESCE(ps.prompt_count, 0) as prompts,
+      COALESCE(md.input_tokens, 0) as inputTokens,
+      COALESCE(md.output_tokens, 0) as outputTokens,
+      COALESCE(md.cache_read_tokens, 0) as cacheReadTokens,
+      COALESCE(md.cache_write_tokens, 0) as cacheWriteTokens,
+      COALESCE(md.cost_usd, 0) as costUsd,
+      COALESCE(md.lines_added, 0) as linesAdded,
+      COALESCE(md.lines_removed, 0) as linesRemoved,
+      COALESCE(md.commits, 0) as commits,
+      COALESCE(md.active_seconds, 0) as activeSeconds,
+      (SELECT MAX(timestamp) FROM events_raw WHERE user_id = {userId:String} AND toDate(timestamp) = today()) as lastActivity
+    FROM metrics_daily md
+    LEFT JOIN prompt_stats_daily ps ON md.user_id = ps.user_id AND md.date = ps.date
+    WHERE md.user_id = {userId:String} AND md.date = today()
+  `;
+
+  const result = await query<TodayMetrics>(sql, { userId });
+  return result[0] || null;
+}
+
+/**
+ * Cache efficiency stats (how much money caching saves)
+ */
+export interface CacheStats {
+  totalCacheReadTokens: number;
+  totalInputTokens: number;
+  cacheHitRate: number; // Percentage of reads that were cached
+  estimatedSavingsUsd: number; // Money saved by caching
+}
+
+export async function getUserCacheStats(userId: string, days?: number): Promise<CacheStats | null> {
+  const dateFilter = days ? `AND md.date >= today() - ${days}` : '';
+
+  const sql = `
+    SELECT
+      SUM(md.cache_read_tokens) as totalCacheReadTokens,
+      SUM(md.input_tokens) as totalInputTokens,
+      -- Cache hit rate: what % of total context was cached
+      if(SUM(md.input_tokens + md.cache_read_tokens) > 0,
+        SUM(md.cache_read_tokens) * 100.0 / SUM(md.input_tokens + md.cache_read_tokens),
+        0) as cacheHitRate,
+      -- Savings: cache_read at 0.1x vs 1.0x (we save 0.9x)
+      -- Using average input price of $4/MTok
+      SUM(md.cache_read_tokens) * 0.9 * 4 / 1000000 as estimatedSavingsUsd
+    FROM metrics_daily md
+    WHERE md.user_id = {userId:String}
+    ${dateFilter}
+  `;
+
+  const result = await query<CacheStats>(sql, { userId });
+  return result[0] || null;
+}
+
+/**
+ * Tool usage breakdown (which tools are used most)
+ */
+export interface ToolStats {
+  toolName: string;
+  totalCalls: number;
+  successCount: number;
+  failureCount: number;
+  successRate: number;
+  avgDurationMs: number;
+}
+
+export async function getUserToolBreakdown(userId: string, days: number = 30): Promise<ToolStats[]> {
+  const sql = `
+    SELECT
+      tool_name as toolName,
+      COUNT(*) as totalCalls,
+      SUM(tool_success) as successCount,
+      SUM(1 - tool_success) as failureCount,
+      if(COUNT(*) > 0, SUM(tool_success) * 100.0 / COUNT(*), 0) as successRate,
+      AVG(tool_duration_ms) as avgDurationMs
+    FROM events_raw
+    WHERE user_id = {userId:String}
+      AND event_name = 'claude_code.tool_result'
+      AND tool_name != ''
+      AND timestamp >= now() - INTERVAL {days:UInt32} DAY
+    GROUP BY tool_name
+    ORDER BY totalCalls DESC
+  `;
+
+  return query<ToolStats>(sql, { userId, days });
+}
+
+/**
+ * Get total tool call count for a user (for badge computation and display)
+ */
+export async function getUserTotalToolCalls(userId: string): Promise<number> {
+  const sql = `
+    SELECT COUNT(*) as total
+    FROM events_raw
+    WHERE user_id = {userId:String}
+      AND event_name = 'claude_code.tool_result'
+  `;
+
+  const result = await query<{ total: number }>(sql, { userId });
+  return result[0]?.total || 0;
+}
+
+/**
+ * Activity heatmap data (for GitHub-style visualization)
+ * Returns data grouped by hour (0-23) and day of week (1-7, Mon=1)
+ */
+export interface HeatmapCell {
+  hour: number;      // 0-23
+  dayOfWeek: number; // 1-7 (Monday=1, Sunday=7)
+  activity: number;  // Token activity level
+  promptCount: number;
+}
+
+export async function getActivityHeatmap(userId: string, days: number = 90): Promise<HeatmapCell[]> {
+  const sql = `
+    SELECT
+      toHour(timestamp) as hour,
+      toDayOfWeek(timestamp) as dayOfWeek,
+      SUM(input_tokens + output_tokens) as activity,
+      COUNT(*) as promptCount
+    FROM events_raw
+    WHERE user_id = {userId:String}
+      AND event_name = 'claude_code.user_prompt'
+      AND timestamp >= now() - INTERVAL {days:UInt32} DAY
+    GROUP BY hour, dayOfWeek
+    ORDER BY dayOfWeek, hour
+  `;
+
+  return query<HeatmapCell>(sql, { userId, days });
+}
+
+/**
+ * Velocity trends (daily metrics for sparkline/chart)
+ */
+export interface DailyTrend {
+  date: string;
+  prompts: number;
+  tokens: number;
+  costUsd: number;
+  lines: number;
+}
+
+export async function getUserVelocityTrend(userId: string, days: number = 30): Promise<DailyTrend[]> {
+  const sql = `
+    SELECT
+      toString(md.date) as date,
+      COALESCE(ps.prompt_count, 0) as prompts,
+      COALESCE(md.input_tokens + md.output_tokens, 0) as tokens,
+      COALESCE(md.cost_usd, 0) as costUsd,
+      COALESCE(md.lines_added, 0) as lines
+    FROM metrics_daily md
+    LEFT JOIN prompt_stats_daily ps ON md.user_id = ps.user_id AND md.date = ps.date
+    WHERE md.user_id = {userId:String}
+      AND md.date >= today() - {days:UInt32}
+    ORDER BY md.date
+  `;
+
+  return query<DailyTrend>(sql, { userId, days });
+}
+
+/**
+ * Session analytics
+ */
+export interface SessionStats {
+  totalSessions: number;
+  avgSessionMinutes: number;
+  avgPromptsPerSession: number;
+  longestSessionMinutes: number;
+}
+
+export async function getUserSessionStats(userId: string, days: number = 30): Promise<SessionStats | null> {
+  const sql = `
+    WITH sessions AS (
+      SELECT
+        session_id,
+        COUNT(*) as prompt_count,
+        dateDiff('second', MIN(timestamp), MAX(timestamp)) / 60 as duration_minutes
+      FROM events_raw
+      WHERE user_id = {userId:String}
+        AND event_name = 'claude_code.user_prompt'
+        AND timestamp >= now() - INTERVAL {days:UInt32} DAY
+        AND session_id != ''
+      GROUP BY session_id
+      HAVING prompt_count > 0
+    )
+    SELECT
+      COUNT(*) as totalSessions,
+      AVG(duration_minutes) as avgSessionMinutes,
+      AVG(prompt_count) as avgPromptsPerSession,
+      MAX(duration_minutes) as longestSessionMinutes
+    FROM sessions
+  `;
+
+  const result = await query<SessionStats>(sql, { userId, days });
+  return result[0] || null;
+}
+
 export const clickhouse = {
   query,
   insert,
@@ -408,6 +640,14 @@ export const clickhouse = {
   getUserHourlyActivity,
   getLeaderboard,
   getUserRank,
+  // New OTEL full potential queries
+  getUserTodayMetrics,
+  getUserCacheStats,
+  getUserToolBreakdown,
+  getUserTotalToolCalls,
+  getActivityHeatmap,
+  getUserVelocityTrend,
+  getUserSessionStats,
 };
 
 export default clickhouse;

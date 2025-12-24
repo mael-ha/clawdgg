@@ -20,6 +20,7 @@ import {
 import { TokenOrbit } from '../components/TokenOrbit';
 import { ActivityRadar } from '../components/ActivityRadar';
 import type { SessionUser } from '../types';
+import { clickhouse, type TodayMetrics, type CacheStats } from '../db/clickhouse';
 
 type Variables = {
   user: SessionUser | null;
@@ -202,6 +203,64 @@ const StyleRow: FC<StyleRowProps> = ({ label, value, subvalue, icon }) => (
   </div>
 );
 
+// Today's Activity Widget (OTEL users only)
+interface TodayWidgetProps {
+  today: TodayMetrics;
+  cacheStats: CacheStats | null;
+}
+
+const TodayWidget: FC<TodayWidgetProps> = ({ today, cacheStats }) => {
+  const costFormatted = today.costUsd >= 1
+    ? `$${today.costUsd.toFixed(0)}`
+    : `$${today.costUsd.toFixed(2)}`;
+
+  return (
+    <div class="relative mb-8 p-6 bg-gradient-to-br from-green-500/5 via-transparent to-cyan-500/5 border border-green-500/20 rounded-2xl overflow-hidden">
+      {/* Live indicator */}
+      <div class="absolute top-4 right-4 flex items-center gap-2">
+        <span class="relative flex h-2 w-2">
+          <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+          <span class="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+        </span>
+        <span class="text-green-400 text-xs font-mono">LIVE</span>
+      </div>
+
+      <h2 class="text-gray-400 text-xs uppercase tracking-[0.3em] mb-4 font-mono">Today's Activity</h2>
+
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div>
+          <div class="text-2xl font-bold text-white font-mono">{today.prompts}</div>
+          <div class="text-gray-600 text-xs font-mono">prompts</div>
+        </div>
+        <div>
+          <div class="text-2xl font-bold text-green-400 font-mono">{costFormatted}</div>
+          <div class="text-gray-600 text-xs font-mono">spent</div>
+        </div>
+        <div>
+          <div class="text-2xl font-bold text-cyan-400 font-mono">{formatTokens(today.linesAdded)}</div>
+          <div class="text-gray-600 text-xs font-mono">lines</div>
+        </div>
+        <div>
+          <div class="text-2xl font-bold text-purple-400 font-mono">{today.commits}</div>
+          <div class="text-gray-600 text-xs font-mono">commits</div>
+        </div>
+      </div>
+
+      {/* Cache savings callout */}
+      {cacheStats && cacheStats.estimatedSavingsUsd > 1 && (
+        <div class="mt-4 pt-4 border-t border-gray-800/50">
+          <div class="flex items-center gap-2">
+            <span class="text-amber-400">$</span>
+            <span class="text-amber-300 font-mono font-bold">{cacheStats.estimatedSavingsUsd.toFixed(0)}</span>
+            <span class="text-gray-500 text-sm">saved by caching</span>
+            <span class="text-gray-600 text-xs">({cacheStats.cacheHitRate.toFixed(0)}% cache hit rate)</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // PROFILE PAGE
 // ═══════════════════════════════════════════════════════════════════════════
@@ -245,6 +304,10 @@ interface ProfileProps {
   peakHour: PeakHourInfo | null;
   contributions: ContributionDay[];
   currentUser: SessionUser | null;
+  // OTEL-specific data (only for own profile)
+  todayMetrics: TodayMetrics | null;
+  cacheStats: CacheStats | null;
+  isOtelEnabled: boolean;
 }
 
 const Profile: FC<ProfileProps> = ({
@@ -253,7 +316,10 @@ const Profile: FC<ProfileProps> = ({
   derivedMetrics,
   peakHour,
   contributions,
-  currentUser
+  currentUser,
+  todayMetrics,
+  cacheStats,
+  isOtelEnabled,
 }) => {
   const isOwnProfile = currentUser?.githubUsername === profile.username;
   const memberSince = profile.firstSessionDate
@@ -311,6 +377,13 @@ clawd.gg/u/${profile.username}`;
       </header>
 
       <main class="max-w-5xl mx-auto px-4 py-8">
+        {/* ════════════════════════════════════════════════════════════════════
+            LIVE TODAY WIDGET (OTEL users viewing own profile only)
+            ════════════════════════════════════════════════════════════════════ */}
+        {isOwnProfile && isOtelEnabled && todayMetrics && (
+          <TodayWidget today={todayMetrics} cacheStats={cacheStats} />
+        )}
+
         {/* ════════════════════════════════════════════════════════════════════
             COMMAND CENTER HERO
             Dramatic centered layout with glowing accents
@@ -601,7 +674,7 @@ app.get('/:username', async (c) => {
   }
 
   const userData = user[0]!;
-  const isOtelUser = userData.otelEnabled;
+  const isOtelUser = userData.otelEnabled === true;
 
   // Get stats: use users.total_* for OTel users, sum daily_stats for legacy
   let totalPrompts: number;
@@ -630,7 +703,9 @@ app.get('/:username', async (c) => {
     totalCostCents = userData.totalCostUsd ?? 0;
     totalActiveSeconds = userData.totalActiveSeconds ?? 0;
     totalMessages = totalPrompts;
-    totalToolCalls = 0;
+    // Tool calls: OTEL + legacy (query ClickHouse for fresh count)
+    const otelToolCalls = await clickhouse.getUserTotalToolCalls(userData.id);
+    totalToolCalls = otelToolCalls + (userData.legacyTotalToolCalls ?? 0);
   } else {
     // V1: Sum from daily_stats
     const statsResult = await db
@@ -665,7 +740,8 @@ app.get('/:username', async (c) => {
   }
 
   // Fetch daily activity for contribution graph
-  const dailyActivity = await db
+  // For OTEL users: Merge legacy dailyStats + ClickHouse metrics_daily
+  const legacyActivity = await db
     .select({
       date: dailyStats.date,
       count: dailyStats.promptCount,
@@ -673,6 +749,30 @@ app.get('/:username', async (c) => {
     .from(dailyStats)
     .where(eq(dailyStats.userId, userData.id))
     .orderBy(asc(dailyStats.date));
+
+  // Build merged daily activity map
+  const activityMap = new Map<string, number>();
+  for (const day of legacyActivity) {
+    activityMap.set(day.date, day.count);
+  }
+
+  // For OTEL users, fetch and merge ClickHouse data
+  if (isOtelUser) {
+    const otelDaily = await clickhouse.getUserDailyMetrics(userData.id, 365);
+    for (const day of otelDaily) {
+      // Use sessions as proxy for activity (or could use input_tokens, etc.)
+      // Since we don't have prompt_count in metrics_daily, use sessions
+      const otelCount = day.sessions || 1; // At least 1 if there's any data
+      const existing = activityMap.get(day.date) || 0;
+      // For overlapping dates (rare, only on OTEL enable day), take max
+      activityMap.set(day.date, Math.max(existing, otelCount));
+    }
+  }
+
+  // Convert map to sorted array
+  const dailyActivity = Array.from(activityMap.entries())
+    .map(([date, count]) => ({ date, count }))
+    .sort((a, b) => a.date.localeCompare(b.date));
 
   // Calculate contribution levels
   const maxCount = Math.max(...dailyActivity.map(d => d.count), 1);
@@ -747,6 +847,26 @@ app.get('/:username', async (c) => {
   // Get peak hour
   const peakHour = getPeakHour(hourCounts);
 
+  // Fetch OTEL-specific data for own profile
+  const isOwnProfile = currentUser?.githubUsername === username;
+  let todayMetrics: TodayMetrics | null = null;
+  let cacheStats: CacheStats | null = null;
+
+  if (isOwnProfile && isOtelUser) {
+    try {
+      // Fetch today's real-time metrics and cache stats in parallel
+      const [todayResult, cacheResult] = await Promise.all([
+        clickhouse.getUserTodayMetrics(userData.id),
+        clickhouse.getUserCacheStats(userData.id),
+      ]);
+      todayMetrics = todayResult;
+      cacheStats = cacheResult;
+    } catch (error) {
+      console.error('Error fetching OTEL data:', error);
+      // Continue without OTEL data
+    }
+  }
+
   const profile: ProfileData = {
     username: userData.githubUsername,
     avatarUrl: userData.avatarUrl,
@@ -780,6 +900,9 @@ app.get('/:username', async (c) => {
         peakHour={peakHour}
         contributions={contributions}
         currentUser={currentUser}
+        todayMetrics={todayMetrics}
+        cacheStats={cacheStats}
+        isOtelEnabled={isOtelUser}
       />
     </Layout>
   );

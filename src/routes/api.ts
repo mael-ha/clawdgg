@@ -61,11 +61,30 @@ function calculateStreaks(dates: string[]): { currentStreak: number; longestStre
 }
 
 // POST /api/stats - Submit daily stats (requires auth)
+// NOTE: This endpoint is for CLI sync (legacy). OTEL users should NOT use this.
 api.post('/stats', requireAuth, async (c) => {
   try {
     const user = c.get('user');
     if (!user) {
       return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CRITICAL: Block CLI sync for OTEL users to prevent data corruption
+    // OTEL users have real-time streaming; CLI sync would overwrite merged data
+    // ═══════════════════════════════════════════════════════════════════════
+    const userData = await db
+      .select({ otelEnabled: users.otelEnabled })
+      .from(users)
+      .where(eq(users.id, user.id))
+      .get();
+
+    if (userData?.otelEnabled) {
+      return c.json({
+        error: 'CLI sync disabled for OTEL users',
+        message: 'Your stats are streaming automatically via OTEL. No manual sync needed.',
+        otelEnabled: true,
+      }, 400);
     }
 
     const body = await c.req.json<StatsSubmission>();
@@ -393,14 +412,20 @@ api.get('/leaderboard', optionalAuth, async (c) => {
       return c.json(response);
     }
 
-    // For period-based queries (today/week/month), use legacy daily_stats query
-    // TODO: When ClickHouse is live, query ClickHouse for period-based data
-    const baseQuery = db
+    // For period-based queries, we need to merge:
+    // 1. Legacy users from dailyStats
+    // 2. OTEL users from ClickHouse
+    //
+    // Strategy: Query both, merge results, sort by the requested column
+
+    // 1. Get legacy users from dailyStats (non-OTEL users)
+    const legacyResults = await db
       .select({
         userId: users.id,
         githubUsername: users.githubUsername,
         avatarUrl: users.avatarUrl,
         badges: users.badges,
+        otelEnabled: users.otelEnabled,
         promptCount: sql<number>`sum(${dailyStats.promptCount})`.as('total_prompts'),
         messageCount: sql<number>`sum(${dailyStats.messageCount})`.as('total_messages'),
         toolCallCount: sql<number>`sum(${dailyStats.toolCallCount})`.as('total_tools'),
@@ -410,43 +435,114 @@ api.get('/leaderboard', optionalAuth, async (c) => {
         sessionCount: sql<number>`sum(${dailyStats.sessionCount})`.as('total_sessions'),
       })
       .from(dailyStats)
-      .innerJoin(users, eq(dailyStats.userId, users.id));
+      .innerJoin(users, eq(dailyStats.userId, users.id))
+      .where(and(
+        dateFilter ? gte(dailyStats.date, dateFilter) : undefined,
+        eq(users.otelEnabled, false), // Only non-OTEL users
+      ))
+      .groupBy(users.id, users.githubUsername, users.avatarUrl, users.badges, users.otelEnabled);
 
-    // Apply date filter
-    const queryWithFilter = dateFilter
-      ? baseQuery.where(gte(dailyStats.date, dateFilter))
-      : baseQuery;
+    // 2. Get OTEL users from ClickHouse
+    let otelResults: Array<{
+      userId: string;
+      githubUsername: string;
+      avatarUrl: string | null;
+      badges: string | null;
+      promptCount: number;
+      tokenCount: number;
+      linesWritten: number;
+      commitCount: number;
+    }> = [];
 
-    // Group and sort
-    // Map validated sort column to the alias used in the query
-    const sortColumnAlias =
-      sortColumn === 'promptCount' ? 'total_prompts' :
-      sortColumn === 'tokenCount' ? 'total_tokens' :
-      sortColumn === 'linesWritten' ? 'total_lines' :
-      sortColumn === 'messageCount' ? 'total_messages' :
-      sortColumn === 'sessionCount' ? 'total_sessions' :
-      sortColumn === 'toolCallCount' ? 'total_tools' : 'total_prompts';
+    try {
+      const { clickhouse } = await import('../db/clickhouse');
+      const chPeriod = period as 'today' | 'week' | 'month';
+      const chResults = await clickhouse.getLeaderboard(chPeriod, 'prompts', 1000, 0);
 
-    const results = await queryWithFilter
-      .groupBy(users.id, users.githubUsername, users.avatarUrl, users.badges)
-      .orderBy(desc(sql.raw(sortColumnAlias)))
-      .limit(limit)
-      .offset(offset);
+      // Get user info for ClickHouse results
+      const otelUserIds = chResults.entries.map(e => e.user_id);
+      if (otelUserIds.length > 0) {
+        const userInfos = await db
+          .select({
+            id: users.id,
+            githubUsername: users.githubUsername,
+            avatarUrl: users.avatarUrl,
+            badges: users.badges,
+            legacyPrompts: users.legacyTotalPrompts,
+            legacyCost: users.legacyTotalCostUsdCents,
+            legacyLines: users.legacyTotalLinesAdded,
+            legacyCommits: users.legacyTotalCommits,
+          })
+          .from(users)
+          .where(eq(users.otelEnabled, true));
 
-    // Get total count
-    const countQuery = db
-      .select({ count: sql<number>`count(distinct ${dailyStats.userId})` })
-      .from(dailyStats);
+        const userMap = new Map(userInfos.map(u => [u.id, u]));
 
-    const countWithFilter = dateFilter
-      ? countQuery.where(gte(dailyStats.date, dateFilter))
-      : countQuery;
+        otelResults = chResults.entries
+          .filter(e => userMap.has(e.user_id))
+          .map(e => {
+            const u = userMap.get(e.user_id)!;
+            return {
+              userId: e.user_id,
+              githubUsername: u.githubUsername,
+              avatarUrl: u.avatarUrl,
+              badges: u.badges,
+              // For period queries, only show OTEL data (not legacy - that's historical)
+              promptCount: e.total_prompts,
+              tokenCount: e.total_tokens,
+              linesWritten: e.total_lines_added,
+              commitCount: e.total_commits,
+            };
+          });
+      }
+    } catch (error) {
+      console.error('[Leaderboard] ClickHouse query failed, using legacy only:', error);
+    }
 
-    const countResult = await countWithFilter;
-    const total = countResult[0]?.count || 0;
+    // 3. Merge results
+    const merged = [
+      ...legacyResults.map(row => ({
+        userId: row.userId,
+        githubUsername: row.githubUsername,
+        avatarUrl: row.avatarUrl,
+        badges: row.badges,
+        promptCount: row.promptCount || 0,
+        tokenCount: row.tokenCount || 0,
+        linesWritten: row.linesWritten || 0,
+        commitCount: row.commitCount || 0,
+        messageCount: row.messageCount || 0,
+        toolCallCount: row.toolCallCount || 0,
+        sessionCount: row.sessionCount || 0,
+      })),
+      ...otelResults.map(row => ({
+        userId: row.userId,
+        githubUsername: row.githubUsername,
+        avatarUrl: row.avatarUrl,
+        badges: row.badges,
+        promptCount: row.promptCount,
+        tokenCount: row.tokenCount,
+        linesWritten: row.linesWritten,
+        commitCount: row.commitCount,
+        messageCount: 0,
+        toolCallCount: 0,
+        sessionCount: 0,
+      })),
+    ];
+
+    // 4. Sort by requested column
+    const sortKey = sortColumn === 'promptCount' ? 'promptCount' :
+      sortColumn === 'tokenCount' ? 'tokenCount' :
+      sortColumn === 'linesWritten' ? 'linesWritten' :
+      sortColumn === 'commitCount' ? 'commitCount' : 'promptCount';
+
+    merged.sort((a, b) => (b[sortKey as keyof typeof b] as number) - (a[sortKey as keyof typeof a] as number));
+
+    // 5. Paginate
+    const total = merged.length;
+    const paginatedResults = merged.slice(offset, offset + limit);
 
     // Transform results
-    const entries: LeaderboardEntry[] = results.map((row, index) => {
+    const entries: LeaderboardEntry[] = paginatedResults.map((row, index) => {
       let badges: string[] = [];
       try {
         badges = row.badges ? JSON.parse(row.badges) : [];
@@ -776,6 +872,7 @@ api.get('/me', requireAuth, async (c) => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // POST /api/otel/enable - Mark user as OTel-enabled
+// CRITICAL: Snapshots historical data from dailyStats before switching to OTEL
 api.post('/otel/enable', requireAuth, async (c) => {
   try {
     const user = c.get('user');
@@ -783,16 +880,66 @@ api.post('/otel/enable', requireAuth, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
 
+    // Get today's date as YYYY-MM-DD for the cutoff point
+    const today = new Date().toISOString().split('T')[0]!;
+
+    // CRITICAL: Snapshot all historical data from dailyStats
+    // This preserves the user's complete history when transitioning to OTEL
+    const legacyTotals = await db
+      .select({
+        prompts: sql<number>`COALESCE(SUM(${dailyStats.promptCount}), 0)`,
+        tokens: sql<number>`COALESCE(SUM(${dailyStats.tokenCount}), 0)`,
+        inputTokens: sql<number>`COALESCE(SUM(${dailyStats.inputTokens}), 0)`,
+        outputTokens: sql<number>`COALESCE(SUM(${dailyStats.outputTokens}), 0)`,
+        cacheReadTokens: sql<number>`COALESCE(SUM(${dailyStats.cacheReadTokens}), 0)`,
+        cacheCreationTokens: sql<number>`COALESCE(SUM(${dailyStats.cacheCreationTokens}), 0)`,
+        costUsdCents: sql<number>`COALESCE(SUM(${dailyStats.costUsdCents}), 0)`,
+        linesAdded: sql<number>`COALESCE(SUM(${dailyStats.linesWritten}), 0)`,
+        commits: sql<number>`COALESCE(SUM(${dailyStats.commitCount}), 0)`,
+        toolCalls: sql<number>`COALESCE(SUM(${dailyStats.toolCallCount}), 0)`,
+      })
+      .from(dailyStats)
+      .where(eq(dailyStats.userId, user.id));
+
+    const legacy = legacyTotals[0] || {
+      prompts: 0, tokens: 0, inputTokens: 0, outputTokens: 0,
+      cacheReadTokens: 0, cacheCreationTokens: 0, costUsdCents: 0,
+      linesAdded: 0, commits: 0, toolCalls: 0,
+    };
+
+    console.log(`[OTel Enable] Snapshotting legacy data for ${user.id}:`, legacy);
+
     await db
       .update(users)
       .set({
         otelEnabled: true,
         otelSetupAt: new Date(),
+        otelSetupDate: today,
+        // Snapshot historical totals - these are frozen and added to OTEL totals
+        legacyTotalPrompts: legacy.prompts,
+        legacyTotalTokens: legacy.tokens,
+        legacyTotalInputTokens: legacy.inputTokens,
+        legacyTotalOutputTokens: legacy.outputTokens,
+        legacyTotalCacheReadTokens: legacy.cacheReadTokens,
+        legacyTotalCacheCreationTokens: legacy.cacheCreationTokens,
+        legacyTotalCostUsdCents: legacy.costUsdCents,
+        legacyTotalLinesAdded: legacy.linesAdded,
+        legacyTotalCommits: legacy.commits,
+        legacyTotalToolCalls: legacy.toolCalls,
         updatedAt: new Date(),
       })
       .where(eq(users.id, user.id));
 
-    return c.json({ success: true, otelEnabled: true });
+    return c.json({
+      success: true,
+      otelEnabled: true,
+      legacySnapshot: {
+        prompts: legacy.prompts,
+        tokens: legacy.tokens,
+        costCents: legacy.costUsdCents,
+        message: 'Historical data preserved. OTEL will add to these totals.',
+      },
+    });
   } catch (error) {
     console.error('Error enabling OTel:', error);
     return c.json({ error: 'Failed to enable OTel' }, 500);
@@ -819,6 +966,270 @@ api.post('/otel/disable', requireAuth, async (c) => {
   } catch (error) {
     console.error('Error disabling OTel:', error);
     return c.json({ error: 'Failed to disable OTel' }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OTEL Insights Endpoints (Full Potential)
+// Real-time data and rich metrics for OTEL-enabled users
+// ═══════════════════════════════════════════════════════════════════════════
+
+// GET /api/me/today - Real-time today's metrics (OTEL users only)
+api.get('/me/today', requireAuth, async (c) => {
+  try {
+    const user = c.get('user');
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    // Check if OTEL is enabled
+    const userData = await db
+      .select({ otelEnabled: users.otelEnabled })
+      .from(users)
+      .where(eq(users.id, user.id))
+      .get();
+
+    if (!userData?.otelEnabled) {
+      return c.json({
+        error: 'OTEL not enabled',
+        message: 'Run `clawd setup` to enable real-time metrics',
+      }, 400);
+    }
+
+    // Dynamic import to avoid issues if ClickHouse not configured
+    const { clickhouse } = await import('../db/clickhouse');
+    const today = await clickhouse.getUserTodayMetrics(user.id);
+
+    if (!today) {
+      return c.json({
+        prompts: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costUsd: 0,
+        linesAdded: 0,
+        linesRemoved: 0,
+        commits: 0,
+        activeSeconds: 0,
+        activeMinutes: 0,
+        lastActivity: null,
+        message: 'No activity today yet',
+      });
+    }
+
+    return c.json({
+      ...today,
+      activeMinutes: Math.round(today.activeSeconds / 60),
+      costFormatted: `$${today.costUsd.toFixed(2)}`,
+    });
+  } catch (error) {
+    console.error('Error fetching today metrics:', error);
+    return c.json({ error: 'Failed to fetch today metrics' }, 500);
+  }
+});
+
+// GET /api/me/insights - Rich metrics for OTEL users
+api.get('/me/insights', requireAuth, async (c) => {
+  try {
+    const user = c.get('user');
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    // Get user data including totals
+    const userData = await db
+      .select({
+        otelEnabled: users.otelEnabled,
+        totalPrompts: users.totalPrompts,
+        totalTokens: users.totalTokens,
+        totalCostUsd: users.totalCostUsd,
+        totalLinesAdded: users.totalLinesAdded,
+        totalCommits: users.totalCommits,
+        totalActiveSeconds: users.totalActiveSeconds,
+        legacyPrompts: users.legacyTotalPrompts,
+        legacyCost: users.legacyTotalCostUsdCents,
+      })
+      .from(users)
+      .where(eq(users.id, user.id))
+      .get();
+
+    if (!userData?.otelEnabled) {
+      return c.json({
+        error: 'OTEL not enabled',
+        message: 'Run `clawd setup` to enable insights',
+      }, 400);
+    }
+
+    const { clickhouse } = await import('../db/clickhouse');
+
+    // Fetch all insights in parallel
+    const [modelUsage, cacheStats, toolBreakdown, sessionStats, velocityTrend] = await Promise.all([
+      clickhouse.getUserModelUsage(user.id),
+      clickhouse.getUserCacheStats(user.id),
+      clickhouse.getUserToolBreakdown(user.id, 30),
+      clickhouse.getUserSessionStats(user.id, 30),
+      clickhouse.getUserVelocityTrend(user.id, 30),
+    ]);
+
+    // Calculate ROI metrics
+    const totalCostDollars = (userData.totalCostUsd || 0) / 100;
+    const totalLines = userData.totalLinesAdded || 0;
+    const totalPrompts = userData.totalPrompts || 0;
+
+    const roiMetrics = {
+      linesPerDollar: totalCostDollars > 0 ? Math.round(totalLines / totalCostDollars) : 0,
+      linesPerPrompt: totalPrompts > 0 ? (totalLines / totalPrompts).toFixed(1) : '0',
+      costPerCommit: userData.totalCommits && userData.totalCommits > 0
+        ? (totalCostDollars / userData.totalCommits).toFixed(2)
+        : '0',
+      tokensPerLine: totalLines > 0
+        ? Math.round((userData.totalTokens || 0) / totalLines)
+        : 0,
+    };
+
+    // Format model diet
+    const modelDiet = modelUsage.map(m => ({
+      model: m.model,
+      displayName: m.model.includes('opus') ? 'Opus' :
+                   m.model.includes('sonnet') ? 'Sonnet' :
+                   m.model.includes('haiku') ? 'Haiku' : m.model,
+      inputTokens: m.input_tokens,
+      outputTokens: m.output_tokens,
+      totalTokens: m.input_tokens + m.output_tokens,
+      costUsd: m.cost_usd,
+      percentage: userData.totalTokens && userData.totalTokens > 0
+        ? ((m.input_tokens + m.output_tokens) / userData.totalTokens * 100).toFixed(1)
+        : '0',
+    }));
+
+    // Calculate average daily metrics from velocity trend
+    const avgDaily = velocityTrend.length > 0 ? {
+      avgPromptsPerDay: Math.round(velocityTrend.reduce((s, d) => s + d.prompts, 0) / velocityTrend.length),
+      avgLinesPerDay: Math.round(velocityTrend.reduce((s, d) => s + d.lines, 0) / velocityTrend.length),
+      avgCostPerDay: (velocityTrend.reduce((s, d) => s + d.costUsd, 0) / velocityTrend.length).toFixed(2),
+    } : { avgPromptsPerDay: 0, avgLinesPerDay: 0, avgCostPerDay: '0' };
+
+    return c.json({
+      // Model diet (which Claudes you use)
+      modelDiet,
+
+      // Cache efficiency
+      cacheStats: cacheStats ? {
+        cacheHitRate: cacheStats.cacheHitRate.toFixed(1),
+        estimatedSavingsUsd: cacheStats.estimatedSavingsUsd.toFixed(2),
+        totalCacheReadTokens: cacheStats.totalCacheReadTokens,
+      } : null,
+
+      // Tool mastery
+      toolBreakdown: toolBreakdown.slice(0, 10), // Top 10 tools
+
+      // Session analytics
+      sessionStats: sessionStats ? {
+        totalSessions: sessionStats.totalSessions,
+        avgSessionMinutes: Math.round(sessionStats.avgSessionMinutes),
+        avgPromptsPerSession: Math.round(sessionStats.avgPromptsPerSession),
+        longestSessionMinutes: Math.round(sessionStats.longestSessionMinutes),
+      } : null,
+
+      // ROI metrics
+      roi: roiMetrics,
+
+      // Average daily metrics
+      averageDaily: avgDaily,
+
+      // Velocity trend (for sparklines)
+      velocityTrend,
+
+      // Active time
+      activeTime: {
+        totalSeconds: userData.totalActiveSeconds || 0,
+        totalMinutes: Math.round((userData.totalActiveSeconds || 0) / 60),
+        totalHours: ((userData.totalActiveSeconds || 0) / 3600).toFixed(1),
+      },
+
+      // Data sources breakdown
+      dataSources: {
+        legacyPrompts: userData.legacyPrompts || 0,
+        legacyCostCents: userData.legacyCost || 0,
+        otelPrompts: (userData.totalPrompts || 0) - (userData.legacyPrompts || 0),
+        otelCostCents: (userData.totalCostUsd || 0) - (userData.legacyCost || 0),
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching insights:', error);
+    return c.json({ error: 'Failed to fetch insights' }, 500);
+  }
+});
+
+// GET /api/me/heatmap - Activity heatmap (GitHub-style)
+api.get('/me/heatmap', requireAuth, async (c) => {
+  try {
+    const user = c.get('user');
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const userData = await db
+      .select({ otelEnabled: users.otelEnabled })
+      .from(users)
+      .where(eq(users.id, user.id))
+      .get();
+
+    if (!userData?.otelEnabled) {
+      return c.json({
+        error: 'OTEL not enabled',
+        message: 'Run `clawd setup` to enable heatmap',
+      }, 400);
+    }
+
+    const days = parseInt(c.req.query('days') || '90', 10);
+    const { clickhouse } = await import('../db/clickhouse');
+    const heatmap = await clickhouse.getActivityHeatmap(user.id, days);
+
+    // Transform to a matrix format for easier frontend rendering
+    // Initialize 7x24 matrix (days x hours)
+    const matrix: number[][] = Array(7).fill(null).map(() => Array(24).fill(0));
+    let maxActivity = 0;
+
+    for (const cell of heatmap) {
+      const dayIndex = cell.dayOfWeek - 1; // Convert 1-7 to 0-6
+      if (dayIndex >= 0 && dayIndex < 7 && cell.hour >= 0 && cell.hour < 24) {
+        matrix[dayIndex][cell.hour] = cell.activity;
+        maxActivity = Math.max(maxActivity, cell.activity);
+      }
+    }
+
+    // Find peak hour
+    let peakHour = 0;
+    let peakDay = 0;
+    let peakValue = 0;
+    for (let d = 0; d < 7; d++) {
+      for (let h = 0; h < 24; h++) {
+        if (matrix[d][h] > peakValue) {
+          peakValue = matrix[d][h];
+          peakHour = h;
+          peakDay = d;
+        }
+      }
+    }
+
+    const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+    return c.json({
+      matrix,
+      maxActivity,
+      peak: {
+        day: dayNames[peakDay],
+        hour: peakHour,
+        formatted: `${dayNames[peakDay]} ${peakHour}:00-${peakHour + 1}:00`,
+      },
+      days,
+      raw: heatmap,
+    });
+  } catch (error) {
+    console.error('Error fetching heatmap:', error);
+    return c.json({ error: 'Failed to fetch heatmap' }, 500);
   }
 });
 

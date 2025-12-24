@@ -11,7 +11,7 @@
  */
 
 import { db } from '../db';
-import { users } from '../db/schema';
+import { users, dailyStats } from '../db/schema';
 import { clickhouse, query } from '../db/clickhouse';
 import { computeBadges } from '../lib/badges';
 import { eq } from 'drizzle-orm';
@@ -241,6 +241,10 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         const userTotals = otelTotals || {
           total_prompts: 0,
           total_tokens: 0,
+          total_input_tokens: 0,
+          total_output_tokens: 0,
+          total_cache_read_tokens: 0,
+          total_cache_write_tokens: 0,
           total_cost_usd: 0,
           total_lines_added: 0,
           total_commits: 0,
@@ -254,10 +258,25 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
           continue;
         }
 
-        // Get daily metrics for streak calculation (OTEL data)
-        const dailyData = await clickhouse.getUserDailyMetrics(userId, 365);
-        const dates = dailyData.map((d) => d.date);
-        const otelStreaks = calculateStreaks(dates);
+        // ═══════════════════════════════════════════════════════════════════════
+        // BULLETPROOF STREAK CALCULATION
+        // Merge dates from BOTH sources to get accurate streaks across transition
+        // ═══════════════════════════════════════════════════════════════════════
+
+        // Get dates from ClickHouse (OTEL data, post-enable)
+        const otelDailyData = await clickhouse.getUserDailyMetrics(userId, 365);
+        const otelDates = otelDailyData.map((d) => d.date);
+
+        // Get dates from SQLite dailyStats (legacy data, pre-enable)
+        const legacyDailyActivity = await db
+          .select({ date: dailyStats.date })
+          .from(dailyStats)
+          .where(eq(dailyStats.userId, userId));
+        const legacyDates = legacyDailyActivity.map((d) => d.date);
+
+        // Merge all dates (deduplicated) for accurate streak calculation
+        const allDates = [...new Set([...legacyDates, ...otelDates])];
+        const mergedStreaks = calculateStreaks(allDates);
 
         // Get hourly counts from OTEL
         const otelHourCounts = await getUserHourlyCounts(userId);
@@ -265,6 +284,9 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
 
         // Get longest session messages from OTEL
         const otelLongestSession = await getLongestSessionMessages(userId);
+
+        // Get total tool calls from OTEL
+        const otelToolCalls = await clickhouse.getUserTotalToolCalls(userId);
 
         // ═══════════════════════════════════════════════════════════════════════
         // CRITICAL: Preserve CLI-synced data when OTEL has no data
@@ -287,16 +309,17 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
           finalHourCounts[hour] = (finalHourCounts[hour] || 0) + count;
         }
 
-        // Streaks: Use max of OTEL vs existing (don't lose CLI-synced data)
-        // OTEL streaks start fresh, so existing may be higher until enough OTEL data accumulates
-        const finalCurrentStreak = Math.max(otelStreaks.currentStreak, existingCurrentStreak);
-        const finalLongestStreak = Math.max(otelStreaks.longestStreak, existingLongestStreak);
+        // Streaks: Use merged calculation (combines legacy + OTEL dates)
+        // currentStreak: Use merged value directly (it's authoritative)
+        // longestStreak: Use max with existing (in case user has >365 day history we can't see)
+        const finalCurrentStreak = mergedStreaks.currentStreak;
+        const finalLongestStreak = Math.max(mergedStreaks.longestStreak, existingLongestStreak ?? 0);
 
         // Longest session: Use max of OTEL vs existing
-        const finalLongestSession = Math.max(otelLongestSession, currentLongestSession);
+        const finalLongestSession = Math.max(otelLongestSession, currentLongestSession ?? 0);
 
-        // First session date: Prefer existing (CLI sync has complete history)
-        const finalFirstSessionDate = currentFirstSessionDate || (dates.length > 0 ? dates.sort()[0] : undefined);
+        // First session date: Prefer existing, fall back to earliest from merged dates
+        const finalFirstSessionDate = currentFirstSessionDate || (allDates.length > 0 ? [...allDates].sort()[0] : undefined);
 
         // Get user rank from pre-calculated lookup
         const userRank = rankLookup.get(userId) ?? allUsers.length;
@@ -311,17 +334,19 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
       const combinedLines = Math.round(userTotals.total_lines_added) + (legacyLines ?? 0);
       const combinedCommits = Math.round(userTotals.total_commits) + (legacyCommits ?? 0);
 
-      // Token breakdown (legacy for now, OTEL breakdown TBD)
-      // These are needed for the TokenOrbit visualization
-      const combinedInputTokens = legacyInputTokens ?? 0;
-      const combinedOutputTokens = legacyOutputTokens ?? 0;
-      const combinedCacheReadTokens = legacyCacheReadTokens ?? 0;
-      const combinedCacheCreationTokens = legacyCacheCreationTokens ?? 0;
+      // Token breakdown: OTEL + legacy (for TokenOrbit visualization)
+      const combinedInputTokens = Math.round(userTotals.total_input_tokens || 0) + (legacyInputTokens ?? 0);
+      const combinedOutputTokens = Math.round(userTotals.total_output_tokens || 0) + (legacyOutputTokens ?? 0);
+      const combinedCacheReadTokens = Math.round(userTotals.total_cache_read_tokens || 0) + (legacyCacheReadTokens ?? 0);
+      const combinedCacheCreationTokens = Math.round(userTotals.total_cache_write_tokens || 0) + (legacyCacheCreationTokens ?? 0);
+
+      // Combined tool calls: OTEL + legacy
+      const combinedToolCalls = otelToolCalls + (legacyToolCalls ?? 0);
 
       // Compute badges with COMBINED totals and PRESERVED metadata
       const badges = computeBadges({
         totalMessages: combinedPrompts,
-        totalToolCalls: legacyToolCalls ?? 0, // Legacy tool calls + OTEL (when we aggregate tool_result events)
+        totalToolCalls: combinedToolCalls,
         currentStreak: finalCurrentStreak,
         longestStreak: finalLongestStreak,
         longestSessionMessages: finalLongestSession,
