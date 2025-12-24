@@ -57,9 +57,20 @@ interface OtelContext {
 }
 
 async function requireOtelAuth(c: any, next: () => Promise<void>): Promise<Response | void> {
-  const authHeader = c.req.header('Authorization');
+  let authHeader = c.req.header('Authorization');
+
+  // OTEL exporter sends the header value as-is from env var, which may be URL-encoded
+  // Decode it if it looks encoded (starts with "Bearer%20" instead of "Bearer ")
+  if (authHeader && authHeader.startsWith('Bearer%20')) {
+    try {
+      authHeader = decodeURIComponent(authHeader);
+    } catch {
+      // If decode fails, use as-is
+    }
+  }
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    console.log('[OTel Auth] Missing or invalid header format:', authHeader?.slice(0, 30));
     return c.json({ error: 'Missing or invalid Authorization header' }, 401);
   }
 
@@ -112,7 +123,10 @@ function getAttr(attrs: OtlpAttribute[], key: string): string | number | boolean
 function parseTimestamp(timeUnixNano: string | number): string {
   const nanos = typeof timeUnixNano === 'string' ? BigInt(timeUnixNano) : BigInt(timeUnixNano);
   const millis = Number(nanos / BigInt(1_000_000));
-  return new Date(millis).toISOString();
+  // ClickHouse DateTime64 expects format without 'Z' suffix: "YYYY-MM-DD HH:MM:SS.sss"
+  const d = new Date(millis);
+  const pad = (n: number, len = 2) => String(n).padStart(len, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}.${pad(d.getUTCMilliseconds(), 3)}`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
