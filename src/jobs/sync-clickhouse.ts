@@ -172,9 +172,25 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
     let synced = 0;
     let errors = 0;
 
-    // Get all OTel-enabled users
+    // Get all OTel-enabled users WITH their legacy totals AND current CLI-synced values
     const otelUsers = await db
-      .select({ id: users.id, createdAt: users.createdAt })
+      .select({
+        id: users.id,
+        createdAt: users.createdAt,
+        // Legacy snapshot (frozen at OTEL enable time)
+        legacyPrompts: users.legacyTotalPrompts,
+        legacyTokens: users.legacyTotalTokens,
+        legacyCostCents: users.legacyTotalCostUsdCents,
+        legacyLines: users.legacyTotalLinesAdded,
+        legacyCommits: users.legacyTotalCommits,
+        legacyToolCalls: users.legacyTotalToolCalls,
+        // Current values (may have been set by CLI sync - preserve if OTEL has no data)
+        currentHourCounts: users.hourCounts,
+        currentLongestSession: users.longestSessionMessages,
+        currentStreak: users.currentStreak,
+        currentLongestStreak: users.longestStreak,
+        currentFirstSessionDate: users.firstSessionDate,
+      })
       .from(users)
       .where(eq(users.otelEnabled, true));
 
@@ -188,67 +204,136 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
     const rankLookup = new Map(allUsers.map((u, idx) => [u.id, idx + 1]));
 
     // Process users in batches to avoid overwhelming ClickHouse
-    for (const { id: userId, createdAt } of otelUsers) {
+    for (const user of otelUsers) {
+      const {
+        id: userId,
+        legacyPrompts = 0,
+        legacyTokens = 0,
+        legacyCostCents = 0,
+        legacyLines = 0,
+        legacyCommits = 0,
+        legacyToolCalls = 0,
+        // Current values from CLI sync (preserve if OTEL has no data)
+        currentHourCounts,
+        currentLongestSession = 0,
+        currentStreak: existingCurrentStreak = 0,
+        currentLongestStreak: existingLongestStreak = 0,
+        currentFirstSessionDate,
+      } = user;
+
       try {
-        // Get totals from ClickHouse
+        // Get totals from ClickHouse (OTEL data only)
         const totals = await clickhouse.getUserTotals(userId);
-        const userTotals = totals[0];
-        if (!userTotals) {
+        const otelTotals = totals[0];
+
+        // Even if no OTEL data yet, we still have legacy data to show
+        const hasOtelData = !!otelTotals;
+        const userTotals = otelTotals || {
+          total_prompts: 0,
+          total_tokens: 0,
+          total_cost_usd: 0,
+          total_lines_added: 0,
+          total_commits: 0,
+          total_prs: 0,
+          total_active_seconds: 0,
+          avg_prompt_length: 0,
+        };
+
+        if (!hasOtelData && legacyPrompts === 0) {
           console.log(`[sync] No data yet for user ${userId}`);
           continue;
         }
 
-        // Get daily metrics for streak calculation
+        // Get daily metrics for streak calculation (OTEL data)
         const dailyData = await clickhouse.getUserDailyMetrics(userId, 365);
         const dates = dailyData.map((d) => d.date);
-        const { currentStreak, longestStreak } = calculateStreaks(dates);
+        const otelStreaks = calculateStreaks(dates);
 
-        // Get hourly counts for badges
-        const hourCounts = await getUserHourlyCounts(userId);
+        // Get hourly counts from OTEL
+        const otelHourCounts = await getUserHourlyCounts(userId);
+        const hasOtelHourCounts = Object.keys(otelHourCounts).length > 0;
 
-        // Get longest session messages
-        const longestSessionMessages = await getLongestSessionMessages(userId);
+        // Get longest session messages from OTEL
+        const otelLongestSession = await getLongestSessionMessages(userId);
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // CRITICAL: Preserve CLI-synced data when OTEL has no data
+        // This ensures data integrity during the transition period
+        // ═══════════════════════════════════════════════════════════════════════
+
+        // Parse existing hourCounts from SQLite (set by CLI sync)
+        let existingHourCounts: Record<string, number> = {};
+        try {
+          existingHourCounts = currentHourCounts ? JSON.parse(currentHourCounts) : {};
+        } catch {
+          existingHourCounts = {};
+        }
+        const hasExistingHourCounts = Object.keys(existingHourCounts).length > 0;
+
+        // Merge hourCounts: Use OTEL if available, otherwise preserve CLI-synced
+        // When both exist, we could merge them, but for now prefer OTEL (newer data)
+        const finalHourCounts = hasOtelHourCounts ? otelHourCounts : existingHourCounts;
+
+        // Streaks: Use max of OTEL vs existing (don't lose CLI-synced data)
+        // OTEL streaks start fresh, so existing may be higher until enough OTEL data accumulates
+        const finalCurrentStreak = Math.max(otelStreaks.currentStreak, existingCurrentStreak);
+        const finalLongestStreak = Math.max(otelStreaks.longestStreak, existingLongestStreak);
+
+        // Longest session: Use max of OTEL vs existing
+        const finalLongestSession = Math.max(otelLongestSession, currentLongestSession);
+
+        // First session date: Prefer existing (CLI sync has complete history)
+        const finalFirstSessionDate = currentFirstSessionDate || (dates.length > 0 ? dates.sort()[0] : undefined);
 
         // Get user rank from pre-calculated lookup
         const userRank = rankLookup.get(userId) ?? allUsers.length;
 
-      // Compute badges
+      // ═══════════════════════════════════════════════════════════════════════
+      // CRITICAL: Combine OTEL totals with legacy snapshot
+      // This preserves complete user history across the transition
+      // ═══════════════════════════════════════════════════════════════════════
+      const combinedPrompts = Math.round(userTotals.total_prompts) + (legacyPrompts ?? 0);
+      const combinedTokens = Math.round(userTotals.total_tokens) + (legacyTokens ?? 0);
+      const combinedCostCents = Math.round(userTotals.total_cost_usd * 100) + (legacyCostCents ?? 0);
+      const combinedLines = Math.round(userTotals.total_lines_added) + (legacyLines ?? 0);
+      const combinedCommits = Math.round(userTotals.total_commits) + (legacyCommits ?? 0);
+
+      // Compute badges with COMBINED totals and PRESERVED metadata
       const badges = computeBadges({
-        totalMessages: Math.round(userTotals.total_prompts),
-        totalToolCalls: 0, // Not tracked in OTel v2 (tool_result events exist but not aggregated)
-        currentStreak,
-        longestStreak,
-        longestSessionMessages,
-        hourCounts,
+        totalMessages: combinedPrompts,
+        totalToolCalls: legacyToolCalls ?? 0, // Legacy tool calls + OTEL (when we aggregate tool_result events)
+        currentStreak: finalCurrentStreak,
+        longestStreak: finalLongestStreak,
+        longestSessionMessages: finalLongestSession,
+        hourCounts: finalHourCounts,
         userRank: userRank > 0 ? userRank : undefined,
       });
 
-      // Update SQLite with all the data
+      // Update SQLite with COMBINED totals and PRESERVED metadata
       await db
         .update(users)
         .set({
-          // Core totals from ClickHouse
-          totalPrompts: Math.round(userTotals.total_prompts),
-          totalTokens: Math.round(userTotals.total_tokens),
-          totalCostUsd: Math.round(userTotals.total_cost_usd * 100), // Convert to cents!
-          totalLinesAdded: Math.round(userTotals.total_lines_added),
-          totalCommits: Math.round(userTotals.total_commits),
-          totalPrs: Math.round(userTotals.total_prs),
-          totalActiveSeconds: Math.round(userTotals.total_active_seconds),
-          avgPromptLength: Math.round(userTotals.avg_prompt_length),
+          // COMBINED totals (OTEL from ClickHouse + legacy snapshot)
+          totalPrompts: combinedPrompts,
+          totalTokens: combinedTokens,
+          totalCostUsd: combinedCostCents,
+          totalLinesAdded: combinedLines,
+          totalCommits: combinedCommits,
+          totalPrs: Math.round(userTotals.total_prs), // No legacy PRs tracked
+          totalActiveSeconds: Math.round(userTotals.total_active_seconds), // OTEL only
+          avgPromptLength: Math.round(userTotals.avg_prompt_length), // OTEL only
 
-          // Streak data
-          currentStreak,
-          longestStreak,
+          // Streak data (max of OTEL vs CLI-synced)
+          currentStreak: finalCurrentStreak,
+          longestStreak: finalLongestStreak,
 
-          // Badge-related
-          longestSessionMessages,
-          hourCounts: JSON.stringify(hourCounts),
+          // Badge-related (preserve CLI-synced if OTEL has no data)
+          longestSessionMessages: finalLongestSession,
+          hourCounts: JSON.stringify(finalHourCounts),
           badges: JSON.stringify(badges),
 
-          // Set first session date if not set
-          firstSessionDate:
-            dates.length > 0 ? dates.sort()[0] : undefined,
+          // First session date (prefer CLI-synced)
+          firstSessionDate: finalFirstSessionDate,
 
           // Update timestamp
           updatedAt: new Date(),
@@ -256,8 +341,10 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         .where(eq(users.id, userId));
 
         synced++;
+        const otelPrompts = Math.round(userTotals.total_prompts);
+        const otelCost = userTotals.total_cost_usd;
         console.log(
-          `[sync] Updated user ${userId}: ${userTotals.total_prompts} prompts, ${userTotals.total_tokens} tokens, $${(userTotals.total_cost_usd).toFixed(2)}`
+          `[sync] Updated user ${userId}: ${combinedPrompts} prompts (${otelPrompts} OTEL + ${legacyPrompts} legacy), $${(combinedCostCents / 100).toFixed(2)} total`
         );
       } catch (error) {
         errors++;
