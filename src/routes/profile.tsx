@@ -259,6 +259,9 @@ const Profile: FC<ProfileProps> = ({
   const memberSince = profile.firstSessionDate
     ? new Date(profile.firstSessionDate).toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
     : null;
+  const totalDaysSinceStart = profile.firstSessionDate
+    ? Math.floor((Date.now() - new Date(profile.firstSessionDate).getTime()) / (1000 * 60 * 60 * 24)) + 1
+    : null;
 
   // Calculate percentile
   const percentile = profile.totalUsers > 0
@@ -496,6 +499,9 @@ clawd.gg/u/${profile.username}`;
               <div class="text-center">
                 <div class="text-2xl font-bold text-gray-300 font-mono">
                   {contributions.filter(d => d.count > 0).length}
+                  {totalDaysSinceStart && (
+                    <span class="text-gray-600 text-lg">/{totalDaysSinceStart}</span>
+                  )}
                 </div>
                 <div class="text-gray-600 text-xs font-mono">active days</div>
               </div>
