@@ -1431,7 +1431,9 @@ async function cmdSetup(): Promise<void> {
   settings.env.OTEL_LOGS_EXPORTER = "otlp";
   settings.env.OTEL_EXPORTER_OTLP_PROTOCOL = "http/json";
   settings.env.OTEL_EXPORTER_OTLP_ENDPOINT = `${API_BASE_URL}/otel`;
-  settings.env.OTEL_EXPORTER_OTLP_HEADERS = `Authorization=Bearer ${config.token}`;
+  // URL-encode the token value per OTEL spec (values with special chars must be encoded)
+  const encodedToken = encodeURIComponent(`Bearer ${config.token}`);
+  settings.env.OTEL_EXPORTER_OTLP_HEADERS = `Authorization=${encodedToken}`;
 
   // 5. Write back
   await mkdir(join(homedir(), ".claude"), { recursive: true });
@@ -1516,28 +1518,233 @@ async function cmdUnsetup(): Promise<void> {
   console.log();
 }
 
+// ============= GG COMMAND (ALL-IN-ONE ONBOARDING) =============
+
+async function cmdGG(): Promise<void> {
+  console.log(`
+${colors.bright}${colors.cyan}clawd.gg${colors.reset} ${colors.dim}— let's go!${colors.reset}
+`);
+
+  const stepStyle = (n: number, label: string) =>
+    `${colors.dim}[${n}/3]${colors.reset} ${colors.bright}${label}${colors.reset}`;
+
+  // ═══════════════════════════════════════════════════════════════
+  // STEP 1: Authentication
+  // ═══════════════════════════════════════════════════════════════
+  console.log(stepStyle(1, "Authentication"));
+
+  let config = await loadConfig();
+
+  if (config.token) {
+    // Verify token is still valid
+    const profile = await fetchProfile(config.token);
+    if (profile) {
+      console.log(`      ${colors.green}✓${colors.reset} Logged in as ${colors.cyan}@${config.username}${colors.reset}`);
+    } else {
+      console.log(`      ${colors.yellow}⚠${colors.reset} Token expired, re-authenticating...`);
+      config.token = undefined;
+    }
+  }
+
+  if (!config.token) {
+    console.log(`      Opening browser for GitHub login...`);
+    try {
+      await initiateLogin();
+      config = await loadConfig(); // Reload after login
+      if (!config.token) {
+        log.error("Login failed. Please try again.");
+        process.exit(1);
+      }
+      console.log(`      ${colors.green}✓${colors.reset} Logged in as ${colors.cyan}@${config.username}${colors.reset}`);
+    } catch (error) {
+      log.error(`Login failed: ${error}`);
+      process.exit(1);
+    }
+  }
+  console.log();
+
+  // ═══════════════════════════════════════════════════════════════
+  // STEP 2: Import History
+  // ═══════════════════════════════════════════════════════════════
+  console.log(stepStyle(2, "Importing History"));
+
+  try {
+    // Find and parse session files
+    const files = await findSessionFiles();
+    if (files.length === 0) {
+      console.log(`      ${colors.dim}No session files found yet. Use Claude Code first!${colors.reset}`);
+    } else {
+      console.log(`      Parsing ${files.length} session files...`);
+      const rawStats = await parseAllSessionFiles(files);
+
+      // Calculate totals for display
+      const totalPrompts = Object.values(rawStats.dailyStats).reduce((sum, d) => sum + d.promptCount, 0);
+      const totalCostCents = Object.values(rawStats.dailyStats).reduce((sum, d) => sum + d.costUsdCents, 0);
+      const totalCost = (totalCostCents / 100).toFixed(0);
+
+      const today = getTodayDate();
+
+      // Convert parsed stats to daily activity format
+      const allDays = Object.entries(rawStats.dailyStats).map(([date, stats]) => ({
+        date,
+        promptCount: stats.promptCount,
+        messageCount: stats.messageCount,
+        toolCallCount: stats.toolCallCount,
+        inputTokens: stats.inputTokens,
+        outputTokens: stats.outputTokens,
+        cacheReadTokens: stats.cacheReadTokens,
+        cacheCreationTokens: stats.cacheCreationTokens,
+        costUsdCents: stats.costUsdCents,
+        linesWritten: stats.linesWritten,
+        commitCount: stats.commitCount,
+        sessionCount: 1,
+      }));
+
+      // Filter out today (incomplete) and already-synced days
+      const activityToSync = allDays.filter(day => {
+        if (day.date === today) return false;
+        if (config.lastSyncDate && day.date <= config.lastSyncDate) return false;
+        return true;
+      });
+
+      if (activityToSync.length > 0) {
+        // Prepare badge data
+        const officialStats = await loadStats();
+        const badgeData: BadgeData = {
+          hourCounts: officialStats?.hourCounts || rawStats.hourCounts,
+          longestSessionMessages: rawStats.longestSessionMessages,
+        };
+
+        // Calculate official streaks
+        let officialStreakData: OfficialStreakData = {};
+        if (officialStats?.dailyActivity) {
+          const officialDates = officialStats.dailyActivity
+            .map(d => d.date)
+            .filter((date, i, arr) => arr.indexOf(date) === i)
+            .sort();
+          const { currentStreak, longestStreak } = calculateStreaksFromDates(officialDates);
+          officialStreakData = {
+            officialCurrentStreak: currentStreak,
+            officialLongestStreak: longestStreak,
+            officialActiveDays: officialDates.length,
+          };
+        }
+
+        // Build token data per day
+        const datesToSync = new Set(activityToSync.map(d => d.date));
+        const tokensToSync: DailyModelTokens[] = Object.entries(rawStats.dailyStats)
+          .filter(([date]) => datesToSync.has(date))
+          .map(([date, stats]) => ({
+            date,
+            tokensByModel: { 'raw-parsed': stats.inputTokens + stats.outputTokens },
+          }));
+
+        await syncStats(activityToSync, tokensToSync, rawStats.firstSessionDate, badgeData, officialStreakData, config.token!);
+        config = await loadConfig(); // Reload to get updated lastSyncDate
+      }
+
+      console.log(`      ${colors.green}✓${colors.reset} Synced ${colors.bright}${totalPrompts.toLocaleString()}${colors.reset} prompts ${colors.dim}($${totalCost} invested)${colors.reset}`);
+    }
+  } catch (error) {
+    log.error(`Sync failed: ${error}`);
+    process.exit(1);
+  }
+  console.log();
+
+  // ═══════════════════════════════════════════════════════════════
+  // STEP 3: Enable Real-Time Streaming
+  // ═══════════════════════════════════════════════════════════════
+  console.log(stepStyle(3, "Enabling Real-Time Streaming"));
+
+  try {
+    // Load existing Claude settings
+    let settings: Record<string, any> = {};
+    try {
+      if (existsSync(CLAUDE_SETTINGS_PATH)) {
+        const data = await readFile(CLAUDE_SETTINGS_PATH, "utf-8");
+        settings = JSON.parse(data);
+      }
+    } catch {
+      // Will create new file
+    }
+
+    // Check if already set up
+    const alreadySetup = settings.env?.OTEL_EXPORTER_OTLP_ENDPOINT?.includes('clawd');
+
+    if (alreadySetup) {
+      console.log(`      ${colors.green}✓${colors.reset} OTEL streaming already configured`);
+    } else {
+      // Configure OTEL
+      settings.env = settings.env || {};
+      settings.env.CLAUDE_CODE_ENABLE_TELEMETRY = "1";
+      settings.env.OTEL_METRICS_EXPORTER = "otlp";
+      settings.env.OTEL_LOGS_EXPORTER = "otlp";
+      settings.env.OTEL_EXPORTER_OTLP_PROTOCOL = "http/json";
+      settings.env.OTEL_EXPORTER_OTLP_ENDPOINT = `${API_BASE_URL}/otel`;
+      const encodedToken = encodeURIComponent(`Bearer ${config.token}`);
+      settings.env.OTEL_EXPORTER_OTLP_HEADERS = `Authorization=${encodedToken}`;
+
+      await mkdir(join(homedir(), ".claude"), { recursive: true });
+      await writeFile(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2));
+
+      // Notify server
+      try {
+        await fetch(`${API_BASE_URL}/api/otel/enable`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${config.token}` },
+        });
+      } catch {
+        // Non-critical
+      }
+
+      console.log(`      ${colors.green}✓${colors.reset} OTEL streaming configured`);
+    }
+  } catch (error) {
+    log.error(`Setup failed: ${error}`);
+    process.exit(1);
+  }
+  console.log();
+
+  // ═══════════════════════════════════════════════════════════════
+  // SUCCESS!
+  // ═══════════════════════════════════════════════════════════════
+  const line = "═".repeat(50);
+  console.log(`${colors.dim}${line}${colors.reset}`);
+  console.log();
+  console.log(`  ${colors.green}✓${colors.reset} ${colors.bright}All set!${colors.reset} One final step:`);
+  console.log();
+  console.log(`  ${colors.yellow}${colors.bright}⚠  RESTART CLAUDE CODE${colors.reset}${colors.yellow} to activate streaming${colors.reset}`);
+  console.log();
+  console.log(`  Then visit: ${colors.cyan}${colors.bright}clawd.gg/u/${config.username}${colors.reset}`);
+  console.log();
+  console.log(`${colors.dim}${line}${colors.reset}`);
+  console.log();
+}
+
 function showHelp(): void {
   console.log(`
-${colors.bright}${colors.cyan}clawd.gg${colors.reset} ${colors.dim}— I built this to track how much you use me${colors.reset}
+${colors.bright}${colors.cyan}clawd.gg${colors.reset} ${colors.dim}— Track your Claude Code usage${colors.reset}
+
+${colors.bright}Quick Start:${colors.reset}
+  ${colors.cyan}clawd gg${colors.reset}     ${colors.dim}One command to set everything up${colors.reset}
+               ${colors.dim}(login + sync history + enable streaming)${colors.reset}
 
 ${colors.bright}Commands:${colors.reset}
-  ${colors.green}login${colors.reset}    Link your GitHub ${colors.dim}(so I know who's flexing)${colors.reset}
-  ${colors.green}setup${colors.reset}    Enable auto-sync ${colors.dim}(stats stream automatically)${colors.reset}
-  ${colors.green}status${colors.reset}   See where you stand
-  ${colors.green}unsetup${colors.reset}  Disable auto-sync
+  ${colors.green}gg${colors.reset}       ${colors.bright}Do everything${colors.reset} — login, sync, enable streaming
+  ${colors.green}status${colors.reset}   See your stats and rank
+  ${colors.green}login${colors.reset}    Link your GitHub account
+  ${colors.green}sync${colors.reset}     Manually sync history (usually not needed)
+  ${colors.green}setup${colors.reset}    Enable OTEL streaming (usually not needed)
+  ${colors.green}disable${colors.reset}  Turn off streaming
   ${colors.green}logout${colors.reset}   Unlink your account
 
-${colors.dim}Legacy (still works):${colors.reset}
-  ${colors.dim}sync${colors.reset}     Manual upload ${colors.dim}(use 'setup' instead)${colors.reset}
-  ${colors.dim}gg${colors.reset}       Sync + status
+${colors.bright}Usage:${colors.reset}
+  ${colors.dim}$ npx clawdgg gg${colors.reset}        ${colors.dim}# First time? This is all you need${colors.reset}
+  ${colors.dim}$ npx clawdgg status${colors.reset}    ${colors.dim}# Check your rank anytime${colors.reset}
 
-${colors.bright}Quick start:${colors.reset}
-  ${colors.dim}$ clawd login   # authenticate once${colors.reset}
-  ${colors.dim}$ clawd setup   # enable auto-sync${colors.reset}
-  ${colors.dim}$ ${colors.cyan}# restart Claude Code - done! stats stream automatically${colors.reset}
+${colors.dim}After 'gg', restart Claude Code to activate streaming.${colors.reset}
+${colors.dim}Your stats will then update automatically in real-time.${colors.reset}
 
-${colors.dim}Stats from: ~/.claude/projects/*/*.jsonl (raw session files)${colors.reset}
-${colors.dim}Cache: ~/.config/clawd/cache.json${colors.reset}
 ${colors.dim}Leaderboard: https://clawd.gg${colors.reset}
 `);
 }
@@ -1550,9 +1757,7 @@ async function main() {
 
   switch (command) {
     case "gg":
-      // The ultimate flex: sync + status
-      await cmdSync(hasForceFlag);
-      await cmdStatus();
+      await cmdGG();
       break;
     case "sync":
       await cmdSync(hasForceFlag);
@@ -1576,13 +1781,14 @@ async function main() {
     case "setup":
       await cmdSetup();
       break;
+    case "disable":
     case "unsetup":
       await cmdUnsetup();
       break;
     case "version":
     case "--version":
     case "-v":
-      console.log("clawd v0.1.0");
+      console.log("clawd v1.0.0");
       break;
     case "help":
     case "--help":
