@@ -145,6 +145,7 @@ export interface DailyMetrics {
   prs: number;
   sessions: number;
   active_seconds: number;
+  prompts: number; // From prompt_stats_daily for contribution graph
 }
 
 export interface UserTotals {
@@ -233,6 +234,7 @@ export async function getUserTotals(userId?: string): Promise<UserTotals[]> {
 
 /**
  * Get daily metrics for a user (for contribution graph)
+ * Joins with prompt_stats_daily to get accurate prompt counts
  */
 export async function getUserDailyMetrics(userId: string, days: number = 365): Promise<DailyMetrics[]> {
   const sql = `
@@ -249,8 +251,10 @@ export async function getUserDailyMetrics(userId: string, days: number = 365): P
       md.commits,
       md.prs,
       md.sessions,
-      md.active_seconds
+      md.active_seconds,
+      COALESCE(ps.prompt_count, 0) as prompts
     FROM metrics_daily md
+    LEFT JOIN prompt_stats_daily ps ON md.user_id = ps.user_id AND md.date = ps.date
     WHERE md.user_id = {userId:String}
       AND md.date >= today() - {days:UInt32}
     ORDER BY md.date

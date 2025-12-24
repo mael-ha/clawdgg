@@ -760,12 +760,13 @@ app.get('/:username', async (c) => {
   if (isOtelUser) {
     const otelDaily = await clickhouse.getUserDailyMetrics(userData.id, 365);
     for (const day of otelDaily) {
-      // Use sessions as proxy for activity (or could use input_tokens, etc.)
-      // Since we don't have prompt_count in metrics_daily, use sessions
-      const otelCount = day.sessions || 1; // At least 1 if there's any data
-      const existing = activityMap.get(day.date) || 0;
-      // For overlapping dates (rare, only on OTEL enable day), take max
-      activityMap.set(day.date, Math.max(existing, otelCount));
+      // Use actual prompt count from prompt_stats_daily (joined in query)
+      const otelCount = day.prompts || 0;
+      if (otelCount > 0) {
+        const existing = activityMap.get(day.date) || 0;
+        // For overlapping dates (rare, only on OTEL enable day), take max
+        activityMap.set(day.date, Math.max(existing, otelCount));
+      }
     }
   }
 
