@@ -43,6 +43,22 @@ export const users = sqliteTable('users', {
   // OTel status
   otelEnabled: integer('otel_enabled', { mode: 'boolean' }).default(false),
   otelSetupAt: integer('otel_setup_at', { mode: 'timestamp' }), // When user ran `clawd setup`
+  otelSetupDate: text('otel_setup_date'), // YYYY-MM-DD for easy date comparison in queries
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Legacy Snapshot: Historical data frozen at OTEL enable time
+  // These are added to OTEL totals to preserve complete history
+  // ═══════════════════════════════════════════════════════════════════════
+  legacyTotalPrompts: integer('legacy_total_prompts').default(0),
+  legacyTotalTokens: integer('legacy_total_tokens').default(0),
+  legacyTotalInputTokens: integer('legacy_total_input_tokens').default(0),
+  legacyTotalOutputTokens: integer('legacy_total_output_tokens').default(0),
+  legacyTotalCacheReadTokens: integer('legacy_total_cache_read_tokens').default(0),
+  legacyTotalCacheCreationTokens: integer('legacy_total_cache_creation_tokens').default(0),
+  legacyTotalCostUsdCents: integer('legacy_total_cost_usd_cents').default(0),
+  legacyTotalLinesAdded: integer('legacy_total_lines_added').default(0),
+  legacyTotalCommits: integer('legacy_total_commits').default(0),
+  legacyTotalToolCalls: integer('legacy_total_tool_calls').default(0),
 
   // Token management (extended to 1 year for OTel)
   tokenExpiresAt: integer('token_expires_at', { mode: 'timestamp' }),

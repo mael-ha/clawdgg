@@ -1,6 +1,25 @@
 /**
  * ClickHouse client for clawd.gg
  * Handles all OTel metrics and events storage/retrieval
+ *
+ * ARCHITECTURE:
+ * - Raw tables use ReplacingMergeTree for deduplication
+ * - All queries use FINAL to get deduplicated results
+ * - No materialized views - aggregation happens at query time
+ *
+ * OTEL NAMING CONVENTION (from Claude Code):
+ * Events:
+ *   - claude_code.api_request (prompts/LLM calls)
+ *   - claude_code.tool_result
+ *   - claude_code.tool_decision
+ * Metrics:
+ *   - claude_code.token.usage (with token_type: input/output/cacheRead/cacheCreation)
+ *   - claude_code.cost.usage
+ *   - claude_code.active_time.total
+ *   - claude_code.lines_of_code.count (with line_type: added/removed)
+ *   - claude_code.commit.count
+ *   - claude_code.pull_request.count
+ *   - claude_code.session.count
  */
 
 const CLICKHOUSE_URL = process.env.CLICKHOUSE_URL || 'http://localhost:8123';
@@ -145,7 +164,7 @@ export interface DailyMetrics {
   prs: number;
   sessions: number;
   active_seconds: number;
-  prompts: number; // From prompt_stats_daily for contribution graph
+  prompts: number;
 }
 
 export interface UserTotals {
@@ -197,36 +216,61 @@ export async function insertEvents(events: EventRow[]): Promise<void> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Query Functions
+// Query Functions (all use FINAL for deduplication)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
  * Get user totals for leaderboard sync
- * Includes token breakdown for TokenOrbit visualization
+ * Queries raw tables with FINAL for deduplication
+ *
+ * NOTE: api_request events represent prompts/LLM calls
  */
 export async function getUserTotals(userId?: string): Promise<UserTotals[]> {
-  const whereClause = userId ? `WHERE md.user_id = {userId:String}` : '';
+  const whereClause = userId ? `WHERE user_id = {userId:String}` : '';
 
   const sql = `
+    WITH
+      event_stats AS (
+        SELECT
+          user_id,
+          countIf(event_name = 'claude_code.api_request') as total_prompts,
+          sumIf(prompt_length, event_name = 'claude_code.api_request') as total_prompt_chars
+        FROM events_raw FINAL
+        ${whereClause}
+        GROUP BY user_id
+      ),
+      metric_stats AS (
+        SELECT
+          user_id,
+          sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'input') as total_input_tokens,
+          sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'output') as total_output_tokens,
+          sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheRead') as total_cache_read_tokens,
+          sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheCreation') as total_cache_write_tokens,
+          sumIf(value, metric_name = 'claude_code.cost.usage') as total_cost_usd,
+          sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added') as total_lines_added,
+          sumIf(value, metric_name = 'claude_code.commit.count') as total_commits,
+          sumIf(value, metric_name = 'claude_code.pull_request.count') as total_prs,
+          sumIf(value, metric_name = 'claude_code.active_time.total') as total_active_seconds
+        FROM metrics_raw FINAL
+        ${whereClause}
+        GROUP BY user_id
+      )
     SELECT
-      md.user_id,
-      SUM(ps.prompt_count) as total_prompts,
-      SUM(md.input_tokens + md.output_tokens) as total_tokens,
-      -- Token breakdown for TokenOrbit
-      SUM(md.input_tokens) as total_input_tokens,
-      SUM(md.output_tokens) as total_output_tokens,
-      SUM(md.cache_read_tokens) as total_cache_read_tokens,
-      SUM(md.cache_write_tokens) as total_cache_write_tokens,
-      SUM(md.cost_usd) as total_cost_usd,
-      SUM(md.lines_added) as total_lines_added,
-      SUM(md.commits) as total_commits,
-      SUM(md.prs) as total_prs,
-      SUM(md.active_seconds) as total_active_seconds,
-      if(SUM(ps.prompt_count) > 0, SUM(ps.total_prompt_chars) / SUM(ps.prompt_count), 0) as avg_prompt_length
-    FROM metrics_daily md
-    LEFT JOIN prompt_stats_daily ps ON md.user_id = ps.user_id AND md.date = ps.date
-    ${whereClause}
-    GROUP BY md.user_id
+      COALESCE(e.user_id, m.user_id) as user_id,
+      COALESCE(e.total_prompts, 0) as total_prompts,
+      COALESCE(m.total_input_tokens + m.total_output_tokens, 0) as total_tokens,
+      COALESCE(m.total_input_tokens, 0) as total_input_tokens,
+      COALESCE(m.total_output_tokens, 0) as total_output_tokens,
+      COALESCE(m.total_cache_read_tokens, 0) as total_cache_read_tokens,
+      COALESCE(m.total_cache_write_tokens, 0) as total_cache_write_tokens,
+      COALESCE(m.total_cost_usd, 0) as total_cost_usd,
+      COALESCE(m.total_lines_added, 0) as total_lines_added,
+      COALESCE(m.total_commits, 0) as total_commits,
+      COALESCE(m.total_prs, 0) as total_prs,
+      COALESCE(m.total_active_seconds, 0) as total_active_seconds,
+      if(COALESCE(e.total_prompts, 0) > 0, COALESCE(e.total_prompt_chars, 0) / e.total_prompts, 0) as avg_prompt_length
+    FROM event_stats e
+    FULL OUTER JOIN metric_stats m ON e.user_id = m.user_id
   `;
 
   return query<UserTotals>(sql, userId ? { userId } : undefined);
@@ -234,30 +278,56 @@ export async function getUserTotals(userId?: string): Promise<UserTotals[]> {
 
 /**
  * Get daily metrics for a user (for contribution graph)
- * Joins with prompt_stats_daily to get accurate prompt counts
  */
 export async function getUserDailyMetrics(userId: string, days: number = 365): Promise<DailyMetrics[]> {
   const sql = `
+    WITH
+      daily_events AS (
+        SELECT
+          toDate(timestamp) as date,
+          countIf(event_name = 'claude_code.api_request') as prompts,
+          uniqExact(session_id) as sessions
+        FROM events_raw FINAL
+        WHERE user_id = {userId:String}
+          AND toDate(timestamp) >= today() - {days:UInt32}
+        GROUP BY date
+      ),
+      daily_metrics AS (
+        SELECT
+          toDate(timestamp) as date,
+          sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'input') as input_tokens,
+          sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'output') as output_tokens,
+          sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheRead') as cache_read_tokens,
+          sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheCreation') as cache_write_tokens,
+          sumIf(value, metric_name = 'claude_code.cost.usage') as cost_usd,
+          sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added') as lines_added,
+          sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'removed') as lines_removed,
+          sumIf(value, metric_name = 'claude_code.commit.count') as commits,
+          sumIf(value, metric_name = 'claude_code.pull_request.count') as prs,
+          sumIf(value, metric_name = 'claude_code.active_time.total') as active_seconds
+        FROM metrics_raw FINAL
+        WHERE user_id = {userId:String}
+          AND toDate(timestamp) >= today() - {days:UInt32}
+        GROUP BY date
+      )
     SELECT
-      md.user_id,
-      toString(md.date) as date,
-      md.input_tokens,
-      md.output_tokens,
-      md.cache_read_tokens,
-      md.cache_write_tokens,
-      md.cost_usd,
-      md.lines_added,
-      md.lines_removed,
-      md.commits,
-      md.prs,
-      md.sessions,
-      md.active_seconds,
-      COALESCE(ps.prompt_count, 0) as prompts
-    FROM metrics_daily md
-    LEFT JOIN prompt_stats_daily ps ON md.user_id = ps.user_id AND md.date = ps.date
-    WHERE md.user_id = {userId:String}
-      AND md.date >= today() - {days:UInt32}
-    ORDER BY md.date
+      {userId:String} as user_id,
+      toString(COALESCE(e.date, m.date)) as date,
+      COALESCE(m.input_tokens, 0) as input_tokens,
+      COALESCE(m.output_tokens, 0) as output_tokens,
+      COALESCE(m.cache_read_tokens, 0) as cache_read_tokens,
+      COALESCE(m.cache_write_tokens, 0) as cache_write_tokens,
+      COALESCE(m.cost_usd, 0) as cost_usd,
+      COALESCE(m.lines_added, 0) as lines_added,
+      COALESCE(m.lines_removed, 0) as lines_removed,
+      COALESCE(m.commits, 0) as commits,
+      COALESCE(m.prs, 0) as prs,
+      COALESCE(e.sessions, 0) as sessions,
+      COALESCE(m.active_seconds, 0) as active_seconds,
+      COALESCE(e.prompts, 0) as prompts
+    FROM daily_events e
+    FULL OUTER JOIN daily_metrics m ON e.date = m.date
+    ORDER BY date
   `;
 
   return query<DailyMetrics>(sql, { userId, days });
@@ -267,16 +337,17 @@ export async function getUserDailyMetrics(userId: string, days: number = 365): P
  * Get model usage breakdown for a user (Claude Diet)
  */
 export async function getUserModelUsage(userId: string, days?: number): Promise<ModelUsage[]> {
-  const dateFilter = days ? `AND date >= today() - {days:UInt32}` : '';
+  const dateFilter = days ? `AND toDate(timestamp) >= today() - ${days}` : '';
 
   const sql = `
     SELECT
       model,
-      SUM(input_tokens) as input_tokens,
-      SUM(output_tokens) as output_tokens,
-      SUM(cost_usd) as cost_usd
-    FROM model_usage_daily
+      sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'input') as input_tokens,
+      sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'output') as output_tokens,
+      sumIf(value, metric_name = 'claude_code.cost.usage') as cost_usd
+    FROM metrics_raw FINAL
     WHERE user_id = {userId:String}
+      AND model != ''
       ${dateFilter}
     GROUP BY model
     ORDER BY (input_tokens + output_tokens) DESC
@@ -291,12 +362,12 @@ export async function getUserModelUsage(userId: string, days?: number): Promise<
 export async function getUserHourlyActivity(userId: string, days: number = 90): Promise<HourlyActivity[]> {
   const sql = `
     SELECT
-      toHour(hour) as hour,
-      toDayOfWeek(hour) as day_of_week,
-      SUM(total_tokens) as activity
-    FROM metrics_hourly
+      toHour(timestamp) as hour,
+      toDayOfWeek(timestamp) as day_of_week,
+      sumIf(value, metric_name = 'claude_code.token.usage') as activity
+    FROM metrics_raw FINAL
     WHERE user_id = {userId:String}
-      AND hour >= now() - INTERVAL {days:UInt32} DAY
+      AND timestamp >= now() - INTERVAL {days:UInt32} DAY
     GROUP BY hour, day_of_week
     ORDER BY day_of_week, hour
   `;
@@ -314,9 +385,9 @@ export async function getLeaderboard(
   offset: number = 0
 ): Promise<{ entries: UserTotals[]; total: number }> {
   const dateFilter = {
-    today: 'date = today()',
-    week: 'date >= today() - 7',
-    month: 'date >= today() - 30',
+    today: 'toDate(timestamp) = today()',
+    week: 'toDate(timestamp) >= today() - 7',
+    month: 'toDate(timestamp) >= today() - 30',
     all: '1=1',
   }[period];
 
@@ -328,20 +399,48 @@ export async function getLeaderboard(
   }[sortBy];
 
   const sql = `
+    WITH
+      event_stats AS (
+        SELECT
+          user_id,
+          countIf(event_name = 'claude_code.api_request') as total_prompts,
+          sumIf(prompt_length, event_name = 'claude_code.api_request') as total_prompt_chars
+        FROM events_raw FINAL
+        WHERE ${dateFilter}
+        GROUP BY user_id
+      ),
+      metric_stats AS (
+        SELECT
+          user_id,
+          sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'input') as total_input_tokens,
+          sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'output') as total_output_tokens,
+          sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheRead') as total_cache_read_tokens,
+          sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheCreation') as total_cache_write_tokens,
+          sumIf(value, metric_name = 'claude_code.cost.usage') as total_cost_usd,
+          sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added') as total_lines_added,
+          sumIf(value, metric_name = 'claude_code.commit.count') as total_commits,
+          sumIf(value, metric_name = 'claude_code.pull_request.count') as total_prs,
+          sumIf(value, metric_name = 'claude_code.active_time.total') as total_active_seconds
+        FROM metrics_raw FINAL
+        WHERE ${dateFilter}
+        GROUP BY user_id
+      )
     SELECT
-      md.user_id,
-      SUM(ps.prompt_count) as total_prompts,
-      SUM(md.input_tokens + md.output_tokens) as total_tokens,
-      SUM(md.cost_usd) as total_cost_usd,
-      SUM(md.lines_added) as total_lines_added,
-      SUM(md.commits) as total_commits,
-      SUM(md.prs) as total_prs,
-      SUM(md.active_seconds) as total_active_seconds,
-      if(SUM(ps.prompt_count) > 0, SUM(ps.total_prompt_chars) / SUM(ps.prompt_count), 0) as avg_prompt_length
-    FROM metrics_daily md
-    LEFT JOIN prompt_stats_daily ps ON md.user_id = ps.user_id AND md.date = ps.date
-    WHERE ${dateFilter}
-    GROUP BY md.user_id
+      COALESCE(e.user_id, m.user_id) as user_id,
+      COALESCE(e.total_prompts, 0) as total_prompts,
+      COALESCE(m.total_input_tokens + m.total_output_tokens, 0) as total_tokens,
+      COALESCE(m.total_input_tokens, 0) as total_input_tokens,
+      COALESCE(m.total_output_tokens, 0) as total_output_tokens,
+      COALESCE(m.total_cache_read_tokens, 0) as total_cache_read_tokens,
+      COALESCE(m.total_cache_write_tokens, 0) as total_cache_write_tokens,
+      COALESCE(m.total_cost_usd, 0) as total_cost_usd,
+      COALESCE(m.total_lines_added, 0) as total_lines_added,
+      COALESCE(m.total_commits, 0) as total_commits,
+      COALESCE(m.total_prs, 0) as total_prs,
+      COALESCE(m.total_active_seconds, 0) as total_active_seconds,
+      if(COALESCE(e.total_prompts, 0) > 0, COALESCE(e.total_prompt_chars, 0) / e.total_prompts, 0) as avg_prompt_length
+    FROM event_stats e
+    FULL OUTER JOIN metric_stats m ON e.user_id = m.user_id
     ORDER BY ${sortColumn} DESC
     LIMIT {limit:UInt32}
     OFFSET {offset:UInt32}
@@ -352,7 +451,7 @@ export async function getLeaderboard(
   // Get total count
   const countSql = `
     SELECT count(DISTINCT user_id) as total
-    FROM metrics_daily
+    FROM events_raw FINAL
     WHERE ${dateFilter}
   `;
   const countResult = await query<{ total: number }>(countSql);
@@ -370,9 +469,9 @@ export async function getUserRank(
   sortBy: 'prompts' | 'tokens' | 'cost' | 'lines' = 'prompts'
 ): Promise<{ rank: number; total: number } | null> {
   const dateFilter = {
-    today: 'date = today()',
-    week: 'date >= today() - 7',
-    month: 'date >= today() - 30',
+    today: 'toDate(timestamp) = today()',
+    week: 'toDate(timestamp) >= today() - 7',
+    month: 'toDate(timestamp) >= today() - 30',
     all: '1=1',
   }[period];
 
@@ -384,24 +483,41 @@ export async function getUserRank(
   }[sortBy];
 
   const sql = `
-    WITH user_totals AS (
-      SELECT
-        md.user_id,
-        SUM(ps.prompt_count) as total_prompts,
-        SUM(md.input_tokens + md.output_tokens) as total_tokens,
-        SUM(md.cost_usd) as total_cost_usd,
-        SUM(md.lines_added) as total_lines_added
-      FROM metrics_daily md
-      LEFT JOIN prompt_stats_daily ps ON md.user_id = ps.user_id AND md.date = ps.date
-      WHERE ${dateFilter}
-      GROUP BY md.user_id
-    ),
-    ranked AS (
-      SELECT
-        user_id,
-        row_number() OVER (ORDER BY ${sortColumn} DESC) as rank
-      FROM user_totals
-    )
+    WITH
+      event_stats AS (
+        SELECT
+          user_id,
+          countIf(event_name = 'claude_code.api_request') as total_prompts
+        FROM events_raw FINAL
+        WHERE ${dateFilter}
+        GROUP BY user_id
+      ),
+      metric_stats AS (
+        SELECT
+          user_id,
+          sumIf(value, metric_name = 'claude_code.token.usage') as total_tokens,
+          sumIf(value, metric_name = 'claude_code.cost.usage') as total_cost_usd,
+          sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added') as total_lines_added
+        FROM metrics_raw FINAL
+        WHERE ${dateFilter}
+        GROUP BY user_id
+      ),
+      user_totals AS (
+        SELECT
+          COALESCE(e.user_id, m.user_id) as user_id,
+          COALESCE(e.total_prompts, 0) as total_prompts,
+          COALESCE(m.total_tokens, 0) as total_tokens,
+          COALESCE(m.total_cost_usd, 0) as total_cost_usd,
+          COALESCE(m.total_lines_added, 0) as total_lines_added
+        FROM event_stats e
+        FULL OUTER JOIN metric_stats m ON e.user_id = m.user_id
+      ),
+      ranked AS (
+        SELECT
+          user_id,
+          row_number() OVER (ORDER BY ${sortColumn} DESC) as rank
+        FROM user_totals
+      )
     SELECT rank, (SELECT count() FROM ranked) as total
     FROM ranked
     WHERE user_id = {userId:String}
@@ -417,7 +533,6 @@ export async function getUserRank(
 
 /**
  * Real-time today's metrics (for live dashboard)
- * Updated every ~60 seconds as OTEL data flows in
  */
 export interface TodayMetrics {
   prompts: number;
@@ -435,21 +550,43 @@ export interface TodayMetrics {
 
 export async function getUserTodayMetrics(userId: string): Promise<TodayMetrics | null> {
   const sql = `
+    WITH
+      today_events AS (
+        SELECT
+          countIf(event_name = 'claude_code.api_request') as prompts,
+          MAX(timestamp) as lastActivity
+        FROM events_raw FINAL
+        WHERE user_id = {userId:String}
+          AND toDate(timestamp) = today()
+      ),
+      today_metrics AS (
+        SELECT
+          sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'input') as inputTokens,
+          sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'output') as outputTokens,
+          sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheRead') as cacheReadTokens,
+          sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheCreation') as cacheWriteTokens,
+          sumIf(value, metric_name = 'claude_code.cost.usage') as costUsd,
+          sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added') as linesAdded,
+          sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'removed') as linesRemoved,
+          sumIf(value, metric_name = 'claude_code.commit.count') as commits,
+          sumIf(value, metric_name = 'claude_code.active_time.total') as activeSeconds
+        FROM metrics_raw FINAL
+        WHERE user_id = {userId:String}
+          AND toDate(timestamp) = today()
+      )
     SELECT
-      COALESCE(ps.prompt_count, 0) as prompts,
-      COALESCE(md.input_tokens, 0) as inputTokens,
-      COALESCE(md.output_tokens, 0) as outputTokens,
-      COALESCE(md.cache_read_tokens, 0) as cacheReadTokens,
-      COALESCE(md.cache_write_tokens, 0) as cacheWriteTokens,
-      COALESCE(md.cost_usd, 0) as costUsd,
-      COALESCE(md.lines_added, 0) as linesAdded,
-      COALESCE(md.lines_removed, 0) as linesRemoved,
-      COALESCE(md.commits, 0) as commits,
-      COALESCE(md.active_seconds, 0) as activeSeconds,
-      (SELECT MAX(timestamp) FROM events_raw WHERE user_id = {userId:String} AND toDate(timestamp) = today()) as lastActivity
-    FROM metrics_daily md
-    LEFT JOIN prompt_stats_daily ps ON md.user_id = ps.user_id AND md.date = ps.date
-    WHERE md.user_id = {userId:String} AND md.date = today()
+      COALESCE(e.prompts, 0) as prompts,
+      COALESCE(m.inputTokens, 0) as inputTokens,
+      COALESCE(m.outputTokens, 0) as outputTokens,
+      COALESCE(m.cacheReadTokens, 0) as cacheReadTokens,
+      COALESCE(m.cacheWriteTokens, 0) as cacheWriteTokens,
+      COALESCE(m.costUsd, 0) as costUsd,
+      COALESCE(m.linesAdded, 0) as linesAdded,
+      COALESCE(m.linesRemoved, 0) as linesRemoved,
+      COALESCE(m.commits, 0) as commits,
+      COALESCE(m.activeSeconds, 0) as activeSeconds,
+      e.lastActivity
+    FROM today_events e, today_metrics m
   `;
 
   const result = await query<TodayMetrics>(sql, { userId });
@@ -462,26 +599,26 @@ export async function getUserTodayMetrics(userId: string): Promise<TodayMetrics 
 export interface CacheStats {
   totalCacheReadTokens: number;
   totalInputTokens: number;
-  cacheHitRate: number; // Percentage of reads that were cached
-  estimatedSavingsUsd: number; // Money saved by caching
+  cacheHitRate: number;
+  estimatedSavingsUsd: number;
 }
 
 export async function getUserCacheStats(userId: string, days?: number): Promise<CacheStats | null> {
-  const dateFilter = days ? `AND md.date >= today() - ${days}` : '';
+  const dateFilter = days ? `AND toDate(timestamp) >= today() - ${days}` : '';
 
   const sql = `
     SELECT
-      SUM(md.cache_read_tokens) as totalCacheReadTokens,
-      SUM(md.input_tokens) as totalInputTokens,
-      -- Cache hit rate: what % of total context was cached
-      if(SUM(md.input_tokens + md.cache_read_tokens) > 0,
-        SUM(md.cache_read_tokens) * 100.0 / SUM(md.input_tokens + md.cache_read_tokens),
-        0) as cacheHitRate,
-      -- Savings: cache_read at 0.1x vs 1.0x (we save 0.9x)
-      -- Using average input price of $4/MTok
-      SUM(md.cache_read_tokens) * 0.9 * 4 / 1000000 as estimatedSavingsUsd
-    FROM metrics_daily md
-    WHERE md.user_id = {userId:String}
+      sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheRead') as totalCacheReadTokens,
+      sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'input') as totalInputTokens,
+      if(
+        sumIf(value, metric_name = 'claude_code.token.usage' AND token_type IN ('input', 'cacheRead')) > 0,
+        sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheRead') * 100.0 /
+        sumIf(value, metric_name = 'claude_code.token.usage' AND token_type IN ('input', 'cacheRead')),
+        0
+      ) as cacheHitRate,
+      sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheRead') * 0.9 * 4 / 1000000 as estimatedSavingsUsd
+    FROM metrics_raw FINAL
+    WHERE user_id = {userId:String}
     ${dateFilter}
   `;
 
@@ -510,7 +647,7 @@ export async function getUserToolBreakdown(userId: string, days: number = 30): P
       SUM(1 - tool_success) as failureCount,
       if(COUNT(*) > 0, SUM(tool_success) * 100.0 / COUNT(*), 0) as successRate,
       AVG(tool_duration_ms) as avgDurationMs
-    FROM events_raw
+    FROM events_raw FINAL
     WHERE user_id = {userId:String}
       AND event_name = 'claude_code.tool_result'
       AND tool_name != ''
@@ -528,7 +665,7 @@ export async function getUserToolBreakdown(userId: string, days: number = 30): P
 export async function getUserTotalToolCalls(userId: string): Promise<number> {
   const sql = `
     SELECT COUNT(*) as total
-    FROM events_raw
+    FROM events_raw FINAL
     WHERE user_id = {userId:String}
       AND event_name = 'claude_code.tool_result'
   `;
@@ -539,12 +676,11 @@ export async function getUserTotalToolCalls(userId: string): Promise<number> {
 
 /**
  * Activity heatmap data (for GitHub-style visualization)
- * Returns data grouped by hour (0-23) and day of week (1-7, Mon=1)
  */
 export interface HeatmapCell {
-  hour: number;      // 0-23
-  dayOfWeek: number; // 1-7 (Monday=1, Sunday=7)
-  activity: number;  // Token activity level
+  hour: number;
+  dayOfWeek: number;
+  activity: number;
   promptCount: number;
 }
 
@@ -555,9 +691,9 @@ export async function getActivityHeatmap(userId: string, days: number = 90): Pro
       toDayOfWeek(timestamp) as dayOfWeek,
       SUM(input_tokens + output_tokens) as activity,
       COUNT(*) as promptCount
-    FROM events_raw
+    FROM events_raw FINAL
     WHERE user_id = {userId:String}
-      AND event_name = 'claude_code.user_prompt'
+      AND event_name = 'claude_code.api_request'
       AND timestamp >= now() - INTERVAL {days:UInt32} DAY
     GROUP BY hour, dayOfWeek
     ORDER BY dayOfWeek, hour
@@ -579,17 +715,36 @@ export interface DailyTrend {
 
 export async function getUserVelocityTrend(userId: string, days: number = 30): Promise<DailyTrend[]> {
   const sql = `
+    WITH
+      daily_events AS (
+        SELECT
+          toDate(timestamp) as date,
+          countIf(event_name = 'claude_code.api_request') as prompts
+        FROM events_raw FINAL
+        WHERE user_id = {userId:String}
+          AND toDate(timestamp) >= today() - {days:UInt32}
+        GROUP BY date
+      ),
+      daily_metrics AS (
+        SELECT
+          toDate(timestamp) as date,
+          sumIf(value, metric_name = 'claude_code.token.usage') as tokens,
+          sumIf(value, metric_name = 'claude_code.cost.usage') as costUsd,
+          sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added') as lines
+        FROM metrics_raw FINAL
+        WHERE user_id = {userId:String}
+          AND toDate(timestamp) >= today() - {days:UInt32}
+        GROUP BY date
+      )
     SELECT
-      toString(md.date) as date,
-      COALESCE(ps.prompt_count, 0) as prompts,
-      COALESCE(md.input_tokens + md.output_tokens, 0) as tokens,
-      COALESCE(md.cost_usd, 0) as costUsd,
-      COALESCE(md.lines_added, 0) as lines
-    FROM metrics_daily md
-    LEFT JOIN prompt_stats_daily ps ON md.user_id = ps.user_id AND md.date = ps.date
-    WHERE md.user_id = {userId:String}
-      AND md.date >= today() - {days:UInt32}
-    ORDER BY md.date
+      toString(COALESCE(e.date, m.date)) as date,
+      COALESCE(e.prompts, 0) as prompts,
+      COALESCE(m.tokens, 0) as tokens,
+      COALESCE(m.costUsd, 0) as costUsd,
+      COALESCE(m.lines, 0) as lines
+    FROM daily_events e
+    FULL OUTER JOIN daily_metrics m ON e.date = m.date
+    ORDER BY date
   `;
 
   return query<DailyTrend>(sql, { userId, days });
@@ -612,9 +767,9 @@ export async function getUserSessionStats(userId: string, days: number = 30): Pr
         session_id,
         COUNT(*) as prompt_count,
         dateDiff('second', MIN(timestamp), MAX(timestamp)) / 60 as duration_minutes
-      FROM events_raw
+      FROM events_raw FINAL
       WHERE user_id = {userId:String}
-        AND event_name = 'claude_code.user_prompt'
+        AND event_name = 'claude_code.api_request'
         AND timestamp >= now() - INTERVAL {days:UInt32} DAY
         AND session_id != ''
       GROUP BY session_id
@@ -644,7 +799,7 @@ export const clickhouse = {
   getUserHourlyActivity,
   getLeaderboard,
   getUserRank,
-  // New OTEL full potential queries
+  // OTEL full potential queries
   getUserTodayMetrics,
   getUserCacheStats,
   getUserToolBreakdown,

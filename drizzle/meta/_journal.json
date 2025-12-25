@@ -29,6 +29,13 @@
       "when": 1766429839187,
       "tag": "0003_certain_baron_strucker",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1766573828592,
+      "tag": "0004_useful_shaman",
+      "breakpoints": true
     }
   ]
 }

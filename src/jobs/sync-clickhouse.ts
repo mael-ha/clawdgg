@@ -100,10 +100,11 @@ async function getUserHourlyCounts(userId: string): Promise<Record<string, numbe
     const result = await query<{ hour: number; count: number }>(
       `
       SELECT
-        toHour(hour) as hour,
-        SUM(data_points) as count
-      FROM metrics_hourly
+        toHour(timestamp) as hour,
+        COUNT(*) as count
+      FROM events_raw FINAL
       WHERE user_id = {userId:String}
+        AND event_name = 'claude_code.api_request'
       GROUP BY hour
       `,
       { userId }
@@ -132,9 +133,9 @@ async function getLongestSessionMessages(userId: string): Promise<number> {
       SELECT MAX(prompt_count) as max_prompts
       FROM (
         SELECT session_id, COUNT(*) as prompt_count
-        FROM events_raw
+        FROM events_raw FINAL
         WHERE user_id = {userId:String}
-          AND event_name = 'claude_code.user_prompt'
+          AND event_name = 'claude_code.api_request'
         GROUP BY session_id
       )
       `,
