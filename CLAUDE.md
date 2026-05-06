@@ -1,8 +1,10 @@
 # clawd.gg
 
+**Live:** https://clawd.gg | **Server:** clawdgg (46.224.85.32)
+
 ## Now (sync with now.md at session end)
-🟢 HTTP | Blocked: domain, X creds | X Bot Ready
-Last: Finalized thread structure, X Premium support, orchestration flow tested.
+Telemetry restored after 2026-01-23 → 05-06 blackout (30-day token cliff). Tokens now never-expire with `token_gen` revocation; `clawd doctor` exits.
+Last: Bearer-token fix + JSONL backfill (~$6.6k cost, ~4.7k prompts recovered).
 
 ## Three Codebases
 ```
@@ -13,8 +15,8 @@ bot/   → X bot (changelog + Reddit)
 
 ## Deploy
 ```bash
-# Web
-rsync -avz src/ clawdgg:/opt/clawdgg/src/ && ssh clawdgg 'cd /opt/clawdgg && docker compose -f docker-compose.staging.yml up -d --force-recreate app'
+# Web (MUST use --build to rebuild image)
+rsync -avz src/ clawdgg:/opt/clawdgg/src/ && ssh clawdgg 'cd /opt/clawdgg && docker compose -f docker-compose.staging.yml up -d --build app'
 
 # Bot (local for now)
 DRY_RUN=true bun bot
@@ -29,6 +31,16 @@ secure: APP_URL.startsWith('https://')
 # Docker — restart WON'T reload .env
 docker compose down && docker compose up -d
 ```
+```sql
+-- Revoke a leaked CLI bearer token (forces re-login on next clawd use)
+UPDATE users SET token_gen = token_gen + 1 WHERE id = 'github_<id>';
+```
+```bash
+# Roll back the prod app to the pre-token-fix image (image was tagged 2026-05-06)
+ssh clawdgg 'cd /opt/clawdgg && docker compose -f docker-compose.staging.yml stop app \
+  && docker tag clawdgg-app:pre-token-fix-2026-05-06 clawdgg-app:latest \
+  && docker compose -f docker-compose.staging.yml up -d app'
+```
 
 ## Bot Voice
 ```
@@ -40,6 +52,12 @@ docker compose down && docker compose up -d
 
 ## Identity
 Co-founder. Terminal aesthetic. YAGNI.
+
+## Data Integrity
+Data integrity is non-negotiable. Users trust us with their usage data - any inconsistency erodes that trust. Every number displayed must be:
+- **Accurate** — Matches what's stored, no rounding surprises
+- **Consistent** — Same metric = same number everywhere
+- **Traceable** — Can trace display → query → storage → ingestion
 
 ## Memento
 .claude/memento/ → now.md, beware.md, knowledge/, procedures/
