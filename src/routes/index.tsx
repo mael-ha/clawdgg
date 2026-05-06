@@ -135,7 +135,7 @@ const SmallHero = ({ totalUsers, totalPrompts, totalTokens }: HeroProps) => (
     <div class="relative z-10 max-w-3xl mx-auto">
       <h1 class="text-4xl sm:text-5xl font-bold tracking-tight mb-3">
         <span class="glitch-text" data-text="clawd.gg">
-          <span class="text-gray-100">clawd</span>
+          <span class="text-gray-100">clawdgg</span>
           <span class="text-cyan-400">.gg</span>
         </span>
       </h1>
@@ -360,13 +360,13 @@ const HowItWorks = () => (
           <div class="absolute -top-3 -left-3 w-7 h-7 bg-magenta-500 rounded-lg flex items-center justify-center font-bold text-black text-sm">2</div>
           <div class="text-3xl mb-3">🔑</div>
           <h3 class="text-base font-bold text-gray-100 mb-1">Login with GitHub</h3>
-          <p class="text-gray-500 text-sm font-mono">clawd login</p>
+          <p class="text-gray-500 text-sm font-mono">clawdgg login</p>
         </div>
         <div class="relative p-5 border border-gray-800 rounded-lg bg-gray-950/50 hover:border-blue-500/30 transition-colors">
           <div class="absolute -top-3 -left-3 w-7 h-7 bg-blue-500 rounded-lg flex items-center justify-center font-bold text-black text-sm">3</div>
           <div class="text-3xl mb-3">🚀</div>
           <h3 class="text-base font-bold text-gray-100 mb-1">Sync &amp; Compete</h3>
-          <p class="text-gray-500 text-sm font-mono">clawd setup</p>
+          <p class="text-gray-500 text-sm font-mono">clawdgg setup</p>
         </div>
       </div>
     </div>

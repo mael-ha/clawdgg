@@ -49,7 +49,7 @@ claude_code.session.count
 
 **Limitations:**
 - No historical data (only from when configured)
-- Requires user to run `clawd setup`
+- Requires user to run `clawdgg setup`
 
 ## Token Types Explained
 
@@ -216,7 +216,7 @@ The ClickHouse schema already captures all token types correctly. No changes nee
 │                              │                                      │
 │                    ┌─────────┴─────────┐                           │
 │                    ▼                   ▼                           │
-│            `clawd sync`          `clawd setup`                     │
+│            `clawdgg sync`          `clawdgg setup`                     │
 │            (one-time)            (enables OTel)                    │
 │                    │                   │                           │
 └────────────────────┼───────────────────┼───────────────────────────┘

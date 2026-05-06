@@ -89,7 +89,7 @@ export const AnalyticsChart: FC<AnalyticsChartProps> = ({
           <div class="text-gray-400 font-mono text-sm mb-1">OTEL Required</div>
           <div class="text-gray-600 font-mono text-xs max-w-xs mb-4">
             Hourly breakdown needs real-time telemetry.<br/>
-            Run <code class="text-cyan-500/70 bg-gray-900/50 px-1 rounded">clawd otel</code> to enable.
+            Run <code class="text-cyan-500/70 bg-gray-900/50 px-1 rounded">clawdgg otel</code> to enable.
           </div>
           <button
             id="chart-fallback-btn"

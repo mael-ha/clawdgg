@@ -3,13 +3,13 @@
 **Live:** https://clawd.gg | **Server:** clawdgg (46.224.85.32)
 
 ## Now (sync with now.md at session end)
-Telemetry restored after 2026-01-23 → 05-06 blackout (30-day token cliff). Tokens now never-expire with `token_gen` revocation; `clawd doctor` exits.
+Telemetry restored after 2026-01-23 → 05-06 blackout (30-day token cliff). Tokens now never-expire with `token_gen` revocation; `clawdgg doctor` exits.
 Last: Bearer-token fix + JSONL backfill (~$6.6k cost, ~4.7k prompts recovered).
 
 ## Three Codebases
 ```
 src/   → Web app (Hono + JSX)
-cli/   → CLI tool (clawd)
+cli/   → CLI tool (clawdgg)
 bot/   → X bot (changelog + Reddit)
 ```
 
@@ -32,7 +32,7 @@ secure: APP_URL.startsWith('https://')
 docker compose down && docker compose up -d
 ```
 ```sql
--- Revoke a leaked CLI bearer token (forces re-login on next clawd use)
+-- Revoke a leaked CLI bearer token (forces re-login on next clawdgg use)
 UPDATE users SET token_gen = token_gen + 1 WHERE id = 'github_<id>';
 ```
 ```bash

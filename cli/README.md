@@ -28,13 +28,13 @@ Then visit [clawd.gg](https://clawd.gg) to see your stats.
 
 | Command | Description |
 |---------|-------------|
-| `clawd gg` | **Do everything** - login, sync history, enable streaming |
-| `clawd status` | See your current stats and rank |
-| `clawd login` | Link your GitHub account |
-| `clawd sync` | Manually sync history (usually not needed) |
-| `clawd setup` | Enable OTEL streaming (usually not needed) |
-| `clawd disable` | Turn off streaming |
-| `clawd logout` | Unlink your account |
+| `clawdgg gg` | **Do everything** - login, sync history, enable streaming |
+| `clawdgg status` | See your current stats and rank |
+| `clawdgg login` | Link your GitHub account |
+| `clawdgg sync` | Manually sync history (usually not needed) |
+| `clawdgg setup` | Enable OTEL streaming (usually not needed) |
+| `clawdgg disable` | Turn off streaming |
+| `clawdgg logout` | Unlink your account |
 
 ## How It Works
 
@@ -42,14 +42,14 @@ Then visit [clawd.gg](https://clawd.gg) to see your stats.
 The CLI parses your local `.jsonl` session files to calculate usage statistics.
 
 ### After OTEL (real-time)
-Once you run `clawd gg`, Claude Code streams telemetry directly to clawd.gg. Your stats update in real-time as you use Claude Code.
+Once you run `clawdgg gg`, Claude Code streams telemetry directly to clawd.gg. Your stats update in real-time as you use Claude Code.
 
 ## Privacy
 
 - Your **prompts and code are never sent** - only aggregate metrics
 - Metrics include: token counts, costs, lines written, tool usage
 - All data is tied to your GitHub username
-- You can disable streaming anytime with `clawd disable`
+- You can disable streaming anytime with `clawdgg disable`
 
 ## Installation Options
 
@@ -59,11 +59,11 @@ npx clawdgg gg
 
 # Or install globally
 npm install -g clawdgg
-clawd gg
+clawdgg gg
 
 # Or with bun
 bun install -g clawdgg
-clawd gg
+clawdgg gg
 ```
 
 ## Requirements
@@ -73,13 +73,13 @@ clawd gg
 
 ## Configuration
 
-- Auth token stored in: `~/.config/clawd/config.json`
-- Stats cache: `~/.config/clawd/cache.json`
+- Auth token stored in: `~/.config/clawdgg/config.json`
+- Stats cache: `~/.config/clawdgg/cache.json`
 - OTEL config written to: `~/.claude/settings.json`
 
 ## Environment Variables
 
-- `CLAWD_API_URL` - Override the API URL (default: `https://clawd.gg`)
+- `CLAWDGG_API_URL` - Override the API URL (default: `https://clawd.gg`)
 
 ## Links
 

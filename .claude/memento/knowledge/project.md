@@ -6,7 +6,7 @@ Gamified leaderboard for Claude Code users to track/compare usage stats.
 Plus: Automated X account for Claude Code updates.
 
 - **Domain:** clawd.gg (pending purchase)
-- **CLI:** `clawdgg` (npm) → binary `clawd`
+- **CLI:** `clawdgg` (npm) → binary `clawdgg`
 - **GitHub:** github.com/mael-ha/clawdgg
 
 ## Three Codebases
@@ -14,7 +14,7 @@ Plus: Automated X account for Claude Code updates.
 ```
 clawdgg/
 ├── src/    # Web app (Hono + JSX)
-├── cli/    # CLI tool (clawd)
+├── cli/    # CLI tool (clawdgg)
 └── bot/    # X bot (changelog + Reddit)
 ```
 
@@ -53,7 +53,7 @@ Claude Code → OTel → ClickHouse → Sync Job → SQLite → API
 
 ## OTel Integration
 
-Users run `clawd setup` once → Claude Code streams data automatically.
+Users run `clawdgg setup` once → Claude Code streams data automatically.
 
 **What gets collected:**
 - Tokens (input/output/cache_read/cache_creation)

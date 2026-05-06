@@ -271,7 +271,7 @@ auth.get('/device/verify', async (c) => {
       <div class="text-center mb-8">
         <a href="/" class="inline-block mb-4">
           <h1 class="text-3xl font-bold">
-            <span class="text-gray-100">clawd</span><span class="text-cyan-400">.gg</span>
+            <span class="text-gray-100">clawdgg</span><span class="text-cyan-400">.gg</span>
           </h1>
         </a>
         <p class="text-gray-500 font-mono text-sm">// link your CLI</p>

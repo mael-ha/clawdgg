@@ -32,7 +32,7 @@ export async function fetchBrewCommits(limit = 10): Promise<BrewCommit[]> {
   const response = await fetch(url, {
     headers: {
       'Accept': 'application/vnd.github.v3+json',
-      'User-Agent': 'clawd-bot/1.0',
+      'User-Agent': 'clawdgg-bot/1.0',
       ...(process.env.GITHUB_TOKEN && {
         'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`
       }),

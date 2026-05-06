@@ -42,7 +42,7 @@ export const users = sqliteTable('users', {
 
   // OTel status
   otelEnabled: integer('otel_enabled', { mode: 'boolean' }).default(false),
-  otelSetupAt: integer('otel_setup_at', { mode: 'timestamp' }), // When user ran `clawd setup`
+  otelSetupAt: integer('otel_setup_at', { mode: 'timestamp' }), // When user ran `clawdgg setup`
   otelSetupDate: text('otel_setup_date'), // YYYY-MM-DD for easy date comparison in queries
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -64,7 +64,7 @@ export const users = sqliteTable('users', {
   // Token management (extended to 1 year for OTel)
   tokenExpiresAt: integer('token_expires_at', { mode: 'timestamp' }),
 
-  // Token generation counter for revocation. Incremented by `clawd login`.
+  // Token generation counter for revocation. Incremented by `clawdgg login`.
   // Bearer tokens carry the gen number they were issued with; verifyBearerToken
   // rejects mismatches. Bumping this column instantly revokes all outstanding
   // tokens for the user without requiring expiry-based rotation.

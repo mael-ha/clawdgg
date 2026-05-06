@@ -59,7 +59,7 @@
 - **Action:** Visit clawd.gg
 
 ### Stage 2: First Sync
-- **Trigger:** Run `clawd sync` for the first time
+- **Trigger:** Run `clawdgg sync` for the first time
 - **Feel:** Validation rush — "Holy shit, I've done a lot"
 - **Key moment:** The numbers appearing in terminal
 - **Design goal:** Make this moment LAND
@@ -83,7 +83,7 @@
 - **Design goal:** Worth screenshotting without prompting
 
 ### Stage 6: Return
-- **Trigger:** Run `clawd gg` days later
+- **Trigger:** Run `clawdgg gg` days later
 - **Feel:** Momentum — "I'm growing"
 - **Key moment:** Streak update, rank change
 - **Design goal:** Reason to come back
@@ -625,16 +625,16 @@ export async function GET(request: Request) {
 
 | Command | Action | Output |
 |---------|--------|--------|
-| `clawd login` | Authenticate via device flow | Token stored locally |
-| `clawd sync` | Upload stats to server | Summary of days synced |
-| `clawd setup` | Enable auto-sync (OTel) | Config updated |
-| `clawd status` | Show stats + rank | Hero card in terminal |
-| `clawd gg` | Sync + Status combined | Full flex experience |
+| `clawdgg login` | Authenticate via device flow | Token stored locally |
+| `clawdgg sync` | Upload stats to server | Summary of days synced |
+| `clawdgg setup` | Enable auto-sync (OTel) | Config updated |
+| `clawdgg status` | Show stats + rank | Hero card in terminal |
+| `clawdgg gg` | Sync + Status combined | Full flex experience |
 
 ### CLI Output Design
 
 ```
-$ clawd gg
+$ clawdgg gg
 
   Syncing 3 new days...
 
@@ -676,7 +676,7 @@ $ clawd gg
 3. [ ] Redesign hero section with archetype + cost
 4. [ ] Add percentile calculation for key stats
 5. [ ] Restructure profile into "Your Numbers" + "Your Style" grid
-6. [ ] Update CLI `clawd status` output to match new design
+6. [ ] Update CLI `clawdgg status` output to match new design
 7. [ ] Add comparison text ("47 copies of War and Peace")
 
 **Files to modify:**

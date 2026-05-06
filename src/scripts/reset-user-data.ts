@@ -8,8 +8,8 @@
  * 4. Clears legacy snapshot
  *
  * After running this:
- * 1. Run `clawd sync` to re-import historical data
- * 2. Run `clawd setup` to enable OTEL (will snapshot the data)
+ * 1. Run `clawdgg sync` to re-import historical data
+ * 2. Run `clawdgg setup` to enable OTEL (will snapshot the data)
  * 3. Use Claude Code - OTEL data will flow
  * 4. Verify combined totals on profile
  *
@@ -124,11 +124,11 @@ async function resetUserData(username: string) {
   console.log('');
   console.log('Next steps to test the flow:');
   console.log('');
-  console.log('1. Run `clawd sync` to import your historical JSONL data');
+  console.log('1. Run `clawdgg sync` to import your historical JSONL data');
   console.log('   → This populates daily_stats');
   console.log('   → You should see your stats on the leaderboard');
   console.log('');
-  console.log('2. Run `clawd setup` to enable OTEL');
+  console.log('2. Run `clawdgg setup` to enable OTEL');
   console.log('   → This snapshots daily_stats into legacy_total_*');
   console.log('   → Configures OTEL streaming');
   console.log('');

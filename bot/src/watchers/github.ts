@@ -27,7 +27,7 @@ export async function fetchLatestRelease(): Promise<GitHubRelease | null> {
   const response = await fetch(`${RELEASES_API}/latest`, {
     headers: {
       'Accept': 'application/vnd.github.v3+json',
-      'User-Agent': 'clawd-bot/1.0',
+      'User-Agent': 'clawdgg-bot/1.0',
       ...(process.env.GITHUB_TOKEN && {
         'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`
       }),
@@ -60,7 +60,7 @@ export async function fetchReleaseByVersion(version: string): Promise<GitHubRele
     const response = await fetch(`${RELEASES_API}/tags/${tag}`, {
       headers: {
         'Accept': 'application/vnd.github.v3+json',
-        'User-Agent': 'clawd-bot/1.0',
+        'User-Agent': 'clawdgg-bot/1.0',
         ...(process.env.GITHUB_TOKEN && {
           'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`
         }),
@@ -143,7 +143,7 @@ export async function fetchRecentReleases(limit = 10): Promise<GitHubRelease[]> 
   const response = await fetch(`${RELEASES_API}?per_page=${limit}`, {
     headers: {
       'Accept': 'application/vnd.github.v3+json',
-      'User-Agent': 'clawd-bot/1.0',
+      'User-Agent': 'clawdgg-bot/1.0',
       ...(process.env.GITHUB_TOKEN && {
         'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`
       }),

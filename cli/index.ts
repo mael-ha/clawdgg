@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { readFile, writeFile, mkdir, chmod, stat, readdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, chmod, stat, readdir, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -37,16 +37,20 @@ const log = {
 const STATS_FILE = join(homedir(), ".claude", "stats-cache.json");
 const CLAUDE_PROJECTS_DIR = join(homedir(), ".claude", "projects");
 const CLAUDE_SETTINGS_PATH = join(homedir(), ".claude", "settings.json");
-const CONFIG_DIR = join(homedir(), ".config", "clawd");
+const CONFIG_DIR = join(homedir(), ".config", "clawdgg");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 const CACHE_FILE = join(CONFIG_DIR, "cache.json");
-// Legacy config location (for migration)
+// Previous config location (renamed from `clawd` to `clawdgg` in May 2026 to
+// avoid namespace collision with unrelated upstream "clawd" projects).
+const PREV_CONFIG_DIR = join(homedir(), ".config", "clawd");
+const PREV_CONFIG_FILE = join(PREV_CONFIG_DIR, "config.json");
+// Original legacy config location (renamed to ~/.config/clawd in 2025).
 const LEGACY_CONFIG_DIR = join(homedir(), ".clawd-gg");
 const LEGACY_CONFIG_FILE = join(LEGACY_CONFIG_DIR, "config.json");
 
 // API configuration
 const API_BASE_URL =
-  process.env.CLAWD_API_URL || "https://clawd.gg";
+  process.env.CLAWDGG_API_URL || "https://clawd.gg";
 
 // Types
 interface DailyActivity {
@@ -708,13 +712,29 @@ async function loadConfig(): Promise<Config> {
       return JSON.parse(data);
     }
 
-    // Fall back to legacy location and migrate if found
+    // Migrate from the previous ~/.config/clawd directory by renaming the
+    // whole dir (preserves cache.json + any other state). Atomic on same
+    // filesystem.
+    if (existsSync(PREV_CONFIG_FILE)) {
+      try {
+        await rename(PREV_CONFIG_DIR, CONFIG_DIR);
+        log.dim("Migrated config from ~/.config/clawd to ~/.config/clawdgg");
+      } catch {
+        // Cross-device rename failed — fall back to copying just the config
+        // file via saveConfig.
+        const data = await readFile(PREV_CONFIG_FILE, "utf-8");
+        await saveConfig(JSON.parse(data));
+      }
+      const data = await readFile(CONFIG_FILE, "utf-8");
+      return JSON.parse(data);
+    }
+
+    // Original legacy location (~/.clawd-gg, pre-2025).
     if (existsSync(LEGACY_CONFIG_FILE)) {
       const data = await readFile(LEGACY_CONFIG_FILE, "utf-8");
       const config = JSON.parse(data);
-      // Migrate to new location
       await saveConfig(config);
-      log.dim("Migrated config from ~/.clawd-gg to ~/.config/clawd");
+      log.dim("Migrated config from ~/.clawd-gg to ~/.config/clawdgg");
       return config;
     }
 
@@ -956,7 +976,7 @@ async function cmdSync(forceFullSync: boolean = false): Promise<void> {
   // Check authentication
   const config = await loadConfig();
   if (!config.token) {
-    log.error("We haven't met yet. Run `clawd login` first.");
+    log.error("We haven't met yet. Run `clawdgg login` first.");
     process.exit(1);
   }
 
@@ -1099,7 +1119,7 @@ async function cmdSync(forceFullSync: boolean = false): Promise<void> {
     log.error(`${error}`);
 
     if (error instanceof Error && error.message.includes("401")) {
-      log.warn("Your token expired. Time flies when you're prompting. Run `clawd login` again.");
+      log.warn("Your token expired. Time flies when you're prompting. Run `clawdgg login` again.");
     }
 
     process.exit(1);
@@ -1115,7 +1135,7 @@ async function cmdLogin(): Promise<void> {
   }
 }
 
-// `clawd doctor` — verify token validity AND that ~/.claude/settings.json
+// `clawdgg doctor` — verify token validity AND that ~/.claude/settings.json
 // carries the current bearer token. The OTel SDK silently drops batches on
 // 401, so this is the only way users learn their telemetry isn't flowing.
 async function cmdDoctor(): Promise<void> {
@@ -1123,7 +1143,7 @@ async function cmdDoctor(): Promise<void> {
 
   const config = await loadConfig();
   if (!config.token) {
-    log.error("Not logged in. Run `clawd login`.");
+    log.error("Not logged in. Run `clawdgg login`.");
     process.exit(1);
   }
 
@@ -1141,7 +1161,7 @@ async function cmdDoctor(): Promise<void> {
   const elapsed = Date.now() - startedAt;
 
   if (response.status === 401) {
-    log.error("Your token is invalid or revoked. Run `clawd login` again.");
+    log.error("Your token is invalid or revoked. Run `clawdgg login` again.");
     process.exit(1);
   }
   if (!response.ok) {
@@ -1164,7 +1184,7 @@ async function cmdDoctor(): Promise<void> {
   const settingsPath = join(homedir(), ".claude", "settings.json");
   if (!existsSync(settingsPath)) {
     log.warn("~/.claude/settings.json not found.");
-    log.warn("Run `clawd setup` so OTEL telemetry can flow to clawd.gg.");
+    log.warn("Run `clawdgg setup` so OTEL telemetry can flow to clawd.gg.");
     process.exit(2);
   }
 
@@ -1179,7 +1199,7 @@ async function cmdDoctor(): Promise<void> {
   const headers: string | undefined = settings?.env?.OTEL_EXPORTER_OTLP_HEADERS;
   if (typeof headers !== "string" || !headers.includes("Authorization=Bearer")) {
     log.warn("OTEL_EXPORTER_OTLP_HEADERS missing in ~/.claude/settings.json.");
-    log.warn("Run `clawd setup` so OTEL telemetry can flow.");
+    log.warn("Run `clawdgg setup` so OTEL telemetry can flow.");
     process.exit(2);
   }
 
@@ -1187,7 +1207,7 @@ async function cmdDoctor(): Promise<void> {
   const encoded = encodeURIComponent(config.token);
   if (!headers.includes(encoded)) {
     log.warn("Your ~/.claude/settings.json carries a stale bearer token.");
-    log.warn("Re-run `clawd login` so the token in settings.json matches the one in clawd config.");
+    log.warn("Re-run `clawdgg login` so the token in settings.json matches the one in clawdgg config.");
     process.exit(2);
   }
 
@@ -1466,9 +1486,9 @@ async function cmdStatus(): Promise<void> {
   console.log();
 
   if (!config.token) {
-    log.dim("Run `clawd login` to join the leaderboard");
+    log.dim("Run `clawdgg login` to join the leaderboard");
   } else if (!profile) {
-    log.dim("Run `clawd sync` to update your stats");
+    log.dim("Run `clawdgg sync` to update your stats");
   } else if (config.lastSyncDate) {
     log.dim(`Last synced: ${config.lastSyncDate}`);
   }
@@ -1482,7 +1502,7 @@ async function cmdStatus(): Promise<void> {
 
 // Refresh just the OTEL Authorization header in ~/.claude/settings.json with a
 // new bearer token. Only updates if OTEL is already configured (i.e. the user
-// previously ran `clawd setup`); otherwise a no-op so we don't auto-enable
+// previously ran `clawdgg setup`); otherwise a no-op so we don't auto-enable
 // telemetry without consent.
 async function refreshOtelHeaderInClaudeSettings(token: string): Promise<boolean> {
   if (!existsSync(CLAUDE_SETTINGS_PATH)) return false;
@@ -1507,14 +1527,14 @@ async function cmdSetup(): Promise<void> {
   // 1. Check login
   const config = await loadConfig();
   if (!config.token) {
-    log.error("Not logged in. Run `clawd login` first.");
+    log.error("Not logged in. Run `clawdgg login` first.");
     process.exit(1);
   }
 
   // 2. Verify token with server
   const profile = await fetchProfile(config.token);
   if (!profile) {
-    log.error("Token invalid or expired. Run `clawd login` to refresh.");
+    log.error("Token invalid or expired. Run `clawdgg login` to refresh.");
     process.exit(1);
   }
 
@@ -1774,7 +1794,7 @@ ${colors.bright}${colors.cyan}clawd.gg${colors.reset} ${colors.dim}— let's go!
     }
 
     // Check if already set up
-    const alreadySetup = settings.env?.OTEL_EXPORTER_OTLP_ENDPOINT?.includes('clawd');
+    const alreadySetup = settings.env?.OTEL_EXPORTER_OTLP_ENDPOINT?.includes('clawd.gg');
 
     if (alreadySetup) {
       console.log(`      ${colors.green}✓${colors.reset} OTEL streaming already configured`);
@@ -1831,7 +1851,7 @@ function showHelp(): void {
 ${colors.bright}${colors.cyan}clawd.gg${colors.reset} ${colors.dim}— Track your Claude Code usage${colors.reset}
 
 ${colors.bright}Quick Start:${colors.reset}
-  ${colors.cyan}clawd gg${colors.reset}     ${colors.dim}One command to set everything up${colors.reset}
+  ${colors.cyan}clawdgg gg${colors.reset}     ${colors.dim}One command to set everything up${colors.reset}
                ${colors.dim}(login + sync history + enable streaming)${colors.reset}
 
 ${colors.bright}Commands:${colors.reset}
@@ -1897,7 +1917,7 @@ async function main() {
     case "version":
     case "--version":
     case "-v":
-      console.log("clawd v1.0.0");
+      console.log("clawdgg v1.0.0");
       break;
     case "help":
     case "--help":

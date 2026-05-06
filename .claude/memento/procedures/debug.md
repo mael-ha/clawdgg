@@ -20,7 +20,7 @@ curl http://localhost:3000/api/leaderboard?period=all&sort=prompts
 
 ```bash
 # Must set API URL for local testing
-export CLAWD_API_URL="http://localhost:3000"
+export CLAWDGG_API_URL="http://localhost:3000"
 
 # Test commands
 bun cli/index.ts login
@@ -55,7 +55,7 @@ bun cli/index.ts setup
 ### OTel Data Not Appearing
 
 **Check:**
-1. User ran `clawd setup`
+1. User ran `clawdgg setup`
 2. Token valid: Check `users.token_expires_at`
 3. ClickHouse receiving: Query `metrics_raw` table
 
@@ -71,8 +71,8 @@ ssh clawdgg 'docker exec clawdgg-clickhouse-1 clickhouse-client --query "SELECT 
 
 **Fix:**
 ```bash
-rm ~/.config/clawd/cache.json
-clawd status  # Re-parses all files
+rm ~/.config/clawdgg/cache.json
+clawdgg status  # Re-parses all files
 ```
 
 ## Database Queries

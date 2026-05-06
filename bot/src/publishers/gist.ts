@@ -47,7 +47,7 @@ export async function createGist(
     headers: {
       'Accept': 'application/vnd.github.v3+json',
       'Authorization': `Bearer ${token}`,
-      'User-Agent': 'clawd-bot/1.0',
+      'User-Agent': 'clawdgg-bot/1.0',
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(request),

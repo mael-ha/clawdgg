@@ -9,13 +9,13 @@
 
 ## Last Session (2026-05-06): Bearer-token cliff + 3.5-month backfill
 
-**Root cause:** clawd CLI baked a 30-day signed token literally into
+**Root cause:** clawdgg CLI baked a 30-day signed token literally into
 `OTEL_EXPORTER_OTLP_HEADERS` in `~/.claude/settings.json`. The OTel SDK reads
 that header once at startup with no refresh hook. Token issued 2025-12-24,
 expired 2026-01-23 14:41:27 UTC — exact match for the last received row in
 ClickHouse (`max(timestamp) = 2026-01-23 14:41:20.630`). Once expired, every
-batch silently 401'd into the void. The `clawd login` warning at
-`cli/index.ts:1097` only fires from interactive `clawd sync`, never from the
+batch silently 401'd into the void. The `clawdgg login` warning at
+`cli/index.ts:1097` only fires from interactive `clawdgg sync`, never from the
 OTel SDK, so nothing surfaced for ~3.5 months.
 
 **What we shipped (branch `wip+fix-deploy-2026-05-06`):**
@@ -24,14 +24,14 @@ OTel SDK, so nothing surfaced for ~3.5 months.
    revokes every outstanding token — replaces lifetime-based rotation.
 2. **Rate-limited [OTel Auth] WARN log** in `requireOtelAuth` so future
    credential anomalies surface in `docker logs` (operator visibility).
-3. **`clawd doctor` command** + auto-refresh of `~/.claude/settings.json`
-   inside `clawd login` so users don't need a separate `clawd setup` step.
+3. **`clawdgg doctor` command** + auto-refresh of `~/.claude/settings.json`
+   inside `clawdgg login` so users don't need a separate `clawdgg setup` step.
 4. **`provenance` column** on `events_raw` / `metrics_raw` (`'live'` vs
    `'backfill'`) tagging reconstructed rows distinct from measured OTLP data.
 5. **`src/scripts/backfill-jsonl.ts`** mining `~/.claude/projects/**/*.jsonl`
    for api_request, tool_result, user_prompt + token.usage / cost.usage rows.
    Skips orchestrator-internal prompts (subagent files + isSidechain=true).
-   Resumable via `~/.clawd-backfill-state.json`.
+   Resumable via `~/.clawdgg-backfill-state.json`.
 
 **Recovered for `github_61985678`:**
 - Prompts: 17,216 → 21,979 (+4,763)

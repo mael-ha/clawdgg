@@ -18,9 +18,9 @@
  * Date format: YYYY-MM-DD or full ISO 'YYYY-MM-DD HH:MM:SS'. UTC.
  *
  * Required env:
- *   CLAWD_USER_ID            user_id to attribute rows to (e.g. github_61985678)
- *   CLAWD_CLICKHOUSE_URL     prod CH endpoint (default http://localhost:8123)
- *   CLAWD_CLICKHOUSE_DB      database name (default clawd)
+ *   CLAWDGG_USER_ID            user_id to attribute rows to (e.g. github_61985678)
+ *   CLAWDGG_CLICKHOUSE_URL     prod CH endpoint (default http://localhost:8123)
+ *   CLAWDGG_CLICKHOUSE_DB      database name (default clawdgg)
  */
 
 import { readFile, readdir, writeFile, stat } from "node:fs/promises";
@@ -78,11 +78,11 @@ function parseDate(s: string): Date {
 // Config / paths
 // ─────────────────────────────────────────────────────────────────────────────
 
-const USER_ID = process.env.CLAWD_USER_ID || "github_61985678";
-const CH_URL = process.env.CLAWD_CLICKHOUSE_URL || "http://localhost:8123";
-const CH_DB = process.env.CLAWD_CLICKHOUSE_DB || "clawd";
+const USER_ID = process.env.CLAWDGG_USER_ID || "github_61985678";
+const CH_URL = process.env.CLAWDGG_CLICKHOUSE_URL || "http://localhost:8123";
+const CH_DB = process.env.CLAWDGG_CLICKHOUSE_DB || "clawd";
 const PROJECTS_DIR = join(homedir(), ".claude", "projects");
-const CHECKPOINT_PATH = join(homedir(), ".clawd-backfill-state.json");
+const CHECKPOINT_PATH = join(homedir(), ".clawdgg-backfill-state.json");
 
 const BATCH_SIZE = 1000;
 

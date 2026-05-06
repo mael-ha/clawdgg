@@ -59,7 +59,7 @@ interface OtelContext {
 // Rate-limited 401 warning. The OTel SDK silently drops batches on 401, so a
 // user can be stuck pushing rejected requests for months without any visible
 // signal. This surfaces sustained 401s in `docker logs` so the operator
-// notices even before the user's CLI heartbeat (clawd doctor) catches it.
+// notices even before the user's CLI heartbeat (clawdgg doctor) catches it.
 type AuthFailWindow = { count: number; windowStartMs: number; lastWarnMs: number };
 const authFailures = new Map<string, AuthFailWindow>();
 const AUTH_FAIL_WINDOW_MS = 60 * 60 * 1000;     // 1 hour rolling window
@@ -80,7 +80,7 @@ function recordAuthFailure(key: string, reason: string): void {
     const minutes = Math.round((now - entry.windowStartMs) / 60000);
     console.warn(
       `[OTel Auth] WARN: ${key} has ${entry.count} 401s in ${minutes}m (reason=${reason}). ` +
-      `Likely a stale or revoked token; user should re-run \`clawd login\`.`
+      `Likely a stale or revoked token; user should re-run \`clawdgg login\`.`
     );
     entry.lastWarnMs = now;
   }

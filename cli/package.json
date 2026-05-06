@@ -4,7 +4,6 @@
   "description": "Track your Claude Code usage - leaderboard, stats, and real-time streaming",
   "type": "module",
   "bin": {
-    "clawd": "./index.ts",
     "clawdgg": "./index.ts"
   },
   "scripts": {

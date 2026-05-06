@@ -994,7 +994,7 @@ api.get('/me/today', requireAuth, async (c) => {
     if (!userData?.otelEnabled) {
       return c.json({
         error: 'OTEL not enabled',
-        message: 'Run `clawd setup` to enable real-time metrics',
+        message: 'Run `clawdgg setup` to enable real-time metrics',
       }, 400);
     }
 
@@ -1059,7 +1059,7 @@ api.get('/me/insights', requireAuth, async (c) => {
     if (!userData?.otelEnabled) {
       return c.json({
         error: 'OTEL not enabled',
-        message: 'Run `clawd setup` to enable insights',
+        message: 'Run `clawdgg setup` to enable insights',
       }, 400);
     }
 
@@ -1181,7 +1181,7 @@ api.get('/me/heatmap', requireAuth, async (c) => {
     if (!userData?.otelEnabled) {
       return c.json({
         error: 'OTEL not enabled',
-        message: 'Run `clawd setup` to enable heatmap',
+        message: 'Run `clawdgg setup` to enable heatmap',
       }, 400);
     }
 
@@ -1282,7 +1282,7 @@ api.get('/me/chart', requireAuth, async (c) => {
         noData: true,
         reason: 'otel_required',
         message: 'Hourly breakdown requires OTEL telemetry',
-        action: 'Run clawd otel to enable',
+        action: 'Run clawdgg otel to enable',
         fallbackPeriod: '7d',
       });
     }
