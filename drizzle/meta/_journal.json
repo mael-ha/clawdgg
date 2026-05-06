@@ -43,6 +43,20 @@
       "when": 1766865325763,
       "tag": "0005_majestic_maelstrom",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1767000000000,
+      "tag": "0006_rename_cost_column",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1778345400000,
+      "tag": "0007_add_user_token_gen",
+      "breakpoints": true
     }
   ]
 }

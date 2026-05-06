@@ -36,6 +36,7 @@ const log = {
 // File paths
 const STATS_FILE = join(homedir(), ".claude", "stats-cache.json");
 const CLAUDE_PROJECTS_DIR = join(homedir(), ".claude", "projects");
+const CLAUDE_SETTINGS_PATH = join(homedir(), ".claude", "settings.json");
 const CONFIG_DIR = join(homedir(), ".config", "clawd");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 const CACHE_FILE = join(CONFIG_DIR, "cache.json");
@@ -922,6 +923,10 @@ async function initiateLogin(): Promise<void> {
       if (pollResponse.ok) {
         const { token, userId, username } = await pollResponse.json();
         await saveConfig({ token, userId, username });
+        // If OTEL is already configured in ~/.claude/settings.json, propagate
+        // the new token so Claude Code's exporter doesn't keep using the old
+        // (now-revoked) credential. Silent on failure — don't block login.
+        await refreshOtelHeaderInClaudeSettings(token).catch(() => {});
         log.success(`Linked! Welcome, ${colors.bright}${username}${colors.reset}`);
         return;
       }
@@ -1108,6 +1113,86 @@ async function cmdLogin(): Promise<void> {
     log.error(`${error}`);
     process.exit(1);
   }
+}
+
+// `clawd doctor` — verify token validity AND that ~/.claude/settings.json
+// carries the current bearer token. The OTel SDK silently drops batches on
+// 401, so this is the only way users learn their telemetry isn't flowing.
+async function cmdDoctor(): Promise<void> {
+  log.title("Health check");
+
+  const config = await loadConfig();
+  if (!config.token) {
+    log.error("Not logged in. Run `clawd login`.");
+    process.exit(1);
+  }
+
+  // 1. Auth ping against /api/me
+  const startedAt = Date.now();
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/api/me`, {
+      headers: { Authorization: `Bearer ${config.token}` },
+    });
+  } catch (error) {
+    log.error(`Cannot reach ${API_BASE_URL}: ${error}`);
+    process.exit(1);
+  }
+  const elapsed = Date.now() - startedAt;
+
+  if (response.status === 401) {
+    log.error("Your token is invalid or revoked. Run `clawd login` again.");
+    process.exit(1);
+  }
+  if (!response.ok) {
+    log.error(`Unexpected server response: HTTP ${response.status}`);
+    process.exit(1);
+  }
+
+  let payload: ProfileData;
+  try {
+    payload = (await response.json()) as ProfileData;
+  } catch {
+    log.error("Server returned non-JSON. Something is wrong on the server side.");
+    process.exit(1);
+  }
+
+  log.success(`Auth: ${payload.username || config.username || "ok"} (${elapsed}ms)`);
+
+  // 2. Verify OTel exporter config is in ~/.claude/settings.json and
+  //    contains the *current* bearer token (catches stale-token drift).
+  const settingsPath = join(homedir(), ".claude", "settings.json");
+  if (!existsSync(settingsPath)) {
+    log.warn("~/.claude/settings.json not found.");
+    log.warn("Run `clawd setup` so OTEL telemetry can flow to clawd.gg.");
+    process.exit(2);
+  }
+
+  let settings: any;
+  try {
+    settings = JSON.parse(await readFile(settingsPath, "utf-8"));
+  } catch (e) {
+    log.warn(`Could not parse ~/.claude/settings.json: ${e}`);
+    process.exit(2);
+  }
+
+  const headers: string | undefined = settings?.env?.OTEL_EXPORTER_OTLP_HEADERS;
+  if (typeof headers !== "string" || !headers.includes("Authorization=Bearer")) {
+    log.warn("OTEL_EXPORTER_OTLP_HEADERS missing in ~/.claude/settings.json.");
+    log.warn("Run `clawd setup` so OTEL telemetry can flow.");
+    process.exit(2);
+  }
+
+  // The header value URL-encodes the token. Compare against the URL-encoded form.
+  const encoded = encodeURIComponent(config.token);
+  if (!headers.includes(encoded)) {
+    log.warn("Your ~/.claude/settings.json carries a stale bearer token.");
+    log.warn("Re-run `clawd login` so the token in settings.json matches the one in clawd config.");
+    process.exit(2);
+  }
+
+  log.success("OTEL exporter: token in settings.json matches current login.");
+  log.success("Telemetry should be flowing. Check https://clawd.gg/u/" + (payload.username || ""));
 }
 
 // Badge emoji mapping
@@ -1395,7 +1480,26 @@ async function cmdStatus(): Promise<void> {
 // SETUP COMMAND - Configure OTel auto-sync
 // ═══════════════════════════════════════════════════════════════════════════
 
-const CLAUDE_SETTINGS_PATH = join(homedir(), ".claude", "settings.json");
+// Refresh just the OTEL Authorization header in ~/.claude/settings.json with a
+// new bearer token. Only updates if OTEL is already configured (i.e. the user
+// previously ran `clawd setup`); otherwise a no-op so we don't auto-enable
+// telemetry without consent.
+async function refreshOtelHeaderInClaudeSettings(token: string): Promise<boolean> {
+  if (!existsSync(CLAUDE_SETTINGS_PATH)) return false;
+  let settings: Record<string, any>;
+  try {
+    settings = JSON.parse(await readFile(CLAUDE_SETTINGS_PATH, "utf-8"));
+  } catch {
+    return false;
+  }
+  if (!settings?.env || typeof settings.env.OTEL_EXPORTER_OTLP_HEADERS !== "string") {
+    return false; // not previously set up — leave alone
+  }
+  const encodedToken = encodeURIComponent(`Bearer ${token}`);
+  settings.env.OTEL_EXPORTER_OTLP_HEADERS = `Authorization=${encodedToken}`;
+  await writeFile(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2));
+  return true;
+}
 
 async function cmdSetup(): Promise<void> {
   log.title("Setting up auto-sync");
@@ -1736,6 +1840,7 @@ ${colors.bright}Commands:${colors.reset}
   ${colors.green}login${colors.reset}    Link your GitHub account
   ${colors.green}sync${colors.reset}     Manually sync history (usually not needed)
   ${colors.green}setup${colors.reset}    Enable OTEL streaming (usually not needed)
+  ${colors.green}doctor${colors.reset}   Verify telemetry is reaching clawd.gg
   ${colors.green}disable${colors.reset}  Turn off streaming
   ${colors.green}logout${colors.reset}   Unlink your account
 
@@ -1765,6 +1870,9 @@ async function main() {
       break;
     case "login":
       await cmdLogin();
+      break;
+    case "doctor":
+      await cmdDoctor();
       break;
     case "logout": {
       const config = await loadConfig();

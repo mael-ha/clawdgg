@@ -56,6 +56,50 @@ interface OtelContext {
   username: string;
 }
 
+// Rate-limited 401 warning. The OTel SDK silently drops batches on 401, so a
+// user can be stuck pushing rejected requests for months without any visible
+// signal. This surfaces sustained 401s in `docker logs` so the operator
+// notices even before the user's CLI heartbeat (clawd doctor) catches it.
+type AuthFailWindow = { count: number; windowStartMs: number; lastWarnMs: number };
+const authFailures = new Map<string, AuthFailWindow>();
+const AUTH_FAIL_WINDOW_MS = 60 * 60 * 1000;     // 1 hour rolling window
+const AUTH_FAIL_THRESHOLD = 100;                 // 401s/hour before warning
+const AUTH_WARN_THROTTLE_MS = 60 * 60 * 1000;    // at most one warn per hour per key
+
+function recordAuthFailure(key: string, reason: string): void {
+  const now = Date.now();
+  const entry = authFailures.get(key) ?? { count: 0, windowStartMs: now, lastWarnMs: 0 };
+
+  if (now - entry.windowStartMs > AUTH_FAIL_WINDOW_MS) {
+    entry.count = 0;
+    entry.windowStartMs = now;
+  }
+  entry.count++;
+
+  if (entry.count > AUTH_FAIL_THRESHOLD && now - entry.lastWarnMs > AUTH_WARN_THROTTLE_MS) {
+    const minutes = Math.round((now - entry.windowStartMs) / 60000);
+    console.warn(
+      `[OTel Auth] WARN: ${key} has ${entry.count} 401s in ${minutes}m (reason=${reason}). ` +
+      `Likely a stale or revoked token; user should re-run \`clawd login\`.`
+    );
+    entry.lastWarnMs = now;
+  }
+
+  authFailures.set(key, entry);
+}
+
+function peekTokenUserId(token: string | undefined): string | null {
+  if (!token) return null;
+  const lastDot = token.lastIndexOf('.');
+  if (lastDot === -1) return null;
+  try {
+    const parsed = JSON.parse(token.slice(0, lastDot));
+    return typeof parsed.userId === 'string' ? parsed.userId : null;
+  } catch {
+    return null;
+  }
+}
+
 async function requireOtelAuth(c: any, next: () => Promise<void>): Promise<Response | void> {
   let authHeader = c.req.header('Authorization');
 
@@ -71,15 +115,18 @@ async function requireOtelAuth(c: any, next: () => Promise<void>): Promise<Respo
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     console.log('[OTel Auth] Missing or invalid header format:', authHeader?.slice(0, 30));
+    recordAuthFailure('anon', 'missing-or-malformed-header');
     return c.json({ error: 'Missing or invalid Authorization header' }, 401);
   }
 
   const token = authHeader.slice(7); // Remove "Bearer "
+  const userIdHint = peekTokenUserId(token) ?? 'anon';
 
-  // Verify token signature and expiry using the proper session library
+  // Verify token signature, expiry, and gen against users.token_gen
   const userId = await verifyBearerToken(token);
   if (!userId) {
-    return c.json({ error: 'Invalid or expired token' }, 401);
+    recordAuthFailure(userIdHint, 'invalid-or-revoked-token');
+    return c.json({ error: 'Invalid or revoked token' }, 401);
   }
 
   // Verify user exists in database
@@ -90,6 +137,7 @@ async function requireOtelAuth(c: any, next: () => Promise<void>): Promise<Respo
     .get();
 
   if (!validUser) {
+    recordAuthFailure(userIdHint, 'user-not-found');
     return c.json({ error: 'User not found' }, 401);
   }
 

@@ -64,6 +64,12 @@ export const users = sqliteTable('users', {
   // Token management (extended to 1 year for OTel)
   tokenExpiresAt: integer('token_expires_at', { mode: 'timestamp' }),
 
+  // Token generation counter for revocation. Incremented by `clawd login`.
+  // Bearer tokens carry the gen number they were issued with; verifyBearerToken
+  // rejects mismatches. Bumping this column instantly revokes all outstanding
+  // tokens for the user without requiring expiry-based rotation.
+  tokenGen: integer('token_gen').notNull().default(1),
+
   // Potential future: Anthropic account linking
   anthropicAccountUuid: text('anthropic_account_uuid'),
 

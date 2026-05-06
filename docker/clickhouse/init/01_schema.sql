@@ -35,7 +35,10 @@ CREATE TABLE IF NOT EXISTS metrics_raw (
     -- Resource attributes
     terminal_type String DEFAULT '',
     app_version String DEFAULT '',
-    account_uuid String DEFAULT ''
+    account_uuid String DEFAULT '',
+    -- Provenance: 'live' for OTLP-received, 'backfill' for JSONL-reconstructed.
+    -- Distinct from `source` (which captures the OTEL source attribute meaning).
+    provenance String DEFAULT 'live'
 ) ENGINE = ReplacingMergeTree()
 -- CRITICAL: line_type must be in ORDER BY to prevent deduplication of added/removed rows
 -- Note: session_id removed from ORDER BY for better query performance (not needed for dedup)
@@ -68,7 +71,10 @@ CREATE TABLE IF NOT EXISTS events_raw (
     -- tool_result / tool_decision attributes
     decision String DEFAULT '',        -- accept, reject
     source String DEFAULT '',          -- config, user_permanent, user_temporary, user_abort, user_reject
-    tool_parameters String DEFAULT ''  -- JSON string with tool-specific params (bash_command, etc.)
+    tool_parameters String DEFAULT '', -- JSON string with tool-specific params (bash_command, etc.)
+    -- Provenance: 'live' for OTLP-received, 'backfill' for JSONL-reconstructed.
+    -- Distinct from `source` above (which captures the OTEL source attribute).
+    provenance String DEFAULT 'live'
 ) ENGINE = ReplacingMergeTree()
 ORDER BY (user_id, session_id, event_name, timestamp, tool_name)
 PARTITION BY toYYYYMM(timestamp)

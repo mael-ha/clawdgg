@@ -143,6 +143,8 @@ export interface MetricRow {
   tool?: string;       // Edit, Write, NotebookEdit
   decision?: string;   // accept, reject
   language?: string;   // TypeScript, Python, etc.
+  // Provenance: 'live' (OTLP-received, default) or 'backfill' (JSONL-reconstructed).
+  provenance?: 'live' | 'backfill';
 }
 
 export interface EventRow {
@@ -167,6 +169,8 @@ export interface EventRow {
   decision?: string;        // accept, reject
   source?: string;          // config, user_permanent, user_temporary, user_abort, user_reject
   tool_parameters?: string; // JSON string with tool-specific params
+  // Provenance: 'live' (OTLP-received, default) or 'backfill' (JSONL-reconstructed).
+  provenance?: 'live' | 'backfill';
 }
 
 export interface DailyMetrics {

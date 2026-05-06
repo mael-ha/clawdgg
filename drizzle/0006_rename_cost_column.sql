@@ -1,3 +1,4 @@
--- Rename misleading column: total_cost_usd stores CENTS, not USD
--- SQLite 3.25+ supports ALTER TABLE RENAME COLUMN
-ALTER TABLE `users` RENAME COLUMN `total_cost_usd` TO `total_cost_cents`;
+-- No-op: the column total_cost_cents already exists on production via
+-- out-of-band ALTER TABLE work; the original total_cost_usd column never
+-- existed in prod. Kept for journal continuity so drizzle's migration
+-- ordering stays consistent with the file system.

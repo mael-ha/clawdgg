@@ -1,5 +1,8 @@
 import type { Context } from 'hono';
 import { setCookie, getCookie, deleteCookie } from 'hono/cookie';
+import { eq, sql } from 'drizzle-orm';
+import { db } from '../db';
+import { users } from '../db/schema';
 import type { SessionUser } from '../types';
 
 const SESSION_COOKIE_NAME = 'session';
@@ -95,35 +98,69 @@ export function destroySession(c: Context): void {
   });
 }
 
-// Token expiry: 30 days
-const TOKEN_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
-
-// Create a bearer token for API access (CLI auth)
+// Issue a fresh CLI bearer token. Rotates users.token_gen so every prior
+// token for this user is immediately invalid (verifyBearerToken rejects on
+// gen mismatch). Tokens carry no `exp` — they're valid until rotated.
+//
+// The OTel SDK has no refresh hook, so the OTEL_EXPORTER_OTLP_HEADERS value
+// must remain valid for the lifetime of the Claude Code process. Long-lived
+// + revocable beats short-lived + auto-refresh-daemon for this use case.
 export async function createBearerToken(userId: string): Promise<string> {
+  const result = await db
+    .update(users)
+    .set({ tokenGen: sql`${users.tokenGen} + 1` })
+    .where(eq(users.id, userId))
+    .returning({ gen: users.tokenGen });
+
+  if (result.length === 0) {
+    throw new Error(`Cannot issue bearer token: user ${userId} not found`);
+  }
+
+  const gen = result[0]!.gen;
   const iat = Date.now();
-  const exp = iat + TOKEN_MAX_AGE_MS;
-  const payload = JSON.stringify({ userId, iat, exp });
+  const payload = JSON.stringify({ userId, iat, gen });
   return sign(payload);
 }
 
-// Verify a bearer token and return the user ID
-// Returns null if token is invalid, expired, or malformed
+// Verify a bearer token and return the user ID, or null if rejected.
+// Reject conditions: malformed payload, bad HMAC signature, missing gen
+// claim, gen mismatch with users.token_gen, or (legacy) exp in the past.
 export async function verifyBearerToken(token: string): Promise<string | null> {
   const payload = await unsign(token);
   if (!payload) return null;
 
+  let userId: string | null = null;
+  let gen: number | null = null;
+  let exp: number | null = null;
+
   try {
-    const { userId, exp } = JSON.parse(payload);
-
-    // Check expiry (if exp exists - old tokens without exp still work temporarily)
-    if (exp && Date.now() > exp) {
-      return null; // Token expired
-    }
-
-    return userId || null;
+    const parsed = JSON.parse(payload);
+    userId = typeof parsed.userId === 'string' ? parsed.userId : null;
+    gen = typeof parsed.gen === 'number' ? parsed.gen : null;
+    exp = typeof parsed.exp === 'number' ? parsed.exp : null;
   } catch {
     return null;
   }
+
+  if (!userId) return null;
+
+  // Honor exp if present (lets us forward-validate hybrid tokens or future
+  // formats without weakening the check).
+  if (exp !== null && Date.now() > exp) return null;
+
+  // gen is mandatory in the new format. Pre-revocation legacy tokens
+  // (which were always exp-bound and have all expired by now) fall here.
+  if (gen === null) return null;
+
+  const row = await db
+    .select({ tokenGen: users.tokenGen })
+    .from(users)
+    .where(eq(users.id, userId))
+    .get();
+
+  if (!row || row.tokenGen !== gen) return null;
+
+  return userId;
 }
 
 // Export the session secret getter for other modules that need it
