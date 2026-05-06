@@ -36,6 +36,13 @@
       "when": 1766573828592,
       "tag": "0004_useful_shaman",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1766865325763,
+      "tag": "0005_majestic_maelstrom",
+      "breakpoints": true
     }
   ]
 }

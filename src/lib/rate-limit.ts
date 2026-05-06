@@ -7,7 +7,7 @@ const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
 
 // Configuration
 const WINDOW_MS = 60 * 1000; // 1 minute window
-const MAX_REQUESTS = 10; // 10 requests per minute
+const MAX_REQUESTS = 60; // 60 requests per minute (more generous for interactive charts)
 
 // Clean up expired entries periodically (every 5 minutes)
 setInterval(() => {

@@ -17,10 +17,25 @@ import {
   type DerivedMetrics,
   type PeakHourInfo
 } from '../lib/archetypes';
-import { TokenOrbit } from '../components/TokenOrbit';
+import { TokenBar } from '../components/TokenBar';
 import { ActivityRadar } from '../components/ActivityRadar';
+import { AnalyticsChart } from '../components/AnalyticsChart';
+import { LanguageChart } from '../components/LanguageChart';
+import { ToolkitChart } from '../components/ToolkitChart';
+import { TrustStyleComponent } from '../components/TrustStyle';
+import { EfficiencyMetrics } from '../components/EfficiencyMetrics';
 import type { SessionUser } from '../types';
-import { clickhouse, type TodayMetrics, type CacheStats } from '../db/clickhouse';
+import {
+  clickhouse,
+  type TodayMetrics,
+  type CacheStats,
+  type LanguageStats,
+  type ToolStats,
+  type TrustStyle,
+  type AgenticStats,
+  type TerminalStats,
+  type TodayMetricsEnhanced,
+} from '../db/clickhouse';
 
 type Variables = {
   user: SessionUser | null;
@@ -65,6 +80,18 @@ interface ContributionDay {
   date: string;
   count: number;
   level: 0 | 1 | 2 | 3 | 4;
+  // Rich data for enhanced tooltips (OTEL users)
+  tokens?: number;
+  linesAdded?: number;
+  linesRemoved?: number;
+  costUsd?: number;
+}
+
+// Format number for tooltip
+function formatTooltipNumber(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
+  return n.toString();
 }
 
 const ContributionGraph: FC<{ days: ContributionDay[] }> = ({ days }) => {
@@ -108,8 +135,30 @@ const ContributionGraph: FC<{ days: ContributionDay[] }> = ({ days }) => {
 
   const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
+  // Build data attributes for rich tooltip
+  const buildDataAttrs = (day: ContributionDay) => {
+    if (!day.date) return {};
+    const attrs: Record<string, string> = {
+      'data-date': day.date,
+      'data-count': String(day.count),
+    };
+    // Always include rich data when available (for both OTEL and legacy days)
+    if (day.tokens !== undefined) attrs['data-tokens'] = String(day.tokens);
+    if (day.linesAdded !== undefined) attrs['data-lines-added'] = String(day.linesAdded);
+    if (day.linesRemoved !== undefined) attrs['data-lines-removed'] = String(day.linesRemoved);
+    if (day.costUsd !== undefined) attrs['data-cost'] = String(day.costUsd);
+    return attrs;
+  };
+
   return (
-    <div class="overflow-x-auto">
+    <div class="overflow-x-auto relative" id="contribution-graph-container">
+      {/* Custom tooltip */}
+      <div
+        id="contrib-tooltip"
+        class="absolute z-50 hidden px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg shadow-xl text-xs font-mono pointer-events-none"
+        style="transform: translateX(-50%);"
+      />
+
       <div class="inline-block min-w-max">
         <div class="flex mb-1 ml-8">
           {weeks.map((week, i) => {
@@ -138,8 +187,8 @@ const ContributionGraph: FC<{ days: ContributionDay[] }> = ({ days }) => {
               {week.map((day, dayIdx) => (
                 <div
                   key={dayIdx}
-                  class={`w-[10px] h-[10px] rounded-sm ${day.date ? levelColors[day.level] : 'bg-transparent'} ${day.date ? 'hover:ring-1 hover:ring-gray-600 transition-all' : ''}`}
-                  title={day.date ? `${day.date}: ${day.count} messages` : ''}
+                  class={`contrib-cell w-[10px] h-[10px] rounded-sm ${day.date ? levelColors[day.level] : 'bg-transparent'} ${day.date ? 'cursor-pointer hover:ring-1 hover:ring-gray-600 transition-all' : ''}`}
+                  {...buildDataAttrs(day)}
                 />
               ))}
             </div>
@@ -153,6 +202,78 @@ const ContributionGraph: FC<{ days: ContributionDay[] }> = ({ days }) => {
           <span>More</span>
         </div>
       </div>
+
+      {/* Tooltip script */}
+      <script dangerouslySetInnerHTML={{
+        __html: `
+          (function() {
+            const container = document.getElementById('contribution-graph-container');
+            const tooltip = document.getElementById('contrib-tooltip');
+            if (!container || !tooltip) return;
+
+            function formatNum(n) {
+              n = parseInt(n, 10) || 0;
+              if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+              if (n >= 1000) return Math.round(n / 1000) + 'K';
+              return n.toString();
+            }
+
+            function formatDate(dateStr) {
+              const d = new Date(dateStr);
+              const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+              return months[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear();
+            }
+
+            container.addEventListener('mouseover', function(e) {
+              const cell = e.target.closest('.contrib-cell');
+              if (!cell || !cell.dataset.date) return;
+
+              const date = cell.dataset.date;
+              const count = parseInt(cell.dataset.count, 10) || 0;
+              const tokens = cell.dataset.tokens;
+              const linesAdded = cell.dataset.linesAdded;
+              const linesRemoved = cell.dataset.linesRemoved;
+              const cost = cell.dataset.cost;
+
+              let html = '<div class="text-gray-300 mb-1">' + formatDate(date) + '</div>';
+              html += '<div class="border-t border-gray-700 pt-1 mt-1 space-y-0.5">';
+              html += '<div class="text-white">' + count + ' prompts</div>';
+
+              if (tokens !== undefined) {
+                html += '<div class="text-cyan-400">' + formatNum(tokens) + ' tokens</div>';
+              }
+              if (linesAdded !== undefined || linesRemoved !== undefined) {
+                const added = parseInt(linesAdded, 10) || 0;
+                const removed = parseInt(linesRemoved, 10) || 0;
+                // Show +/- format for OTEL data, just + for legacy (no removed tracking)
+                if (linesRemoved !== undefined) {
+                  html += '<div><span class="text-green-400">+' + formatNum(added) + '</span> / <span class="text-red-400">-' + formatNum(removed) + '</span> lines</div>';
+                } else {
+                  html += '<div><span class="text-green-400">+' + formatNum(added) + ' lines</span></div>';
+                }
+              }
+              if (cost !== undefined) {
+                const costVal = parseFloat(cost) || 0;
+                html += '<div class="text-amber-400">$' + (costVal >= 1 ? costVal.toFixed(0) : costVal.toFixed(2)) + '</div>';
+              }
+              html += '</div>';
+
+              tooltip.innerHTML = html;
+              tooltip.classList.remove('hidden');
+
+              const rect = cell.getBoundingClientRect();
+              const containerRect = container.getBoundingClientRect();
+              tooltip.style.left = (rect.left - containerRect.left + rect.width / 2) + 'px';
+              tooltip.style.top = (rect.top - containerRect.top - tooltip.offsetHeight - 8) + 'px';
+            });
+
+            container.addEventListener('mouseout', function(e) {
+              if (!e.target.closest('.contrib-cell')) return;
+              tooltip.classList.add('hidden');
+            });
+          })();
+        `
+      }} />
     </div>
   );
 };
@@ -308,6 +429,13 @@ interface ProfileProps {
   todayMetrics: TodayMetrics | null;
   cacheStats: CacheStats | null;
   isOtelEnabled: boolean;
+  // NEW: Profile Signature data
+  languageStats: LanguageStats[];
+  toolStats: ToolStats[];
+  trustStyle: TrustStyle | null;
+  agenticStats: AgenticStats | null;
+  terminalStats: TerminalStats[];
+  todayEnhanced: TodayMetricsEnhanced | null;
 }
 
 const Profile: FC<ProfileProps> = ({
@@ -320,6 +448,12 @@ const Profile: FC<ProfileProps> = ({
   todayMetrics,
   cacheStats,
   isOtelEnabled,
+  languageStats,
+  toolStats,
+  trustStyle,
+  agenticStats,
+  terminalStats,
+  todayEnhanced,
 }) => {
   const isOwnProfile = currentUser?.githubUsername === profile.username;
   const memberSince = profile.firstSessionDate
@@ -417,9 +551,20 @@ clawd.gg/u/${profile.username}`;
             </div>
             <div class="mt-4">
               <div class="text-white font-mono text-lg">@{profile.username}</div>
-              {memberSince && (
-                <div class="text-gray-600 text-xs font-mono mt-1">since {memberSince}</div>
-              )}
+              <div class="flex items-center justify-center gap-2 mt-1">
+                {memberSince && (
+                  <span class="text-gray-600 text-xs font-mono">since {memberSince}</span>
+                )}
+                {terminalStats[0] && (
+                  <>
+                    <span class="text-gray-700">•</span>
+                    <span class="text-gray-500 text-xs font-mono flex items-center gap-1">
+                      <span>⌨️</span>
+                      <span>{terminalStats[0].terminalType}</span>
+                    </span>
+                  </>
+                )}
+              </div>
             </div>
           </div>
 
@@ -443,8 +588,17 @@ clawd.gg/u/${profile.username}`;
             <div class="text-gray-600 text-sm font-mono mt-2 tracking-widest uppercase">invested in claude</div>
           </div>
 
-          {/* Rank and percentile */}
-          <div class="flex items-center justify-center gap-6 text-sm">
+          {/* Rank, active hours, and percentile */}
+          <div class="flex items-center justify-center gap-4 sm:gap-6 text-sm flex-wrap">
+            {profile.totalActiveSeconds > 0 && (
+              <>
+                <div class="flex items-center gap-2">
+                  <span class="text-gray-600 font-mono">active</span>
+                  <span class="text-white font-mono font-bold">{formatHours(profile.totalActiveSeconds)}</span>
+                </div>
+                <div class="w-px h-4 bg-gray-800 hidden sm:block" />
+              </>
+            )}
             <div class="flex items-center gap-2">
               <span class="text-gray-600 font-mono">rank</span>
               <span class="text-white font-mono font-bold">#{profile.rank.toLocaleString()}</span>
@@ -463,34 +617,110 @@ clawd.gg/u/${profile.username}`;
         </div>
 
         {/* ════════════════════════════════════════════════════════════════════
+            ANALYTICS CHART - Flexible metrics explorer
+            Shown to all users viewing their own profile (supports OTEL + legacy data)
+            ════════════════════════════════════════════════════════════════════ */}
+        {isOwnProfile && (
+          <section class="mb-16">
+            <h2 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-6 font-mono flex items-center gap-2">
+              <span class="w-2 h-2 bg-cyan-500 rounded-full animate-pulse" />
+              Analytics
+            </h2>
+            <div class="p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
+              <AnalyticsChart userId={profile.username} />
+            </div>
+          </section>
+        )}
+
+        {/* ════════════════════════════════════════════════════════════════════
+            YOUR SIGNATURE - Identity-revealing insights (OTEL users only)
+            ════════════════════════════════════════════════════════════════════ */}
+        {isOwnProfile && isOtelEnabled && (languageStats.length > 0 || toolStats.length > 0 || trustStyle) && (
+          <section class="mb-16">
+            <h2 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-6 font-mono flex items-center gap-2">
+              <span class="w-2 h-2 rounded-full" style="background: linear-gradient(135deg, #22d3ee, #a855f7);" />
+              Your Signature
+            </h2>
+
+            {/* Languages - Full width card */}
+            {languageStats.length > 0 && (
+              <div class="mb-8 p-4 sm:p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
+                <h3 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-4 sm:mb-6 font-mono flex items-center gap-2">
+                  <span class="w-2 h-2 bg-blue-500 rounded-full" />
+                  Languages You Build With
+                </h3>
+                <LanguageChart languages={languageStats} />
+              </div>
+            )}
+
+            {/* Toolkit + Trust - Two columns */}
+            <div class="grid md:grid-cols-2 gap-8">
+              {toolStats.length > 0 && (
+                <div class="p-4 sm:p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
+                  <h3 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-4 sm:mb-6 font-mono flex items-center gap-2">
+                    <span class="w-2 h-2 bg-amber-500 rounded-full" />
+                    Your Toolkit
+                  </h3>
+                  <ToolkitChart tools={toolStats} />
+                </div>
+              )}
+              {trustStyle && (
+                <div class="p-4 sm:p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
+                  <h3 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-4 sm:mb-6 font-mono flex items-center gap-2">
+                    <span class="w-2 h-2 bg-green-500 rounded-full" />
+                    Your Trust Style
+                  </h3>
+                  <TrustStyleComponent trustStyle={trustStyle} />
+                </div>
+              )}
+            </div>
+          </section>
+        )}
+
+        {/* ════════════════════════════════════════════════════════════════════
             RADAR DISPLAYS - The cockpit instruments
             ════════════════════════════════════════════════════════════════════ */}
         {(hasTokenData || hasHourData) && (
           <div class="grid md:grid-cols-2 gap-8 mb-16">
-            {/* Token Orbit */}
-            {hasTokenData && (
-              <div class="p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
-                <h2 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-6 font-mono flex items-center gap-2">
+            {/* Activity Radar */}
+            {hasHourData && profile.hourCounts && (
+              <div class="p-4 sm:p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
+                <h2 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-4 sm:mb-6 font-mono flex items-center gap-2">
+                  <span class="w-2 h-2 bg-purple-500 rounded-full animate-pulse" />
+                  Activity Patterns
+                </h2>
+                <ActivityRadar hourCounts={profile.hourCounts} />
+              </div>
+            )}
+
+            {/* Efficiency Metrics (OTEL) or Token Orbit (legacy) */}
+            {isOtelEnabled && agenticStats ? (
+              <div class="p-4 sm:p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
+                <h2 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-4 sm:mb-6 font-mono flex items-center gap-2">
+                  <span class="w-2 h-2 bg-cyan-500 rounded-full animate-pulse" />
+                  Efficiency
+                </h2>
+                <EfficiencyMetrics
+                  agenticStats={agenticStats}
+                  cacheStats={cacheStats}
+                  totalOutputTokens={profile.totalOutputTokens}
+                  totalInputTokens={profile.totalInputTokens}
+                  totalLinesAdded={profile.totalLinesWritten}
+                  totalCostUsd={profile.totalCostCents / 100}
+                />
+              </div>
+            ) : hasTokenData && (
+              <div class="p-4 sm:p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
+                <h2 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-4 sm:mb-6 font-mono flex items-center gap-2">
                   <span class="w-2 h-2 bg-cyan-500 rounded-full animate-pulse" />
                   Token Flow
                 </h2>
-                <TokenOrbit
+                <TokenBar
                   inputTokens={profile.totalInputTokens}
                   outputTokens={profile.totalOutputTokens}
                   cacheReadTokens={profile.totalCacheReadTokens}
                   cacheCreationTokens={profile.totalCacheCreationTokens}
                 />
-              </div>
-            )}
-
-            {/* Activity Radar */}
-            {hasHourData && profile.hourCounts && (
-              <div class="p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
-                <h2 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-6 font-mono flex items-center gap-2">
-                  <span class="w-2 h-2 bg-purple-500 rounded-full animate-pulse" />
-                  Activity Patterns
-                </h2>
-                <ActivityRadar hourCounts={profile.hourCounts} />
               </div>
             )}
           </div>
@@ -500,9 +730,12 @@ clawd.gg/u/${profile.username}`;
             METRICS GRID - Quick stats with terminal aesthetic
             ════════════════════════════════════════════════════════════════════ */}
         <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-16">
-          <div class="p-4 bg-gray-950/30 border border-gray-800/30 rounded-xl text-center">
+          <div class="p-4 bg-gray-950/30 border border-gray-800/30 rounded-xl text-center group relative">
             <div class="text-2xl font-bold text-white font-mono">{formatTokens(profile.totalTokens)}</div>
-            <div class="text-gray-600 text-xs font-mono mt-1">tokens</div>
+            <div class="text-gray-600 text-xs font-mono mt-1">I/O tokens</div>
+            <div class="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 bg-gray-900 border border-gray-700 rounded text-xs text-gray-400 whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+              Input + Output (excludes cache)
+            </div>
           </div>
           <div class="p-4 bg-gray-950/30 border border-gray-800/30 rounded-xl text-center">
             <div class="text-2xl font-bold text-white font-mono">{formatTokens(profile.totalLinesWritten)}</div>
@@ -572,9 +805,7 @@ clawd.gg/u/${profile.username}`;
               <div class="text-center">
                 <div class="text-2xl font-bold text-gray-300 font-mono">
                   {contributions.filter(d => d.count > 0).length}
-                  {totalDaysSinceStart && (
-                    <span class="text-gray-600 text-lg">/{totalDaysSinceStart}</span>
-                  )}
+                  <span class="text-gray-600 text-lg">/365</span>
                 </div>
                 <div class="text-gray-600 text-xs font-mono">active days</div>
               </div>
@@ -700,7 +931,7 @@ app.get('/:username', async (c) => {
     totalOutputTokens = userData.totalOutputTokens ?? 0;
     totalCacheReadTokens = userData.totalCacheReadTokens ?? 0;
     totalCacheCreationTokens = userData.totalCacheCreationTokens ?? 0;
-    totalCostCents = userData.totalCostUsd ?? 0;
+    totalCostCents = userData.totalCostCents ?? 0;
     totalActiveSeconds = userData.totalActiveSeconds ?? 0;
     totalMessages = totalPrompts;
     // Tool calls: OTEL + legacy (query ClickHouse for fresh count)
@@ -745,34 +976,59 @@ app.get('/:username', async (c) => {
     .select({
       date: dailyStats.date,
       count: dailyStats.promptCount,
+      // Rich data from V2 schema (may be 0 for older data)
+      inputTokens: dailyStats.inputTokens,
+      outputTokens: dailyStats.outputTokens,
+      linesWritten: dailyStats.linesWritten,
+      costUsdCents: dailyStats.costUsdCents,
     })
     .from(dailyStats)
     .where(eq(dailyStats.userId, userData.id))
     .orderBy(asc(dailyStats.date));
 
-  // Build merged daily activity map
-  const activityMap = new Map<string, number>();
+  // Build merged daily activity map with optional rich data
+  interface DailyData {
+    count: number;
+    tokens?: number;
+    linesAdded?: number;
+    linesRemoved?: number;
+    costUsd?: number;
+  }
+  const activityMap = new Map<string, DailyData>();
   for (const day of legacyActivity) {
-    activityMap.set(day.date, day.count);
+    const tokens = (day.inputTokens || 0) + (day.outputTokens || 0);
+    activityMap.set(day.date, {
+      count: day.count,
+      // Only include rich data if we have it (V2 schema)
+      tokens: tokens > 0 ? tokens : undefined,
+      linesAdded: day.linesWritten > 0 ? day.linesWritten : undefined,
+      // Legacy doesn't track removed lines separately
+      linesRemoved: undefined,
+      costUsd: day.costUsdCents > 0 ? day.costUsdCents / 100 : undefined,
+    });
   }
 
-  // For OTEL users, fetch and merge ClickHouse data
+  // For OTEL users, fetch and merge ClickHouse data with rich metrics
   if (isOtelUser) {
     const otelDaily = await clickhouse.getUserDailyMetrics(userData.id, 365);
     for (const day of otelDaily) {
-      // Use actual prompt count from prompt_stats_daily (joined in query)
       const otelCount = day.prompts || 0;
-      if (otelCount > 0) {
-        const existing = activityMap.get(day.date) || 0;
-        // For overlapping dates (rare, only on OTEL enable day), take max
-        activityMap.set(day.date, Math.max(existing, otelCount));
+      if (otelCount > 0 || day.input_tokens > 0) {
+        const existing = activityMap.get(day.date);
+        activityMap.set(day.date, {
+          count: Math.max(existing?.count || 0, otelCount),
+          tokens: (day.input_tokens || 0) + (day.output_tokens || 0),
+          linesAdded: day.lines_added || 0,
+          linesRemoved: day.lines_removed || 0,
+          costUsd: day.cost_usd || 0,
+        });
       }
     }
   }
 
   // Convert map to sorted array
   const dailyActivity = Array.from(activityMap.entries())
-    .map(([date, count]) => ({ date, count }))
+    .map(([date, data]) => ({ date, ...data }))
     .sort((a, b) => a.date.localeCompare(b.date));
 
   // Calculate contribution levels
@@ -786,7 +1042,15 @@ app.get('/:username', async (c) => {
       else if (ratio >= 0.25) level = 2;
       else level = 1;
     }
-    return { date: d.date, count: d.count, level };
+    return {
+      date: d.date,
+      count: d.count,
+      level,
+      tokens: d.tokens,
+      linesAdded: d.linesAdded,
+      linesRemoved: d.linesRemoved,
+      costUsd: d.costUsd,
+    };
   });
 
   // Get user rank
@@ -852,16 +1116,35 @@ app.get('/:username', async (c) => {
   const isOwnProfile = currentUser?.githubUsername === username;
   let todayMetrics: TodayMetrics | null = null;
   let cacheStats: CacheStats | null = null;
+  // NEW: Profile Signature data
+  let languageStats: LanguageStats[] = [];
+  let toolStats: ToolStats[] = [];
+  let trustStyle: TrustStyle | null = null;
+  let agenticStats: AgenticStats | null = null;
+  let terminalStats: TerminalStats[] = [];
+  let todayEnhanced: TodayMetricsEnhanced | null = null;
 
   if (isOwnProfile && isOtelUser) {
     try {
-      // Fetch today's real-time metrics and cache stats in parallel
-      const [todayResult, cacheResult] = await Promise.all([
+      // Fetch all OTEL data in parallel
+      const [todayResult, cacheResult, langResult, toolResult, trustResult, agenticResult, terminalResult, todayEnhResult] = await Promise.all([
         clickhouse.getUserTodayMetrics(userData.id),
         clickhouse.getUserCacheStats(userData.id),
+        clickhouse.getUserLanguageStats(userData.id),
+        clickhouse.getUserToolBreakdown(userData.id),
+        clickhouse.getUserTrustStyle(userData.id),
+        clickhouse.getUserAgenticStats(userData.id),
+        clickhouse.getUserTerminalStats(userData.id),
+        clickhouse.getUserTodayMetricsEnhanced(userData.id),
       ]);
       todayMetrics = todayResult;
       cacheStats = cacheResult;
+      languageStats = langResult;
+      toolStats = toolResult;
+      trustStyle = trustResult;
+      agenticStats = agenticResult;
+      terminalStats = terminalResult;
+      todayEnhanced = todayEnhResult;
     } catch (error) {
       console.error('Error fetching OTEL data:', error);
       // Continue without OTEL data
@@ -904,6 +1187,12 @@ app.get('/:username', async (c) => {
         todayMetrics={todayMetrics}
         cacheStats={cacheStats}
         isOtelEnabled={isOtelUser}
+        languageStats={languageStats}
+        toolStats={toolStats}
+        trustStyle={trustStyle}
+        agenticStats={agenticStats}
+        terminalStats={terminalStats}
+        todayEnhanced={todayEnhanced}
       />
     </Layout>
   );

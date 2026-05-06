@@ -104,7 +104,7 @@ async function getUserHourlyCounts(userId: string): Promise<Record<string, numbe
         COUNT(*) as count
       FROM events_raw FINAL
       WHERE user_id = {userId:String}
-        AND event_name = 'claude_code.api_request'
+        AND event_name = 'claude_code.user_prompt'
       GROUP BY hour
       `,
       { userId }
@@ -135,7 +135,7 @@ async function getLongestSessionMessages(userId: string): Promise<number> {
         SELECT session_id, COUNT(*) as prompt_count
         FROM events_raw FINAL
         WHERE user_id = {userId:String}
-          AND event_name = 'claude_code.api_request'
+          AND event_name = 'claude_code.user_prompt'
         GROUP BY session_id
       )
       `,
@@ -190,6 +190,8 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         legacyOutputTokens: users.legacyTotalOutputTokens,
         legacyCacheReadTokens: users.legacyTotalCacheReadTokens,
         legacyCacheCreationTokens: users.legacyTotalCacheCreationTokens,
+        // Legacy hourCounts (frozen at OTEL enable time)
+        legacyHourCounts: users.legacyHourCounts,
         // Current values (may have been set by CLI sync - preserve if OTEL has no data)
         currentHourCounts: users.hourCounts,
         currentLongestSession: users.longestSessionMessages,
@@ -224,6 +226,8 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         legacyOutputTokens = 0,
         legacyCacheReadTokens = 0,
         legacyCacheCreationTokens = 0,
+        // Legacy hourCounts (frozen at OTEL enable time)
+        legacyHourCounts,
         // Current values from CLI sync (preserve if OTEL has no data)
         currentHourCounts,
         currentLongestSession = 0,
@@ -290,22 +294,21 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         const otelToolCalls = await clickhouse.getUserTotalToolCalls(userId);
 
         // ═══════════════════════════════════════════════════════════════════════
-        // CRITICAL: Preserve CLI-synced data when OTEL has no data
-        // This ensures data integrity during the transition period
+        // CRITICAL: Use legacyHourCounts (frozen at OTEL enable) + fresh OTEL data
+        // DO NOT use currentHourCounts - it gets corrupted by repeated additions
         // ═══════════════════════════════════════════════════════════════════════
 
-        // Parse existing hourCounts from SQLite (set by CLI sync)
-        let existingHourCounts: Record<string, number> = {};
+        // Parse legacy hourCounts (frozen at OTEL enable time)
+        let parsedLegacyHourCounts: Record<string, number> = {};
         try {
-          existingHourCounts = currentHourCounts ? JSON.parse(currentHourCounts) : {};
+          parsedLegacyHourCounts = legacyHourCounts ? JSON.parse(legacyHourCounts) : {};
         } catch {
-          existingHourCounts = {};
+          parsedLegacyHourCounts = {};
         }
-        const hasExistingHourCounts = Object.keys(existingHourCounts).length > 0;
 
-        // Merge hourCounts: SUM by hour (historical CLI + recent OTEL)
-        // This preserves complete activity patterns across the transition
-        const finalHourCounts: Record<string, number> = { ...existingHourCounts };
+        // Merge hourCounts: legacy (frozen) + OTEL (fresh from ClickHouse)
+        // This correctly combines pre-OTEL CLI data with post-OTEL data
+        const finalHourCounts: Record<string, number> = { ...parsedLegacyHourCounts };
         for (const [hour, count] of Object.entries(otelHourCounts)) {
           finalHourCounts[hour] = (finalHourCounts[hour] || 0) + count;
         }
@@ -362,7 +365,7 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
           // COMBINED totals (OTEL from ClickHouse + legacy snapshot)
           totalPrompts: combinedPrompts,
           totalTokens: combinedTokens,
-          totalCostUsd: combinedCostCents,
+          totalCostCents: combinedCostCents,
           totalLinesAdded: combinedLines,
           totalCommits: combinedCommits,
           totalPrs: Math.round(userTotals.total_prs), // No legacy PRs tracked

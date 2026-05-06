@@ -136,6 +136,9 @@ export const Layout: FC<LayoutProps> = ({ children, title = 'clawd.gg', user }) 
       {/* HTMX */}
       <script src="https://unpkg.com/htmx.org@1.9.10"></script>
 
+      {/* Chart.js for analytics charts */}
+      <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
       {/* Custom Styles */}
       <link rel="stylesheet" href="/public/styles.css" />
     </head>

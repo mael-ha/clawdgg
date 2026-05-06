@@ -190,6 +190,9 @@ function parseOtlpMetrics(body: OtlpMetricsRequest, userId: string): MetricRow[]
           // Extract type attribute (used for both token_type and line_type)
           const typeAttr = safeString(getAttr(dpAttrs, 'type'), 100);
 
+          // Extract code_edit_tool.decision specific attributes
+          const isCodeEditDecision = metricName.includes('code_edit_tool.decision');
+
           metrics.push({
             timestamp: parseTimestamp(dp.timeUnixNano),
             user_id: userId,
@@ -202,6 +205,10 @@ function parseOtlpMetrics(body: OtlpMetricsRequest, userId: string): MetricRow[]
             terminal_type: terminalType,
             app_version: appVersion,
             account_uuid: accountUuid,
+            // code_edit_tool.decision attributes
+            tool: isCodeEditDecision ? safeString(getAttr(dpAttrs, 'tool'), 50) : '',
+            decision: isCodeEditDecision ? safeString(getAttr(dpAttrs, 'decision'), 20) : '',
+            language: isCodeEditDecision ? safeString(getAttr(dpAttrs, 'language'), 50) : '',
           });
         }
       }
@@ -271,6 +278,10 @@ function parseOtlpEvents(body: OtlpLogsRequest, userId: string): EventRow[] {
           error_message: safeString(getAttr(attrs, 'error'), 2000), // Longer for error messages
           status_code: safeNumber(getAttr(attrs, 'status_code'), 0, 999),
           duration_ms: safeNumber(getAttr(attrs, 'duration_ms'), 0, 3600000), // Max 1 hour
+          // tool_result / tool_decision attributes
+          decision: safeString(getAttr(attrs, 'decision'), 20),      // accept, reject
+          source: safeString(getAttr(attrs, 'source'), 50),          // config, user_permanent, etc.
+          tool_parameters: safeString(getAttr(attrs, 'tool_parameters'), 5000), // JSON string
         });
       }
     }

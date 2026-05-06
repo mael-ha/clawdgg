@@ -89,15 +89,15 @@ export const TokenOrbit: FC<TokenOrbitProps> = ({
 
   return (
     <div class="relative">
-      {/* Main orbital display */}
-      <div class="flex items-start gap-8">
-        {/* SVG Orbit visualization */}
+      {/* Main orbital display - stacks vertically on mobile */}
+      <div class="flex flex-col lg:flex-row items-center lg:items-start gap-4 lg:gap-8">
+        {/* SVG Orbit visualization - scales down on mobile */}
         <div class="relative flex-shrink-0">
           <svg
             width={size}
             height={size}
             viewBox={`0 0 ${size} ${size}`}
-            class="orbit-container"
+            class="orbit-container w-[220px] h-[220px] sm:w-[280px] sm:h-[280px]"
           >
             {/* Definitions for glow effects */}
             <defs>
@@ -193,7 +193,7 @@ export const TokenOrbit: FC<TokenOrbitProps> = ({
         </div>
 
         {/* Legend and stats */}
-        <div class="flex-1 space-y-4 pt-2">
+        <div class="w-full lg:flex-1 space-y-4 pt-2">
           {/* Token type legend */}
           <div class="space-y-3">
             {sorted.map(([key, value]) => {
@@ -209,12 +209,12 @@ export const TokenOrbit: FC<TokenOrbitProps> = ({
                     />
                   </div>
                   {/* Label and value */}
-                  <div class="flex-1 flex items-baseline justify-between">
+                  <div class="flex-1 flex flex-col sm:flex-row sm:items-baseline sm:justify-between gap-1 sm:gap-0">
                     <div>
                       <span class="text-gray-400 text-xs font-mono tracking-wider">{config.label}</span>
-                      <span class="text-gray-600 text-xs ml-2">{config.description}</span>
+                      <span class="text-gray-600 text-xs ml-2 hidden sm:inline">{config.description}</span>
                     </div>
-                    <div class="text-right">
+                    <div class="sm:text-right">
                       <span class="text-white font-mono text-sm">{formatTokens(value)}</span>
                       <span class="text-gray-500 text-xs ml-2">{percentage}%</span>
                     </div>

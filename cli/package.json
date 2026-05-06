@@ -1,10 +1,11 @@
 {
   "name": "clawdgg",
   "version": "1.0.0",
-  "description": "CLI tool for syncing Claude Code stats to clawd.gg",
+  "description": "Track your Claude Code usage - leaderboard, stats, and real-time streaming",
   "type": "module",
   "bin": {
-    "clawd": "./index.ts"
+    "clawd": "./index.ts",
+    "clawdgg": "./index.ts"
   },
   "scripts": {
     "build": "bun build ./index.ts --outdir ./dist --target node",
@@ -12,11 +13,32 @@
   },
   "keywords": [
     "claude",
+    "claude-code",
+    "anthropic",
+    "ai",
     "stats",
-    "cli"
+    "leaderboard",
+    "cli",
+    "telemetry",
+    "otel"
   ],
-  "author": "",
+  "author": "clawd.gg",
   "license": "MIT",
+  "homepage": "https://clawd.gg",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mael-ha/clawdgg"
+  },
+  "bugs": {
+    "url": "https://github.com/mael-ha/clawdgg/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "index.ts",
+    "README.md"
+  ],
   "dependencies": {},
   "devDependencies": {
     "@types/node": "^20.10.0",

@@ -9,47 +9,40 @@ import { computeBadges, formatBadgesCompact, type BadgeInput } from '../lib/badg
 const api = new Hono();
 
 // Helper to calculate streak from sorted dates
+// Uses day-numbers (integer days since epoch) for reliable calculation
+// avoiding timezone/DST edge cases with millisecond division
 function calculateStreaks(dates: string[]): { currentStreak: number; longestStreak: number } {
   if (dates.length === 0) return { currentStreak: 0, longestStreak: 0 };
 
-  const today = new Date().toISOString().split('T')[0]!;
-  const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0]!;
+  // Deduplicate and sort dates chronologically
+  const sorted = [...new Set(dates)].sort();
 
-  let currentStreak = 0;
-  let longestStreak = 0;
-  let streak = 1;
+  // Convert to day numbers (days since epoch) - more reliable than date string comparison
+  const MS_PER_DAY = 24 * 60 * 60 * 1000;
+  const dayNumbers = sorted.map((dateStr) => Math.floor(new Date(dateStr).getTime() / MS_PER_DAY));
 
-  // Check if the most recent date is today or yesterday (for current streak)
-  const lastDate = dates[dates.length - 1]!;
-  const isActive = lastDate === today || lastDate === yesterday;
+  // Calculate longest streak
+  let longestStreak = 1;
+  let currentRun = 1;
 
-  for (let i = 1; i < dates.length; i++) {
-    const prevDateStr = dates[i - 1]!;
-    const currDateStr = dates[i]!;
-    const prevDate = new Date(prevDateStr);
-    const currDate = new Date(currDateStr);
-    const diffDays = (currDate.getTime() - prevDate.getTime()) / 86400000;
-
-    if (diffDays === 1) {
-      streak++;
+  for (let i = 1; i < dayNumbers.length; i++) {
+    if (dayNumbers[i] === dayNumbers[i - 1]! + 1) {
+      currentRun++;
+      longestStreak = Math.max(longestStreak, currentRun);
     } else {
-      longestStreak = Math.max(longestStreak, streak);
-      streak = 1;
+      currentRun = 1;
     }
   }
-  longestStreak = Math.max(longestStreak, streak);
 
-  // Current streak: count backwards from today/yesterday
-  if (isActive) {
+  // Calculate current streak (must include today or yesterday)
+  const today = Math.floor(Date.now() / MS_PER_DAY);
+  const lastActiveDay = dayNumbers[dayNumbers.length - 1]!;
+
+  let currentStreak = 0;
+  if (lastActiveDay === today || lastActiveDay === today - 1) {
     currentStreak = 1;
-    for (let i = dates.length - 2; i >= 0; i--) {
-      const currDateStr = dates[i + 1]!;
-      const prevDateStr = dates[i]!;
-      const currDate = new Date(currDateStr);
-      const prevDate = new Date(prevDateStr);
-      const diffDays = (currDate.getTime() - prevDate.getTime()) / 86400000;
-
-      if (diffDays === 1) {
+    for (let i = dayNumbers.length - 2; i >= 0; i--) {
+      if (dayNumbers[i] === dayNumbers[i + 1]! - 1) {
         currentStreak++;
       } else {
         break;
@@ -347,7 +340,7 @@ api.get('/leaderboard', optionalAuth, async (c) => {
             ELSE COALESCE((SELECT SUM(commit_count) FROM daily_stats WHERE user_id = u.id), 0)
           END as commitCount,
           CASE
-            WHEN u.otel_enabled = 1 THEN u.total_cost_usd
+            WHEN u.otel_enabled = 1 THEN u.total_cost_cents
             ELSE COALESCE((SELECT SUM(cost_usd_cents) FROM daily_stats WHERE user_id = u.id), 0)
           END as costUsdCents,
           -- Legacy fields (for backward compat)
@@ -883,6 +876,13 @@ api.post('/otel/enable', requireAuth, async (c) => {
     // Get today's date as YYYY-MM-DD for the cutoff point
     const today = new Date().toISOString().split('T')[0]!;
 
+    // Get the user's current hourCounts before switching to OTEL
+    const existingUser = await db
+      .select({ hourCounts: users.hourCounts })
+      .from(users)
+      .where(eq(users.id, user.id))
+      .get();
+
     // CRITICAL: Snapshot all historical data from dailyStats
     // This preserves the user's complete history when transitioning to OTEL
     const legacyTotals = await db
@@ -926,6 +926,8 @@ api.post('/otel/enable', requireAuth, async (c) => {
         legacyTotalLinesAdded: legacy.linesAdded,
         legacyTotalCommits: legacy.commits,
         legacyTotalToolCalls: legacy.toolCalls,
+        // Snapshot hourCounts - preserves pre-OTEL activity patterns for badges
+        legacyHourCounts: existingUser?.hourCounts || null,
         updatedAt: new Date(),
       })
       .where(eq(users.id, user.id));
@@ -1043,7 +1045,7 @@ api.get('/me/insights', requireAuth, async (c) => {
         otelEnabled: users.otelEnabled,
         totalPrompts: users.totalPrompts,
         totalTokens: users.totalTokens,
-        totalCostUsd: users.totalCostUsd,
+        totalCostCents: users.totalCostCents,
         totalLinesAdded: users.totalLinesAdded,
         totalCommits: users.totalCommits,
         totalActiveSeconds: users.totalActiveSeconds,
@@ -1073,7 +1075,7 @@ api.get('/me/insights', requireAuth, async (c) => {
     ]);
 
     // Calculate ROI metrics
-    const totalCostDollars = (userData.totalCostUsd || 0) / 100;
+    const totalCostDollars = (userData.totalCostCents || 0) / 100;
     const totalLines = userData.totalLinesAdded || 0;
     const totalPrompts = userData.totalPrompts || 0;
 
@@ -1153,7 +1155,7 @@ api.get('/me/insights', requireAuth, async (c) => {
         legacyPrompts: userData.legacyPrompts || 0,
         legacyCostCents: userData.legacyCost || 0,
         otelPrompts: (userData.totalPrompts || 0) - (userData.legacyPrompts || 0),
-        otelCostCents: (userData.totalCostUsd || 0) - (userData.legacyCost || 0),
+        otelCostCents: (userData.totalCostCents || 0) - (userData.legacyCost || 0),
       },
     });
   } catch (error) {
@@ -1230,6 +1232,112 @@ api.get('/me/heatmap', requireAuth, async (c) => {
   } catch (error) {
     console.error('Error fetching heatmap:', error);
     return c.json({ error: 'Failed to fetch heatmap' }, 500);
+  }
+});
+
+// GET /api/me/chart - Flexible analytics chart data
+// Supports both OTEL (ClickHouse) and legacy (SQLite) data sources
+api.get('/me/chart', requireAuth, async (c) => {
+  try {
+    const user = c.get('user');
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const userData = await db
+      .select({
+        otelEnabled: users.otelEnabled,
+        otelSetupDate: users.otelSetupDate,
+      })
+      .from(users)
+      .where(eq(users.id, user.id))
+      .get();
+
+    // Parse query params
+    const metricParam = c.req.query('metric') || 'tokens';
+    const periodParam = c.req.query('period') || '30d';
+
+    // Validate metric
+    const validMetrics = ['tokens', 'cost', 'prompts', 'lines', 'commits'] as const;
+    type ChartMetric = typeof validMetrics[number];
+    const metric: ChartMetric = validMetrics.includes(metricParam as ChartMetric)
+      ? (metricParam as ChartMetric)
+      : 'tokens';
+
+    // Validate period
+    const validPeriods = ['1d', '7d', '30d', '90d', 'all'] as const;
+    type ChartPeriod = typeof validPeriods[number];
+    const period: ChartPeriod = validPeriods.includes(periodParam as ChartPeriod)
+      ? (periodParam as ChartPeriod)
+      : '30d';
+
+    const { clickhouse, getLegacyChartData, mergeChartData } = await import('../db/clickhouse');
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Case 1: Non-OTEL user requesting "Today" (hourly view)
+    // Hourly granularity requires OTEL - show friendly message
+    // ═══════════════════════════════════════════════════════════════════════
+    if (!userData?.otelEnabled && period === '1d') {
+      return c.json({
+        noData: true,
+        reason: 'otel_required',
+        message: 'Hourly breakdown requires OTEL telemetry',
+        action: 'Run clawd otel to enable',
+        fallbackPeriod: '7d',
+      });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Case 2: Non-OTEL user requesting daily data
+    // Use legacy SQLite data only
+    // ═══════════════════════════════════════════════════════════════════════
+    if (!userData?.otelEnabled) {
+      const legacyData = await getLegacyChartData(user.id, metric, period);
+      if (!legacyData) {
+        return c.json({
+          noData: true,
+          reason: 'no_data',
+          message: 'No data available for this period',
+        });
+      }
+      return c.json(legacyData);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Case 3: OTEL user - get ClickHouse data and optionally merge with legacy
+    // ═══════════════════════════════════════════════════════════════════════
+    const otelData = await clickhouse.getChartData(user.id, metric, period);
+
+    // For hourly view, no legacy data to merge
+    if (period === '1d') {
+      return c.json(otelData);
+    }
+
+    // Check if period extends before OTEL setup date
+    const otelSetupDate = userData.otelSetupDate;
+    if (otelSetupDate && period !== '1d') {
+      // Calculate the start date of the requested period
+      const days = period === '7d' ? 7 : period === '30d' ? 30 : period === '90d' ? 90 : 365 * 10;
+      const periodStartDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0]!;
+
+      // If period starts before OTEL setup, fetch and merge legacy data
+      if (periodStartDate < otelSetupDate) {
+        // Get legacy data for dates BEFORE otelSetupDate
+        const legacyData = await getLegacyChartData(user.id, metric, period, otelSetupDate);
+
+        if (legacyData && legacyData.labels.length > 0) {
+          // Merge legacy + OTEL data
+          const mergedData = mergeChartData(legacyData, otelData);
+          return c.json(mergedData);
+        }
+      }
+    }
+
+    // No legacy data to merge, return OTEL data as-is
+    return c.json(otelData);
+  } catch (error) {
+    console.error('Error fetching chart data:', error);
+    return c.json({ error: 'Failed to fetch chart data' }, 500);
   }
 });
 

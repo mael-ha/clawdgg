@@ -458,7 +458,7 @@ async function getLeaderboardData(period: Period, sort: SortKey, limit: number, 
       avatarUrl: users.avatarUrl,
       badges: users.badges,
       currentStreak: users.currentStreak,
-      totalCostUsd: users.totalCostUsd,
+      totalCostCents: users.totalCostCents,
       updatedAt: users.updatedAt,
       promptCount: sql<number>`sum(${dailyStats.promptCount})`.as('total_prompts'),
       tokenCount: sql<number>`sum(${dailyStats.tokenCount})`.as('total_tokens'),
@@ -471,7 +471,7 @@ async function getLeaderboardData(period: Period, sort: SortKey, limit: number, 
     .from(dailyStats)
     .innerJoin(users, eq(dailyStats.userId, users.id))
     .where(baseQuery)
-    .groupBy(users.id, users.githubUsername, users.avatarUrl, users.badges, users.currentStreak, users.totalCostUsd, users.updatedAt)
+    .groupBy(users.id, users.githubUsername, users.avatarUrl, users.badges, users.currentStreak, users.totalCostCents, users.updatedAt)
     .orderBy(desc(sql.raw(sortColumn)))
     .limit(limit)
     .offset(offset);
@@ -525,7 +525,7 @@ async function getLeaderboardData(period: Period, sort: SortKey, limit: number, 
       sessionCount: row.sessionCount || 0,
       badges,
       currentStreak: row.currentStreak || 0,
-      costUsdCents: row.totalCostUsd || 0,
+      costUsdCents: row.totalCostCents || 0,
       rankChange,
       lastActive: row.updatedAt ? new Date(row.updatedAt) : null,
     };

@@ -28,12 +28,18 @@ CREATE TABLE IF NOT EXISTS metrics_raw (
     model String DEFAULT '',
     token_type String DEFAULT '',
     line_type String DEFAULT '',
+    -- code_edit_tool.decision attributes
+    tool String DEFAULT '',       -- Edit, Write, NotebookEdit
+    decision String DEFAULT '',   -- accept, reject
+    language String DEFAULT '',   -- TypeScript, Python, etc.
     -- Resource attributes
     terminal_type String DEFAULT '',
     app_version String DEFAULT '',
     account_uuid String DEFAULT ''
 ) ENGINE = ReplacingMergeTree()
-ORDER BY (user_id, session_id, metric_name, token_type, timestamp)
+-- CRITICAL: line_type must be in ORDER BY to prevent deduplication of added/removed rows
+-- Note: session_id removed from ORDER BY for better query performance (not needed for dedup)
+ORDER BY (user_id, metric_name, token_type, line_type, timestamp)
 PARTITION BY toYYYYMM(timestamp)
 TTL toDateTime(timestamp) + INTERVAL 365 DAY
 SETTINGS index_granularity = 8192;
@@ -58,7 +64,11 @@ CREATE TABLE IF NOT EXISTS events_raw (
     cache_write_tokens UInt32 DEFAULT 0,
     error_message String DEFAULT '',
     status_code UInt16 DEFAULT 0,
-    duration_ms UInt32 DEFAULT 0
+    duration_ms UInt32 DEFAULT 0,
+    -- tool_result / tool_decision attributes
+    decision String DEFAULT '',        -- accept, reject
+    source String DEFAULT '',          -- config, user_permanent, user_temporary, user_abort, user_reject
+    tool_parameters String DEFAULT ''  -- JSON string with tool-specific params (bash_command, etc.)
 ) ENGINE = ReplacingMergeTree()
 ORDER BY (user_id, session_id, event_name, timestamp, tool_name)
 PARTITION BY toYYYYMM(timestamp)

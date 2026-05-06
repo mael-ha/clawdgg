@@ -1,0 +1,1 @@
+ALTER TABLE `users` ADD `legacy_hour_counts` text;

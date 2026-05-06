@@ -26,7 +26,7 @@ export const users = sqliteTable('users', {
   totalOutputTokens: integer('total_output_tokens').default(0),
   totalCacheReadTokens: integer('total_cache_read_tokens').default(0),
   totalCacheCreationTokens: integer('total_cache_creation_tokens').default(0),
-  totalCostUsd: integer('total_cost_usd').default(0),       // Stored as cents (multiply by 100)
+  totalCostCents: integer('total_cost_cents').default(0),   // Cost in cents (divide by 100 for USD)
   totalLinesAdded: integer('total_lines_added').default(0),
   totalCommits: integer('total_commits').default(0),
   totalPrs: integer('total_prs').default(0),
@@ -59,6 +59,7 @@ export const users = sqliteTable('users', {
   legacyTotalLinesAdded: integer('legacy_total_lines_added').default(0),
   legacyTotalCommits: integer('legacy_total_commits').default(0),
   legacyTotalToolCalls: integer('legacy_total_tool_calls').default(0),
+  legacyHourCounts: text('legacy_hour_counts'), // JSON: {"0": 5, "1": 2, ...} frozen at OTEL enable
 
   // Token management (extended to 1 year for OTel)
   tokenExpiresAt: integer('token_expires_at', { mode: 'timestamp' }),

@@ -33,7 +33,8 @@
     "typecheck": "bun tsc --noEmit",
     "bot": "bun bot/src/index.ts",
     "bot:dev": "bun --hot bot/src/index.ts",
-    "bot:daemon": "bun bot/src/index.ts --daemon"
+    "bot:daemon": "bun bot/src/index.ts --daemon",
+    "bot:oauth": "bun bot/scripts/oauth.ts"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

@@ -383,11 +383,19 @@ async function parseSessionFile(filepath: string): Promise<{
 
         // Count prompts (user messages only) and all messages
         // IMPORTANT: hourCounts only tracks USER messages to match Claude Code's peak hour calculation
+        // CRITICAL: Filter out tool_result messages - in Claude's API, tool outputs are sent as
+        // role="user" messages containing [{type: "tool_result", ...}]. These are NOT actual user prompts.
         if (role === 'user') {
-          dayStats.promptCount++;
+          const content = msg.content;
+          const isToolResult = Array.isArray(content) &&
+            content.some((item: any) => item && typeof item === 'object' && item.type === 'tool_result');
+
+          if (!isToolResult) {
+            dayStats.promptCount++;
+            hourCounts[hour] = (hourCounts[hour] || 0) + 1;  // Only count user prompts for peak hour
+          }
           dayStats.messageCount++;
           sessionMessages++;
-          hourCounts[hour] = (hourCounts[hour] || 0) + 1;  // Only count user prompts for peak hour
         } else if (role === 'assistant') {
           dayStats.messageCount++;
           sessionMessages++;
@@ -779,47 +787,40 @@ interface OfficialStreakData {
 }
 
 // Helper to calculate streak from sorted dates (same logic as server)
+// Uses day-numbers (integer days since epoch) for reliable calculation
+// avoiding timezone/DST edge cases with millisecond division
 function calculateStreaksFromDates(dates: string[]): { currentStreak: number; longestStreak: number } {
   if (dates.length === 0) return { currentStreak: 0, longestStreak: 0 };
 
-  const today = new Date().toISOString().split('T')[0]!;
-  const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0]!;
+  // Deduplicate and sort dates chronologically
+  const sorted = [...new Set(dates)].sort();
 
-  let currentStreak = 0;
-  let longestStreak = 0;
-  let streak = 1;
+  // Convert to day numbers (days since epoch) - more reliable than date string comparison
+  const MS_PER_DAY = 24 * 60 * 60 * 1000;
+  const dayNumbers = sorted.map((dateStr) => Math.floor(new Date(dateStr).getTime() / MS_PER_DAY));
 
-  // Check if the most recent date is today or yesterday (for current streak)
-  const lastDate = dates[dates.length - 1]!;
-  const isActive = lastDate === today || lastDate === yesterday;
+  // Calculate longest streak
+  let longestStreak = 1;
+  let currentRun = 1;
 
-  for (let i = 1; i < dates.length; i++) {
-    const prevDateStr = dates[i - 1]!;
-    const currDateStr = dates[i]!;
-    const prevDate = new Date(prevDateStr);
-    const currDate = new Date(currDateStr);
-    const diffDays = (currDate.getTime() - prevDate.getTime()) / 86400000;
-
-    if (diffDays === 1) {
-      streak++;
+  for (let i = 1; i < dayNumbers.length; i++) {
+    if (dayNumbers[i] === dayNumbers[i - 1]! + 1) {
+      currentRun++;
+      longestStreak = Math.max(longestStreak, currentRun);
     } else {
-      longestStreak = Math.max(longestStreak, streak);
-      streak = 1;
+      currentRun = 1;
     }
   }
-  longestStreak = Math.max(longestStreak, streak);
 
-  // Current streak: count backwards from today/yesterday
-  if (isActive) {
+  // Calculate current streak (must include today or yesterday)
+  const today = Math.floor(Date.now() / MS_PER_DAY);
+  const lastActiveDay = dayNumbers[dayNumbers.length - 1]!;
+
+  let currentStreak = 0;
+  if (lastActiveDay === today || lastActiveDay === today - 1) {
     currentStreak = 1;
-    for (let i = dates.length - 2; i >= 0; i--) {
-      const currDateStr = dates[i + 1]!;
-      const prevDateStr = dates[i]!;
-      const currDate = new Date(currDateStr);
-      const prevDate = new Date(prevDateStr);
-      const diffDays = (currDate.getTime() - prevDate.getTime()) / 86400000;
-
-      if (diffDays === 1) {
+    for (let i = dayNumbers.length - 2; i >= 0; i--) {
+      if (dayNumbers[i] === dayNumbers[i + 1]! - 1) {
         currentStreak++;
       } else {
         break;
