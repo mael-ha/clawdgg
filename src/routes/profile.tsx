@@ -237,7 +237,11 @@ const ContributionGraph: FC<{ days: ContributionDay[] }> = ({ days }) => {
 
               let html = '<div class="text-gray-300 mb-1">' + formatDate(date) + '</div>';
               html += '<div class="border-t border-gray-700 pt-1 mt-1 space-y-0.5">';
-              html += '<div class="text-white">' + count + ' prompts</div>';
+              if (count > 0) {
+                html += '<div class="text-white">' + count + ' prompts</div>';
+              } else if (tokens !== undefined && parseInt(tokens, 10) > 0) {
+                html += '<div class="text-gray-500 text-xs italic">backfilled — prompt count unavailable</div>';
+              }
 
               if (tokens !== undefined) {
                 html += '<div class="text-cyan-400">' + formatNum(tokens) + ' tokens</div>';
@@ -804,7 +808,7 @@ clawd.gg/u/${profile.username}`;
               </div>
               <div class="text-center">
                 <div class="text-2xl font-bold text-gray-300 font-mono">
-                  {contributions.filter(d => d.count > 0).length}
+                  {contributions.filter(d => d.level > 0).length}
                   <span class="text-gray-600 text-lg">/365</span>
                 </div>
                 <div class="text-gray-600 text-xs font-mono">active days</div>
@@ -1031,12 +1035,19 @@ app.get('/:username', async (c) => {
     .map(([date, data]) => ({ date, ...data }))
     .sort((a, b) => a.date.localeCompare(b.date));
 
-  // Calculate contribution levels
-  const maxCount = Math.max(...dailyActivity.map(d => d.count), 1);
+  // Calculate contribution levels.
+  // Use the LOUDER of the count-ratio and the tokens-ratio (each normalized
+  // against its own max). Days with token activity but zero recovered prompts
+  // (e.g. backfilled gap window where the prompt source is unavailable) still
+  // light up at a level proportional to their token volume.
+  const maxCount = Math.max(...dailyActivity.map(d => d.count || 0), 1);
+  const maxTokens = Math.max(...dailyActivity.map(d => d.tokens || 0), 1);
   const contributions: ContributionDay[] = dailyActivity.map(d => {
+    const countRatio = (d.count || 0) / maxCount;
+    const tokenRatio = (d.tokens || 0) / maxTokens;
+    const ratio = Math.max(countRatio, tokenRatio);
     let level: 0 | 1 | 2 | 3 | 4 = 0;
-    if (d.count > 0) {
-      const ratio = d.count / maxCount;
+    if (ratio > 0) {
       if (ratio >= 0.75) level = 4;
       else if (ratio >= 0.5) level = 3;
       else if (ratio >= 0.25) level = 2;

@@ -33,7 +33,7 @@ import { getModelPricing } from "../lib/pricing";
 // CLI args
 // ─────────────────────────────────────────────────────────────────────────────
 
-type Mode = "dry-run" | "diff-overlap" | "insert";
+type Mode = "dry-run" | "diff-overlap" | "insert" | "from-history";
 
 interface Args {
   mode: Mode;
@@ -53,6 +53,7 @@ function parseArgs(argv: string[]): Args {
   let mode: Mode = "insert";
   if (has("--dry-run")) mode = "dry-run";
   else if (has("--diff-overlap")) mode = "diff-overlap";
+  else if (has("--from-history")) mode = "from-history";
 
   const from = get("--from");
   const to = get("--to");
@@ -111,7 +112,7 @@ interface EventRow {
   decision?: string;
   source?: string;
   tool_parameters?: string;
-  provenance?: "live" | "backfill";
+  provenance?: "live" | "backfill" | "backfill-history";
 }
 
 interface MetricRow {
@@ -129,7 +130,7 @@ interface MetricRow {
   tool?: string;
   decision?: string;
   language?: string;
-  provenance?: "live" | "backfill";
+  provenance?: "live" | "backfill" | "backfill-history";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -574,6 +575,114 @@ async function mapFile(file: string, args: Args): Promise<MappedRows> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// from-history: reconstruct user_prompt events from ~/.claude/history.jsonl
+//
+// Used to recover prompt counts for the 2026-01-24 → 2026-03-06 gap window
+// where main-session JSONL files have rotated out and only subagent files
+// (which carry orchestrator-internal prompts, not human ones) survive.
+// history.jsonl is the chronological log of every prompt the user typed in
+// the Claude Code REPL — slash commands and up-arrow repeats included, which
+// we filter / dedupe here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const HISTORY_PATH = join(homedir(), ".claude", "history.jsonl");
+
+async function runFromHistory(args: Args): Promise<void> {
+  if (!args.from) throw new Error("--from-history requires --from");
+  const to = args.to ?? new Date();
+  console.log(
+    `[from-history] Window: ${args.from.toISOString()} → ${to.toISOString()}  (provenance='backfill-history')`
+  );
+  console.log(`[from-history] Source: ${HISTORY_PATH}\n`);
+
+  const raw = await readFile(HISTORY_PATH, "utf-8");
+  const lines = raw.split("\n").filter((l) => l.length > 0);
+
+  // Phase 1: parse + filter + dedupe in memory.
+  type Entry = { ts: Date; sessionId: string; display: string };
+  const seen = new Map<string, Entry>();
+  let parsed = 0;
+  let droppedSlash = 0;
+  let droppedEmpty = 0;
+  let droppedOutOfWindow = 0;
+  let droppedDup = 0;
+
+  for (const line of lines) {
+    let rec: any;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    parsed++;
+    if (typeof rec.timestamp !== "number" || typeof rec.display !== "string") continue;
+    const display = rec.display.trim();
+    if (display.length === 0) {
+      droppedEmpty++;
+      continue;
+    }
+    if (display.startsWith("/")) {
+      droppedSlash++;
+      continue;
+    }
+    const ts = new Date(rec.timestamp);
+    if (isNaN(ts.getTime())) continue;
+    if (ts < args.from) {
+      droppedOutOfWindow++;
+      continue;
+    }
+    if (ts >= to) {
+      droppedOutOfWindow++;
+      continue;
+    }
+    // Dedupe per-minute bucket to collapse up-arrow repeats with the same content.
+    const sessionId = typeof rec.sessionId === "string" ? rec.sessionId : "";
+    const minuteBucket = Math.floor(rec.timestamp / 60000);
+    const key = `${sessionId}|${display.slice(0, 200)}|${minuteBucket}`;
+    if (seen.has(key)) {
+      droppedDup++;
+      continue;
+    }
+    seen.set(key, { ts, sessionId, display });
+  }
+
+  console.log(
+    `[from-history] parsed=${parsed}  in-window=${seen.size}  dropped: slash=${droppedSlash} empty=${droppedEmpty} out-of-window=${droppedOutOfWindow} dup=${droppedDup}`
+  );
+
+  // Phase 2: emit rows.
+  const rows: EventRow[] = [];
+  for (const e of seen.values()) {
+    rows.push({
+      timestamp: fmtTs(e.ts),
+      user_id: USER_ID,
+      session_id: e.sessionId,
+      event_name: "claude_code.user_prompt",
+      prompt_length: e.display.length,
+      provenance: "backfill-history",
+    });
+  }
+
+  // Daily breakdown for sanity.
+  const byDay = new Map<string, number>();
+  for (const r of rows) {
+    const day = r.timestamp.slice(0, 10);
+    byDay.set(day, (byDay.get(day) ?? 0) + 1);
+  }
+  console.log(`[from-history] daily counts:`);
+  for (const [day, n] of [...byDay.entries()].sort()) {
+    console.log(`  ${day}  ${n}`);
+  }
+
+  // Phase 3: insert in batches.
+  console.log(`\n[from-history] Inserting ${rows.length} events_raw rows...`);
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    await chInsert("events_raw", rows.slice(i, i + BATCH_SIZE));
+  }
+  console.log(`[from-history] Done.`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Entry
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -589,6 +698,9 @@ async function main() {
       break;
     case "insert":
       await runInsert(args);
+      break;
+    case "from-history":
+      await runFromHistory(args);
       break;
   }
 }

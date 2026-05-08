@@ -135,7 +135,7 @@ const SmallHero = ({ totalUsers, totalPrompts, totalTokens }: HeroProps) => (
     <div class="relative z-10 max-w-3xl mx-auto">
       <h1 class="text-4xl sm:text-5xl font-bold tracking-tight mb-3">
         <span class="glitch-text" data-text="clawd.gg">
-          <span class="text-gray-100">clawdgg</span>
+          <span class="text-gray-100">clawd</span>
           <span class="text-cyan-400">.gg</span>
         </span>
       </h1>

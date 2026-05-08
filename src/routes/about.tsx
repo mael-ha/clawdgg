@@ -38,7 +38,7 @@ const MinimalHeader = ({ user }: HeaderProps) => (
     <div class="max-w-4xl mx-auto px-4 py-4 flex justify-between items-center">
       <a href="/" class="flex items-center gap-2 group">
         <span class="text-2xl font-bold tracking-tight">
-          <span class="text-gray-100">clawdgg</span>
+          <span class="text-gray-100">clawd</span>
           <span class="text-cyan-400">.gg</span>
         </span>
       </a>
