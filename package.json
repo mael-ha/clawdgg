@@ -31,6 +31,7 @@
     "db:migrate": "bunx drizzle-kit migrate",
     "db:seed": "bun src/db/seed.ts",
     "typecheck": "bun tsc --noEmit",
+    "test": "bun test",
     "bot": "bun bot/src/index.ts",
     "bot:dev": "bun --hot bot/src/index.ts",
     "bot:daemon": "bun bot/src/index.ts --daemon",

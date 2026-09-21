@@ -1093,7 +1093,9 @@ api.get('/me/insights', requireAuth, async (c) => {
     // Format model diet
     const modelDiet = modelUsage.map(m => ({
       model: m.model,
-      displayName: m.model.includes('opus') ? 'Opus' :
+      displayName: m.model.includes('fable') ? 'Fable' :
+                   m.model.includes('mythos') ? 'Mythos' :
+                   m.model.includes('opus') ? 'Opus' :
                    m.model.includes('sonnet') ? 'Sonnet' :
                    m.model.includes('haiku') ? 'Haiku' : m.model,
       inputTokens: m.input_tokens,

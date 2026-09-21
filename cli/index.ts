@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
+import { getModelPricing } from "../src/lib/pricing";
 
 // ANSI color codes
 const colors = {
@@ -202,106 +203,12 @@ function getExtension(filepath: string): string {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PRICING TABLE - for calculating cost from tokens
-// Source: https://platform.claude.com/docs/en/about-claude/pricing
-// Last updated: 2025-12-22
-//
-// Prices are per MTok (million tokens) in USD
-// Cache pricing: 5m cache write = 1.25x input, cache read = 0.1x input
+// PRICING - single source of truth lives in src/lib/pricing.ts.
+// The CLI ships the whole repo in its npm tarball, so this relative import
+// resolves both from a checkout and from a global install. Never re-declare a
+// price table here: the duplicate that used to live in this file had drifted
+// from src/lib/pricing.ts on model ids, dates AND prices.
 // ═══════════════════════════════════════════════════════════════════════════
-const PRICING_LAST_UPDATED = '2025-12-22';
-
-const MODEL_PRICING: Record<string, { input: number; output: number; cacheRead: number; cacheWrite: number }> = {
-  // ─────────────────────────────────────────────────────────────────────────
-  // Opus models
-  // ─────────────────────────────────────────────────────────────────────────
-  // Opus 4.5 (current flagship)
-  'claude-opus-4-5-20251101': { input: 5.0, output: 25.0, cacheRead: 0.50, cacheWrite: 6.25 },
-  // Opus 4.1
-  'claude-opus-4-1-20250429': { input: 15.0, output: 75.0, cacheRead: 1.50, cacheWrite: 18.75 },
-  // Opus 4
-  'claude-opus-4-20250514': { input: 15.0, output: 75.0, cacheRead: 1.50, cacheWrite: 18.75 },
-  // Opus 3 (deprecated)
-  'claude-3-opus-20240229': { input: 15.0, output: 75.0, cacheRead: 1.50, cacheWrite: 18.75 },
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Sonnet models
-  // ─────────────────────────────────────────────────────────────────────────
-  // Sonnet 4.5
-  'claude-sonnet-4-5-20250929': { input: 3.0, output: 15.0, cacheRead: 0.30, cacheWrite: 3.75 },
-  // Sonnet 4
-  'claude-sonnet-4-20250514': { input: 3.0, output: 15.0, cacheRead: 0.30, cacheWrite: 3.75 },
-  // Sonnet 3.7 (deprecated)
-  'claude-3-7-sonnet-20250219': { input: 3.0, output: 15.0, cacheRead: 0.30, cacheWrite: 3.75 },
-  // Sonnet 3.5 v2
-  'claude-3-5-sonnet-20241022': { input: 3.0, output: 15.0, cacheRead: 0.30, cacheWrite: 3.75 },
-  // Sonnet 3.5 v1
-  'claude-3-5-sonnet-20240620': { input: 3.0, output: 15.0, cacheRead: 0.30, cacheWrite: 3.75 },
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Haiku models
-  // ─────────────────────────────────────────────────────────────────────────
-  // Haiku 4.5
-  'claude-haiku-4-5-20251001': { input: 1.0, output: 5.0, cacheRead: 0.10, cacheWrite: 1.25 },
-  // Haiku 3.5
-  'claude-3-5-haiku-20241022': { input: 0.80, output: 4.0, cacheRead: 0.08, cacheWrite: 1.0 },
-  // Haiku 3
-  'claude-3-haiku-20240307': { input: 0.25, output: 1.25, cacheRead: 0.03, cacheWrite: 0.30 },
-};
-
-// Default to Sonnet pricing if model not found
-const DEFAULT_PRICING = { input: 3.0, output: 15.0, cacheRead: 0.3, cacheWrite: 3.75 };
-
-function getModelPricing(model: string): typeof DEFAULT_PRICING {
-  // Try exact match first
-  const exact = MODEL_PRICING[model];
-  if (exact) return exact;
-
-  // Fuzzy match by model family (handles version date variations)
-  const modelLower = model.toLowerCase();
-
-  // Opus family
-  if (modelLower.includes('opus-4-5') || modelLower.includes('opus-4.5')) {
-    return MODEL_PRICING['claude-opus-4-5-20251101']!;
-  }
-  if (modelLower.includes('opus-4-1') || modelLower.includes('opus-4.1')) {
-    return MODEL_PRICING['claude-opus-4-1-20250429']!;
-  }
-  if (modelLower.includes('opus-4') && !modelLower.includes('opus-4-5') && !modelLower.includes('opus-4-1')) {
-    return MODEL_PRICING['claude-opus-4-20250514']!;
-  }
-  if (modelLower.includes('opus-3') || modelLower.includes('opus 3')) {
-    return MODEL_PRICING['claude-3-opus-20240229']!;
-  }
-
-  // Sonnet family
-  if (modelLower.includes('sonnet-4-5') || modelLower.includes('sonnet-4.5')) {
-    return MODEL_PRICING['claude-sonnet-4-5-20250929']!;
-  }
-  if (modelLower.includes('sonnet-4') && !modelLower.includes('sonnet-4-5')) {
-    return MODEL_PRICING['claude-sonnet-4-20250514']!;
-  }
-  if (modelLower.includes('sonnet-3-7') || modelLower.includes('sonnet-3.7')) {
-    return MODEL_PRICING['claude-3-7-sonnet-20250219']!;
-  }
-  if (modelLower.includes('sonnet-3-5') || modelLower.includes('sonnet-3.5') || modelLower.includes('3-5-sonnet')) {
-    return MODEL_PRICING['claude-3-5-sonnet-20241022']!;
-  }
-
-  // Haiku family
-  if (modelLower.includes('haiku-4-5') || modelLower.includes('haiku-4.5')) {
-    return MODEL_PRICING['claude-haiku-4-5-20251001']!;
-  }
-  if (modelLower.includes('haiku-3-5') || modelLower.includes('haiku-3.5') || modelLower.includes('3-5-haiku')) {
-    return MODEL_PRICING['claude-3-5-haiku-20241022']!;
-  }
-  if (modelLower.includes('haiku-3') || modelLower.includes('3-haiku')) {
-    return MODEL_PRICING['claude-3-haiku-20240307']!;
-  }
-
-  // Default to Sonnet 4 pricing (most common)
-  return DEFAULT_PRICING;
-}
 
 // Calculate cost in cents from token usage
 function calculateCostCents(
