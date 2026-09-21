@@ -43,10 +43,15 @@ describe('getModelPricingDetailed', () => {
   });
 
   it('falls back to a family rule for an unlisted variant', () => {
-    const match = getModelPricingDetailed('us.anthropic.claude-opus-4-8-v1:0');
-    expect(match.matchQuality).toBe('family');
-    expect(match.modelId).toBe('claude-opus-4-8');
-    expect(match.pricing.input).toBe(5);
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const match = getModelPricingDetailed('claude-opus-4-8-turbo');
+      expect(match.matchQuality).toBe('family');
+      expect(match.modelId).toBe('claude-opus-4-8');
+      expect(match.pricing.input).toBe(5);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('prefers Fable 5.1 over Fable 5 despite the shared prefix', () => {
@@ -196,5 +201,117 @@ describe('cache-write pricing by TTL', () => {
     const p = getModelPricingDetailed('claude-fable-5-1').pricing;
     expect(p.cacheWrite5m).toBe(12.5);
     expect(p.cacheWrite1h).toBe(20);
+  });
+});
+
+describe('model id coverage', () => {
+  const quiet = () => spyOn(console, 'warn').mockImplementation(() => {});
+
+  it('prices Mythos 5.1 exactly, at the Fable 5.1 tier', () => {
+    const match = getModelPricingDetailed('claude-mythos-5-1');
+    expect(match.matchQuality).toBe('exact');
+    expect(match.pricing).toEqual(getModelPricingDetailed('claude-fable-5-1').pricing);
+  });
+
+  it('routes an unlisted mythos variant to Mythos 5.1 by family', () => {
+    const warn = quiet();
+    try {
+      const match = getModelPricingDetailed('claude-mythos-preview');
+      expect(match.matchQuality).toBe('family');
+      expect(match.modelId).toBe('claude-mythos-5-1');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('normalizes the dated Haiku 4.5 id onto the undated entry', () => {
+    const match = getModelPricingDetailed('claude-haiku-4-5-20251001');
+    expect(match.matchQuality).toBe('normalized');
+    expect(match.modelId).toBe('claude-haiku-4-5');
+    expect(match.pricing.input).toBe(1);
+  });
+
+  it('strips a Vertex @YYYYMMDD suffix', () => {
+    const match = getModelPricingDetailed('claude-sonnet-5@20260401');
+    expect(match.matchQuality).toBe('normalized');
+    expect(match.modelId).toBe('claude-sonnet-5');
+  });
+
+  it('strips a Bedrock vendor prefix and revision suffix', () => {
+    const match = getModelPricingDetailed('us.anthropic.claude-opus-5-v1:0');
+    expect(match.matchQuality).toBe('normalized');
+    expect(match.modelId).toBe('claude-opus-5');
+  });
+
+  it('prices Sonnet 4.6 and Opus 4.7 / 4.6 exactly', () => {
+    expect(getModelPricingDetailed('claude-sonnet-4-6')).toMatchObject({
+      matchQuality: 'exact',
+      pricing: { input: 3, output: 15 },
+    });
+    expect(getModelPricingDetailed('claude-opus-4-7')).toMatchObject({
+      matchQuality: 'exact',
+      pricing: { input: 5, output: 25 },
+    });
+    expect(getModelPricingDetailed('claude-opus-4-6')).toMatchObject({
+      matchQuality: 'exact',
+      pricing: { input: 5, output: 25 },
+    });
+  });
+
+  it('does not let sonnet-5 shadow 3-5-sonnet', () => {
+    expect(getModelPricingDetailed('claude-3-5-sonnet-20241022').pricing.input).toBe(3);
+    expect(getModelPricingDetailed('claude-sonnet-5').pricing.input).toBe(2);
+  });
+
+  it('does not let haiku-4-5 shadow 3-5-haiku', () => {
+    expect(getModelPricingDetailed('claude-3-5-haiku-20241022').pricing.input).toBe(0.8);
+    expect(getModelPricingDetailed('claude-haiku-4-5').pricing.input).toBe(1);
+  });
+
+  it('treats an empty model id as a fallback', () => {
+    const warn = quiet();
+    try {
+      expect(getModelPricingDetailed('').matchQuality).toBe('fallback');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('points a bare-family rule at the current generation, not the oldest', () => {
+    const warn = quiet();
+    try {
+      // The next unlisted minor must not inherit years-old prices.
+      expect(getModelPricingDetailed('claude-opus-4-9').modelId).toBe('claude-opus-4-8');
+      expect(getModelPricingDetailed('claude-opus-4-9').pricing.input).toBe(5);
+      expect(getModelPricingDetailed('claude-fable-5-2').modelId).toBe('claude-fable-5-1');
+      expect(getModelPricingDetailed('claude-fable-5-2').pricing.cacheRead).toBe(0.25);
+      // ...while the genuine legacy ids still hit their own entries.
+      expect(getModelPricingDetailed('claude-opus-4-20250514')).toMatchObject({
+        matchQuality: 'exact',
+        pricing: { input: 15 },
+      });
+      expect(getModelPricingDetailed('claude-fable-5')).toMatchObject({
+        matchQuality: 'exact',
+        pricing: { cacheRead: 1 },
+      });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('warns once on a family match but stays silent on exact/normalized', () => {
+    const warn = quiet();
+    try {
+      getModelPricingDetailed('claude-opus-5');
+      getModelPricingDetailed('claude-haiku-4-5-20251001');
+      expect(warn).not.toHaveBeenCalled();
+
+      getModelPricingDetailed('claude-opus-4-3');
+      getModelPricingDetailed('claude-opus-4-3');
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]?.[0]).toContain('claude-opus-4-3');
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

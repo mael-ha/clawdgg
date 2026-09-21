@@ -276,12 +276,16 @@ export interface ModelPricingMatch {
 
 // Family/version rules, most specific first — ordering is load-bearing
 // ('fable-5' also matches 'fable-5-1', 'opus-4' also matches 'opus-4-5', ...).
-// The trailing generic rule per family maps an unrecognised generation to the
-// CURRENT tier price, not to a years-old one.
+//
+// A bare-family rule points at the CURRENT generation of that family, so the
+// next unlisted minor release guesses right: 'claude-opus-4-9' should price
+// like Opus 4.8 ($5/$25), not like Opus 4 ($15/$75). The genuine legacy ids
+// still land on their own entries via the exact/normalized steps, which run
+// first. Same for the trailing generic rule per family.
 const FAMILY_RULES: ReadonlyArray<readonly [readonly string[], string]> = [
   [['fable-5-1', 'fable-5.1'], 'claude-fable-5-1'],
   [['mythos-5-1', 'mythos-5.1'], 'claude-mythos-5-1'],
-  [['fable-5'], 'claude-fable-5'],
+  [['fable-5'], 'claude-fable-5-1'],
   [['fable'], 'claude-fable-5-1'],
   [['mythos'], 'claude-mythos-5-1'],
 
@@ -291,14 +295,14 @@ const FAMILY_RULES: ReadonlyArray<readonly [readonly string[], string]> = [
   [['opus-4-6', 'opus-4.6'], 'claude-opus-4-6'],
   [['opus-4-5', 'opus-4.5'], 'claude-opus-4-5-20251101'],
   [['opus-4-1', 'opus-4.1'], 'claude-opus-4-1-20250414'],
-  [['opus-4', 'opus4'], 'claude-opus-4-20250514'],
+  [['opus-4', 'opus4'], 'claude-opus-4-8'],
   [['opus-3', '3-opus'], 'claude-3-opus-20240229'],
   [['opus'], 'claude-opus-5'],
 
   [['sonnet-5', 'sonnet5'], 'claude-sonnet-5'],
   [['sonnet-4-6', 'sonnet-4.6'], 'claude-sonnet-4-6'],
   [['sonnet-4-5', 'sonnet-4.5'], 'claude-sonnet-4-5-20250929'],
-  [['sonnet-4', 'sonnet4'], 'claude-sonnet-4-20250514'],
+  [['sonnet-4', 'sonnet4'], 'claude-sonnet-4-6'],
   [['sonnet-3-7', 'sonnet-3.7', '3-7-sonnet'], 'claude-3-7-sonnet-20250219'],
   [['sonnet-3-5', 'sonnet-3.5', '3-5-sonnet'], 'claude-3-5-sonnet-20241022'],
   [['sonnet-3', '3-sonnet'], 'claude-3-sonnet-20240229'],
@@ -310,13 +314,30 @@ const FAMILY_RULES: ReadonlyArray<readonly [readonly string[], string]> = [
   [['haiku'], 'claude-haiku-4-5'],
 ];
 
-// One warning per distinct unmatched id per process — the backfill walks
-// hundreds of thousands of rows and must not drown its own output.
-const warnedUnknownModels = new Set<string>();
+// One warning per distinct model id per process — the backfill walks hundreds
+// of thousands of rows and must not drown its own output.
+const warnedModels = new Set<string>();
 
-/** Strip a trailing -YYYYMMDD (or @YYYYMMDD) snapshot suffix. */
-function stripDateSuffix(modelId: string): string {
-  return modelId.replace(/[-@]\d{8}$/, '');
+function warnOncePerModel(modelId: string, message: string): void {
+  if (warnedModels.has(modelId)) return;
+  warnedModels.add(modelId);
+  console.warn(message);
+}
+
+/**
+ * Reduce a model id to its first-party bare form: lowercase, without a cloud
+ * provider's region/vendor prefix, its `-v1:0` revision suffix, or a
+ * `-YYYYMMDD` / `@YYYYMMDD` snapshot suffix. So both
+ * `us.anthropic.claude-sonnet-5-v1:0` (Bedrock) and `claude-sonnet-5@20260401`
+ * (Vertex) normalize onto the `claude-sonnet-5` table key.
+ */
+function normalizeModelId(modelId: string): string {
+  return modelId
+    .toLowerCase()
+    .replace(/^(?:us|eu|apac|global)\./, '')
+    .replace(/^anthropic\./, '')
+    .replace(/-v\d+:\d+$/, '')
+    .replace(/[-@]\d{8}$/, '');
 }
 
 /**
@@ -330,7 +351,7 @@ export function getModelPricingDetailed(modelId: string): ModelPricingMatch {
 
   const lower = modelId.toLowerCase();
 
-  const normalizedId = stripDateSuffix(lower);
+  const normalizedId = normalizeModelId(modelId);
   const normalized = MODEL_PRICING[normalizedId];
   if (normalized) {
     return { pricing: normalized, matchQuality: 'normalized', modelId: normalizedId };
@@ -339,18 +360,26 @@ export function getModelPricingDetailed(modelId: string): ModelPricingMatch {
   for (const [needles, key] of FAMILY_RULES) {
     if (needles.some(n => lower.includes(n))) {
       const pricing = MODEL_PRICING[key];
-      if (pricing) return { pricing, matchQuality: 'family', modelId: key };
+      if (!pricing) continue;
+      // A family match is a guess — the id is not in the table. Surface it so a
+      // new minor release gets real prices instead of quietly inheriting a
+      // sibling's. Exact and normalized matches stay silent.
+      warnOncePerModel(
+        modelId,
+        `[pricing] Model "${modelId}" is not in the price table — priced from the ` +
+        `"${key}" family rule ($${pricing.input}/$${pricing.output} per MTok). ` +
+        `Add it to MODEL_PRICING in src/lib/pricing.ts (table version ${PRICING_VERSION}).`
+      );
+      return { pricing, matchQuality: 'family', modelId: key };
     }
   }
 
-  if (!warnedUnknownModels.has(modelId)) {
-    warnedUnknownModels.add(modelId);
-    console.warn(
-      `[pricing] No price match for model "${modelId}" — falling back to DEFAULT_PRICING ` +
-      `($${DEFAULT_PRICING.input}/$${DEFAULT_PRICING.output} per MTok). ` +
-      `Add it to MODEL_PRICING in src/lib/pricing.ts (table version ${PRICING_VERSION}).`
-    );
-  }
+  warnOncePerModel(
+    modelId,
+    `[pricing] No price match for model "${modelId}" — falling back to DEFAULT_PRICING ` +
+    `($${DEFAULT_PRICING.input}/$${DEFAULT_PRICING.output} per MTok). ` +
+    `Add it to MODEL_PRICING in src/lib/pricing.ts (table version ${PRICING_VERSION}).`
+  );
   return { pricing: DEFAULT_PRICING, matchQuality: 'fallback', modelId };
 }
 

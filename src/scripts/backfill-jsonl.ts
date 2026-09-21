@@ -237,6 +237,12 @@ function mapLine(line: any, sessionFallback: string, isSubagentFile: boolean): M
   if (type === "assistant") {
     const usage = line?.message?.usage;
     const model: string = line?.message?.model || "";
+
+    // Claude Code writes model="<synthetic>" for locally-generated assistant
+    // messages (interrupts, error placeholders) that never hit the API. Every
+    // one of them carries all-zero usage, so they add $0 — but emitting them as
+    // api_request events inflates the API-calls-per-prompt agentic ratio.
+    if (model === "<synthetic>") return out;
     if (usage && (usage.input_tokens != null || usage.output_tokens != null)) {
       const inputTokens = Number(usage.input_tokens ?? 0);
       const outputTokens = Number(usage.output_tokens ?? 0);

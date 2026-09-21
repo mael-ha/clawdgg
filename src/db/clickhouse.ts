@@ -28,6 +28,7 @@
  */
 
 import { db } from './index';
+import { getModelPricing } from '../lib/pricing';
 import { dailyStats } from './schema';
 import { eq, and, gte, lte, asc, desc } from 'drizzle-orm';
 
@@ -627,27 +628,51 @@ export interface CacheStats {
   estimatedSavingsUsd: number;
 }
 
+/**
+ * Cache savings are derived PER MODEL from src/lib/pricing.ts.
+ *
+ * This used to be `cacheRead * 0.9 * 4 / 1e6` — a flat $4/MTok input rate that
+ * matches no model, times a hardcoded 0.9 that assumed cacheRead is always
+ * 0.1x input. Both are wrong: Fable 5.1 reads at 0.025x, and input rates run
+ * from $0.25 to $10. Savings per model are cacheRead tokens x (input - cacheRead).
+ */
 export async function getUserCacheStats(userId: string, days?: number): Promise<CacheStats | null> {
   const dateFilter = days ? `AND toDate(timestamp) >= today() - ${days}` : '';
 
   const sql = `
     SELECT
-      toUInt64(sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheRead')) as totalCacheReadTokens,
-      toUInt64(sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'input')) as totalInputTokens,
-      toFloat64(if(
-        sumIf(value, metric_name = 'claude_code.token.usage' AND token_type IN ('input', 'cacheRead')) > 0,
-        sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheRead') * 100.0 /
-        sumIf(value, metric_name = 'claude_code.token.usage' AND token_type IN ('input', 'cacheRead')),
-        0
-      )) as cacheHitRate,
-      toFloat64(sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheRead') * 0.9 * 4 / 1000000) as estimatedSavingsUsd
+      model,
+      toUInt64(sumIf(value, token_type = 'cacheRead')) as cacheReadTokens,
+      toUInt64(sumIf(value, token_type = 'input')) as inputTokens
     FROM metrics_raw FINAL
     WHERE user_id = {userId:String}
-    ${dateFilter}
+      AND metric_name = 'claude_code.token.usage'
+      AND token_type IN ('input', 'cacheRead')
+      ${dateFilter}
+    GROUP BY model
   `;
 
-  const result = await query<CacheStats>(sql, { userId });
-  return result[0] || null;
+  const rows = await query<{ model: string; cacheReadTokens: number; inputTokens: number }>(sql, { userId });
+
+  let totalCacheReadTokens = 0;
+  let totalInputTokens = 0;
+  let estimatedSavingsUsd = 0;
+  for (const row of rows) {
+    const cacheRead = Number(row.cacheReadTokens) || 0;
+    const input = Number(row.inputTokens) || 0;
+    totalCacheReadTokens += cacheRead;
+    totalInputTokens += input;
+    const pricing = getModelPricing(row.model || '');
+    estimatedSavingsUsd += (cacheRead * (pricing.input - pricing.cacheRead)) / 1_000_000;
+  }
+
+  const billableTokens = totalCacheReadTokens + totalInputTokens;
+  return {
+    totalCacheReadTokens,
+    totalInputTokens,
+    cacheHitRate: billableTokens > 0 ? (totalCacheReadTokens * 100) / billableTokens : 0,
+    estimatedSavingsUsd,
+  };
 }
 
 /**
