@@ -27,7 +27,7 @@ import { readFile, readdir, writeFile, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { getModelPricing } from "../lib/pricing";
+import { getModelPricingDetailed, type PricingMatchQuality } from "../lib/pricing";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI args
@@ -113,6 +113,8 @@ interface EventRow {
   source?: string;
   tool_parameters?: string;
   provenance?: "live" | "backfill" | "backfill-history";
+  /** Price-table match quality behind cost_usd. Omitted when no cost was estimated. */
+  pricing_source?: PricingMatchQuality;
 }
 
 interface MetricRow {
@@ -131,6 +133,8 @@ interface MetricRow {
   decision?: string;
   language?: string;
   provenance?: "live" | "backfill" | "backfill-history";
+  /** Price-table match quality behind a cost.usage value. Omitted for token metrics. */
+  pricing_source?: PricingMatchQuality;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -166,16 +170,21 @@ function contentLength(content: unknown): number {
   return 0;
 }
 
-/** USD cost from token usage + model. Returns dollars (Float64). */
-function computeCostUsd(model: string, usage: any): number {
-  const p = getModelPricing(model || "");
+/**
+ * USD cost from token usage + model. Returns dollars (Float64) plus how the
+ * price was looked up, so the row can carry its own estimate quality.
+ */
+function computeCostUsd(model: string, usage: any): { costUsd: number; pricingSource: PricingMatchQuality } {
+  const { pricing: p, matchQuality } = getModelPricingDetailed(model || "");
   const input = Number(usage?.input_tokens ?? 0);
   const output = Number(usage?.output_tokens ?? 0);
   const cacheRead = Number(usage?.cache_read_input_tokens ?? 0);
   const cacheWrite = Number(usage?.cache_creation_input_tokens ?? 0);
-  return (
-    (input * p.input + output * p.output + cacheRead * p.cacheRead + cacheWrite * p.cacheWrite) / 1_000_000
-  );
+  return {
+    costUsd:
+      (input * p.input + output * p.output + cacheRead * p.cacheRead + cacheWrite * p.cacheWrite) / 1_000_000,
+    pricingSource: matchQuality,
+  };
 }
 
 /** Map one JSONL line (already JSON-parsed) into rows. Returns nothing for unmappable lines. */
@@ -216,13 +225,14 @@ function mapLine(line: any, sessionFallback: string, isSubagentFile: boolean): M
       const outputTokens = Number(usage.output_tokens ?? 0);
       const cacheRead = Number(usage.cache_read_input_tokens ?? 0);
       const cacheWrite = Number(usage.cache_creation_input_tokens ?? 0);
-      const costUsd = computeCostUsd(model, usage);
+      const { costUsd, pricingSource } = computeCostUsd(model, usage);
 
       out.events.push({
         ...base,
         event_name: "claude_code.api_request",
         model,
         cost_usd: costUsd,
+        pricing_source: pricingSource,
         input_tokens: inputTokens,
         output_tokens: outputTokens,
         cache_read_tokens: cacheRead,
@@ -244,12 +254,15 @@ function mapLine(line: any, sessionFallback: string, isSubagentFile: boolean): M
         out.metrics.push({ ...tokenMetricBase, value: cacheWrite, token_type: "cacheCreation" });
       // Emit cost.usage metric so getUserTotals total_cost_usd aggregates correctly.
       // Note: this is *estimated* cost from token counts × pricing table, not measured.
+      // pricing_source records how well the model id matched the price table, so a
+      // fallback-priced row is traceable instead of blending into the totals.
       if (costUsd > 0) {
         out.metrics.push({
           ...base,
           metric_name: "claude_code.cost.usage",
           value: costUsd,
           model,
+          pricing_source: pricingSource,
         });
       }
     }

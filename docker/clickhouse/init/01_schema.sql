@@ -38,7 +38,12 @@ CREATE TABLE IF NOT EXISTS metrics_raw (
     account_uuid String DEFAULT '',
     -- Provenance: 'live' for OTLP-received, 'backfill' for JSONL-reconstructed.
     -- Distinct from `source` (which captures the OTEL source attribute meaning).
-    provenance String DEFAULT 'live'
+    provenance String DEFAULT 'live',
+    -- How the model id matched the price table behind an ESTIMATED cost:
+    -- 'exact' | 'normalized' | 'family' | 'fallback' (see src/lib/pricing.ts).
+    -- Empty means no price table was consulted — live OTLP rows carry Claude
+    -- Code's own measured cost, and token metrics carry no cost at all.
+    pricing_source String DEFAULT ''
 ) ENGINE = ReplacingMergeTree()
 -- CRITICAL: line_type must be in ORDER BY to prevent deduplication of added/removed rows
 -- Note: session_id removed from ORDER BY for better query performance (not needed for dedup)
@@ -74,7 +79,12 @@ CREATE TABLE IF NOT EXISTS events_raw (
     tool_parameters String DEFAULT '', -- JSON string with tool-specific params (bash_command, etc.)
     -- Provenance: 'live' for OTLP-received, 'backfill' for JSONL-reconstructed.
     -- Distinct from `source` above (which captures the OTEL source attribute).
-    provenance String DEFAULT 'live'
+    provenance String DEFAULT 'live',
+    -- How the model id matched the price table behind cost_usd when that cost
+    -- was ESTIMATED: 'exact' | 'normalized' | 'family' | 'fallback'
+    -- (see src/lib/pricing.ts). Empty means no price table was consulted —
+    -- live OTLP rows carry Claude Code's own measured cost_usd.
+    pricing_source String DEFAULT ''
 ) ENGINE = ReplacingMergeTree()
 ORDER BY (user_id, session_id, event_name, timestamp, tool_name)
 PARTITION BY toYYYYMM(timestamp)
