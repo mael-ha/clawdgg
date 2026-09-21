@@ -11,15 +11,20 @@ export const PRICING_VERSION = '2026-09';
 export const PRICING_LAST_UPDATED = '2026-09-21';
 
 // Pricing per million tokens (MTok)
-// Cache pricing is normally cache_read = 0.1x base input, cache_write = 1.25x
-// base input. Exceptions are called out inline (Fable 5.1 / Mythos 5.1 read at
-// 0.025x). cacheWrite is always the 5-minute ephemeral rate, because Claude
-// Code's JSONL only reports one undifferentiated cache_creation_input_tokens.
+// Cache pricing is normally cache_read = 0.1x base input, 5m cache_write =
+// 1.25x and 1h cache_write = 2x base input. Exceptions are called out inline
+// (Fable 5.1 / Mythos 5.1 read at 0.025x).
+//
+// The two cache-write rates are BOTH needed: Claude Code's JSONL reports the
+// split in `usage.cache_creation.{ephemeral_1h,ephemeral_5m}_input_tokens`,
+// and across the local transcript corpus 37% of cache-creation tokens are 1h.
+// Pricing all of it at the 5m rate understates cache-write cost by ~22%.
 export interface ModelPricing {
-  input: number;      // Fresh input tokens
-  output: number;     // Output tokens
-  cacheRead: number;  // Cache read tokens
-  cacheWrite: number; // Cache write tokens (5m ephemeral)
+  input: number;        // Fresh input tokens
+  output: number;       // Output tokens
+  cacheRead: number;    // Cache read tokens
+  cacheWrite5m: number; // Cache creation, 5-minute TTL (normally 1.25x input)
+  cacheWrite1h: number; // Cache creation, 1-hour TTL (normally 2x input)
 }
 
 export const MODEL_PRICING: Record<string, ModelPricing> = {
@@ -31,63 +36,73 @@ export const MODEL_PRICING: Record<string, ModelPricing> = {
     input: 10,
     output: 50,
     cacheRead: 0.25,
-    cacheWrite: 12.50,
+    cacheWrite5m: 12.50,
+    cacheWrite1h: 20,
   },
   // Claude Mythos 5.1 (Project Glasswing) — same tier as Fable 5.1
   'claude-mythos-5-1': {
     input: 10,
     output: 50,
     cacheRead: 0.25,
-    cacheWrite: 12.50,
+    cacheWrite5m: 12.50,
+    cacheWrite1h: 20,
   },
   // Claude Fable 5 — same per-token price as 5.1 but standard 0.1x cache read
   'claude-fable-5': {
     input: 10,
     output: 50,
     cacheRead: 1.00,
-    cacheWrite: 12.50,
+    cacheWrite5m: 12.50,
+    cacheWrite1h: 20,
   },
   'claude-opus-5': {
     input: 5,
     output: 25,
     cacheRead: 0.50,
-    cacheWrite: 6.25,
+    cacheWrite5m: 6.25,
+    cacheWrite1h: 10,
   },
   'claude-opus-4-8': {
     input: 5,
     output: 25,
     cacheRead: 0.50,
-    cacheWrite: 6.25,
+    cacheWrite5m: 6.25,
+    cacheWrite1h: 10,
   },
   'claude-opus-4-7': {
     input: 5,
     output: 25,
     cacheRead: 0.50,
-    cacheWrite: 6.25,
+    cacheWrite5m: 6.25,
+    cacheWrite1h: 10,
   },
   'claude-opus-4-6': {
     input: 5,
     output: 25,
     cacheRead: 0.50,
-    cacheWrite: 6.25,
+    cacheWrite5m: 6.25,
+    cacheWrite1h: 10,
   },
   'claude-sonnet-5': {
     input: 2,
     output: 10,
     cacheRead: 0.20,
-    cacheWrite: 2.50,
+    cacheWrite5m: 2.50,
+    cacheWrite1h: 4,
   },
   'claude-sonnet-4-6': {
     input: 3,
     output: 15,
     cacheRead: 0.30,
-    cacheWrite: 3.75,
+    cacheWrite5m: 3.75,
+    cacheWrite1h: 6,
   },
   'claude-haiku-4-5': {
     input: 1,
     output: 5,
     cacheRead: 0.10,
-    cacheWrite: 1.25,
+    cacheWrite5m: 1.25,
+    cacheWrite1h: 2,
   },
 
   // ───────────────────────────────────────────────────────────────────────
@@ -97,25 +112,29 @@ export const MODEL_PRICING: Record<string, ModelPricing> = {
     input: 5,
     output: 25,
     cacheRead: 0.50,
-    cacheWrite: 6.25,
+    cacheWrite5m: 6.25,
+    cacheWrite1h: 10,
   },
   'claude-opus-4-1-20250414': {
     input: 15,
     output: 75,
     cacheRead: 1.50,
-    cacheWrite: 18.75,
+    cacheWrite5m: 18.75,
+    cacheWrite1h: 30,
   },
   'claude-opus-4-20250514': {
     input: 15,
     output: 75,
     cacheRead: 1.50,
-    cacheWrite: 18.75,
+    cacheWrite5m: 18.75,
+    cacheWrite1h: 30,
   },
   'claude-3-opus-20240229': {
     input: 15,
     output: 75,
     cacheRead: 1.50,
-    cacheWrite: 18.75,
+    cacheWrite5m: 18.75,
+    cacheWrite1h: 30,
   },
   // Note: Sonnet 4.5 long context (>200K input) is priced at a premium
   // ($6/$22.50/$7.50/$0.60). We use standard pricing — long context is an edge
@@ -124,49 +143,57 @@ export const MODEL_PRICING: Record<string, ModelPricing> = {
     input: 3,
     output: 15,
     cacheRead: 0.30,
-    cacheWrite: 3.75,
+    cacheWrite5m: 3.75,
+    cacheWrite1h: 6,
   },
   'claude-sonnet-4-20250514': {
     input: 3,
     output: 15,
     cacheRead: 0.30,
-    cacheWrite: 3.75,
+    cacheWrite5m: 3.75,
+    cacheWrite1h: 6,
   },
   'claude-3-7-sonnet-20250219': {
     input: 3,
     output: 15,
     cacheRead: 0.30,
-    cacheWrite: 3.75,
+    cacheWrite5m: 3.75,
+    cacheWrite1h: 6,
   },
   'claude-3-5-sonnet-20241022': {
     input: 3,
     output: 15,
     cacheRead: 0.30,
-    cacheWrite: 3.75,
+    cacheWrite5m: 3.75,
+    cacheWrite1h: 6,
   },
   'claude-3-5-sonnet-20240620': {
     input: 3,
     output: 15,
     cacheRead: 0.30,
-    cacheWrite: 3.75,
+    cacheWrite5m: 3.75,
+    cacheWrite1h: 6,
   },
   'claude-3-sonnet-20240229': {
     input: 3,
     output: 15,
     cacheRead: 0.30,
-    cacheWrite: 3.75,
+    cacheWrite5m: 3.75,
+    cacheWrite1h: 6,
   },
   'claude-3-5-haiku-20241022': {
     input: 0.80,
     output: 4,
     cacheRead: 0.08,
-    cacheWrite: 1.00,
+    cacheWrite5m: 1.00,
+    cacheWrite1h: 1.6,
   },
   'claude-3-haiku-20240307': {
     input: 0.25,
     output: 1.25,
     cacheRead: 0.025,
-    cacheWrite: 0.3125,
+    cacheWrite5m: 0.3125,
+    cacheWrite1h: 0.5,
   },
 };
 
@@ -177,7 +204,8 @@ export const DEFAULT_PRICING: ModelPricing = {
   input: 2,
   output: 10,
   cacheRead: 0.20,
-  cacheWrite: 2.50,
+  cacheWrite5m: 2.50,
+  cacheWrite1h: 4,
 };
 
 // Token usage breakdown
@@ -185,7 +213,49 @@ export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
+  /** Cache-creation tokens at the 5-minute rate. */
   cacheWriteTokens: number;
+  /** Cache-creation tokens at the 1-hour rate. Omit when the split is unknown. */
+  cacheWrite1hTokens?: number;
+}
+
+/** Cache-creation tokens split by TTL, as billed. */
+export interface CacheCreationSplit {
+  tokens5m: number;
+  tokens1h: number;
+  /**
+   * True when the JSONL carried no nested `cache_creation` breakdown and the
+   * flat total was billed entirely at the 5m rate. Callers that care about
+   * estimate quality should count these.
+   */
+  fromFlatFallback: boolean;
+}
+
+/**
+ * Split a Claude Code JSONL `message.usage` into 5m / 1h cache-creation tokens.
+ *
+ * `usage.cache_creation.{ephemeral_1h,ephemeral_5m}_input_tokens` is the
+ * authoritative breakdown and is present on 100% of the local corpus. The flat
+ * `cache_creation_input_tokens` is normally their sum, but the two disagree on
+ * a handful of rows in both directions — so any flat excess over the nested sum
+ * is billed at the 5m rate rather than dropped. Older transcripts that predate
+ * the nested field fall back to billing the flat total at 5m.
+ */
+export function splitCacheCreationTokens(usage: unknown): CacheCreationSplit {
+  const u = (usage ?? {}) as Record<string, unknown>;
+  const flat = Number(u.cache_creation_input_tokens ?? 0) || 0;
+  const nested = u.cache_creation;
+
+  if (!nested || typeof nested !== 'object') {
+    return { tokens5m: flat, tokens1h: 0, fromFlatFallback: true };
+  }
+
+  const n = nested as Record<string, unknown>;
+  const tokens1h = Number(n.ephemeral_1h_input_tokens ?? 0) || 0;
+  const tokens5m = Number(n.ephemeral_5m_input_tokens ?? 0) || 0;
+  const unexplained = Math.max(0, flat - (tokens1h + tokens5m));
+
+  return { tokens5m: tokens5m + unexplained, tokens1h, fromFlatFallback: false };
 }
 
 /**
@@ -296,7 +366,8 @@ export function calculateModelCost(usage: TokenUsage, modelId: string): number {
     (usage.inputTokens * pricing.input / 1_000_000) +
     (usage.outputTokens * pricing.output / 1_000_000) +
     (usage.cacheReadTokens * pricing.cacheRead / 1_000_000) +
-    (usage.cacheWriteTokens * pricing.cacheWrite / 1_000_000)
+    (usage.cacheWriteTokens * pricing.cacheWrite5m / 1_000_000) +
+    ((usage.cacheWrite1hTokens ?? 0) * pricing.cacheWrite1h / 1_000_000)
   );
 }
 

@@ -2,6 +2,7 @@ import { describe, expect, it, spyOn } from 'bun:test';
 import {
   calculateModelCost,
   getModelPricingDetailed,
+  splitCacheCreationTokens,
   type TokenUsage,
 } from './pricing';
 
@@ -18,7 +19,13 @@ describe('getModelPricingDetailed', () => {
     const match = getModelPricingDetailed('claude-opus-5');
     expect(match.matchQuality).toBe('exact');
     expect(match.modelId).toBe('claude-opus-5');
-    expect(match.pricing).toEqual({ input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 });
+    expect(match.pricing).toEqual({
+      input: 5,
+      output: 25,
+      cacheRead: 0.5,
+      cacheWrite5m: 6.25,
+      cacheWrite1h: 10,
+    });
   });
 
   it('matches a legacy dated id exactly', () => {
@@ -102,5 +109,92 @@ describe('calculateModelCost', () => {
       (12_000 * 5 + 3_500 * 25 + 480_000 * 0.5 + 25_000 * 6.25) / 1_000_000;
     expect(calculateModelCost(usage, 'claude-opus-5')).toBeCloseTo(expected, 10);
     expect(expected).toBeCloseTo(0.54375, 10);
+  });
+});
+
+describe('splitCacheCreationTokens', () => {
+  it('reads the nested 1h/5m breakdown', () => {
+    const split = splitCacheCreationTokens({
+      cache_creation_input_tokens: 3439,
+      cache_creation: { ephemeral_1h_input_tokens: 3000, ephemeral_5m_input_tokens: 439 },
+    });
+    expect(split).toEqual({ tokens5m: 439, tokens1h: 3000, fromFlatFallback: false });
+  });
+
+  it('falls back to the flat total at the 5m rate when the split is absent', () => {
+    const split = splitCacheCreationTokens({ cache_creation_input_tokens: 5000 });
+    expect(split).toEqual({ tokens5m: 5000, tokens1h: 0, fromFlatFallback: true });
+  });
+
+  it('bills a flat excess over the nested sum at 5m instead of dropping it', () => {
+    // Observed in the real corpus: the two fields disagree on a handful of rows.
+    const split = splitCacheCreationTokens({
+      cache_creation_input_tokens: 1000,
+      cache_creation: { ephemeral_1h_input_tokens: 600, ephemeral_5m_input_tokens: 0 },
+    });
+    expect(split).toEqual({ tokens5m: 400, tokens1h: 600, fromFlatFallback: false });
+  });
+
+  it('keeps the nested total when it exceeds the flat field', () => {
+    const split = splitCacheCreationTokens({
+      cache_creation_input_tokens: 0,
+      cache_creation: { ephemeral_1h_input_tokens: 546851, ephemeral_5m_input_tokens: 0 },
+    });
+    expect(split).toEqual({ tokens5m: 0, tokens1h: 546851, fromFlatFallback: false });
+  });
+
+  it('handles a missing usage object', () => {
+    expect(splitCacheCreationTokens(undefined)).toEqual({
+      tokens5m: 0,
+      tokens1h: 0,
+      fromFlatFallback: true,
+    });
+  });
+});
+
+describe('cache-write pricing by TTL', () => {
+  it('prices a 1h/5m mix at the two different rates', () => {
+    // Opus 5: 5m = $6.25/MTok, 1h = $10/MTok
+    const usage: TokenUsage = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 400_000,
+      cacheWrite1hTokens: 600_000,
+    };
+    // 0.4 * 6.25 + 0.6 * 10 = 2.5 + 6 = 8.5
+    expect(calculateModelCost(usage, 'claude-opus-5')).toBeCloseTo(8.5, 10);
+  });
+
+  it('prices the flat-only fallback entirely at the 5m rate', () => {
+    const usage: TokenUsage = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 1_000_000,
+    };
+    expect(calculateModelCost(usage, 'claude-opus-5')).toBeCloseTo(6.25, 10);
+  });
+
+  it('charges 1h cache writes at 2x the input rate for every model', () => {
+    for (const id of [
+      'claude-fable-5-1',
+      'claude-fable-5',
+      'claude-opus-5',
+      'claude-sonnet-5',
+      'claude-sonnet-4-6',
+      'claude-haiku-4-5',
+      'claude-opus-4-20250514',
+      'claude-3-5-haiku-20241022',
+    ]) {
+      const p = getModelPricingDetailed(id).pricing;
+      expect(p.cacheWrite1h).toBeCloseTo(p.input * 2, 10);
+    }
+  });
+
+  it('keeps Fable 5.1 cache writes at 12.50 (5m) / 20 (1h)', () => {
+    const p = getModelPricingDetailed('claude-fable-5-1').pricing;
+    expect(p.cacheWrite5m).toBe(12.5);
+    expect(p.cacheWrite1h).toBe(20);
   });
 });

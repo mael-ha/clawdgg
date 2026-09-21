@@ -27,7 +27,7 @@ import { readFile, readdir, writeFile, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { getModelPricingDetailed, type PricingMatchQuality } from "../lib/pricing";
+import { getModelPricingDetailed, splitCacheCreationTokens, type PricingMatchQuality } from "../lib/pricing";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI args
@@ -171,18 +171,35 @@ function contentLength(content: unknown): number {
 }
 
 /**
+ * Count of assistant rows whose usage carried no nested `cache_creation`
+ * breakdown, so their cache-creation tokens were all billed at the 5m rate.
+ * Reported at the end of a run — a non-zero count means that run's cache-write
+ * cost is understated.
+ */
+let rowsWithoutCacheBreakdown = 0;
+
+/**
  * USD cost from token usage + model. Returns dollars (Float64) plus how the
  * price was looked up, so the row can carry its own estimate quality.
+ *
+ * Cache creation is billed per TTL: 1h costs 2x input, 5m costs 1.25x. Pricing
+ * everything at 5m (what this did before) understates cache-write cost by ~22%
+ * on the current corpus, where 37% of cache-creation tokens are 1h.
  */
 function computeCostUsd(model: string, usage: any): { costUsd: number; pricingSource: PricingMatchQuality } {
   const { pricing: p, matchQuality } = getModelPricingDetailed(model || "");
   const input = Number(usage?.input_tokens ?? 0);
   const output = Number(usage?.output_tokens ?? 0);
   const cacheRead = Number(usage?.cache_read_input_tokens ?? 0);
-  const cacheWrite = Number(usage?.cache_creation_input_tokens ?? 0);
+  const { tokens5m, tokens1h, fromFlatFallback } = splitCacheCreationTokens(usage);
+  if (fromFlatFallback) rowsWithoutCacheBreakdown++;
   return {
     costUsd:
-      (input * p.input + output * p.output + cacheRead * p.cacheRead + cacheWrite * p.cacheWrite) / 1_000_000,
+      (input * p.input +
+        output * p.output +
+        cacheRead * p.cacheRead +
+        tokens5m * p.cacheWrite5m +
+        tokens1h * p.cacheWrite1h) / 1_000_000,
     pricingSource: matchQuality,
   };
 }
@@ -405,6 +422,20 @@ async function runDryRun(args: Args): Promise<void> {
     }
     console.log();
   }
+  reportCacheBreakdownCoverage();
+}
+
+/** Warn if any priced row lacked the 1h/5m cache-creation split. */
+function reportCacheBreakdownCoverage(): void {
+  if (rowsWithoutCacheBreakdown > 0) {
+    console.warn(
+      `[cache-split] ${rowsWithoutCacheBreakdown} priced row(s) carried no nested ` +
+      `cache_creation breakdown; their cache-creation tokens were billed at the 5m ` +
+      `rate, so cache-write cost for those rows is understated.`
+    );
+  } else {
+    console.log(`[cache-split] every priced row carried the 1h/5m cache_creation breakdown.`);
+  }
 }
 
 async function runDiffOverlap(args: Args): Promise<void> {
@@ -550,6 +581,7 @@ async function runInsert(args: Args): Promise<void> {
   await flush();
   await saveCheckpoint(checkpoint);
   console.log(`\n[insert] Done. Inserted ${totalEvents} events + ${totalMetrics} metrics.`);
+  reportCacheBreakdownCoverage();
 }
 
 /** Read one JSONL file, filter by date window, map to rows. */

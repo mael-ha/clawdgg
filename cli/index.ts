@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
-import { getModelPricing } from "../src/lib/pricing";
+import { getModelPricing, splitCacheCreationTokens } from "../src/lib/pricing";
 
 // ANSI color codes
 const colors = {
@@ -210,12 +210,16 @@ function getExtension(filepath: string): string {
 // from src/lib/pricing.ts on model ids, dates AND prices.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Calculate cost in cents from token usage
+// Calculate cost in cents from token usage.
+// Cache creation is billed per TTL — 1h costs 2x input, 5m costs 1.25x — so the
+// two are passed separately. splitCacheCreationTokens() derives them from the
+// JSONL usage object and handles transcripts that predate the nested split.
 function calculateCostCents(
   inputTokens: number,
   outputTokens: number,
   cacheReadTokens: number,
-  cacheCreationTokens: number,
+  cacheCreation5mTokens: number,
+  cacheCreation1hTokens: number,
   model: string
 ): number {
   const pricing = getModelPricing(model);
@@ -223,7 +227,8 @@ function calculateCostCents(
     (inputTokens / 1_000_000) * pricing.input +
     (outputTokens / 1_000_000) * pricing.output +
     (cacheReadTokens / 1_000_000) * pricing.cacheRead +
-    (cacheCreationTokens / 1_000_000) * pricing.cacheWrite;
+    (cacheCreation5mTokens / 1_000_000) * pricing.cacheWrite5m +
+    (cacheCreation1hTokens / 1_000_000) * pricing.cacheWrite1h;
   return Math.round(cost * 100); // Convert to cents
 }
 
@@ -370,7 +375,8 @@ async function parseSessionFile(filepath: string): Promise<{
           const inputTok = usage.input_tokens || 0;
           const outputTok = usage.output_tokens || 0;
           const cacheReadTok = usage.cache_read_input_tokens || 0;
-          const cacheCreationTok = usage.cache_creation_input_tokens || 0;
+          const { tokens5m, tokens1h } = splitCacheCreationTokens(usage);
+          const cacheCreationTok = tokens5m + tokens1h;
 
           dayStats.inputTokens += inputTok;
           dayStats.outputTokens += outputTok;
@@ -379,7 +385,7 @@ async function parseSessionFile(filepath: string): Promise<{
 
           // Calculate and add cost for this message
           if (model) {
-            const messageCost = calculateCostCents(inputTok, outputTok, cacheReadTok, cacheCreationTok, model);
+            const messageCost = calculateCostCents(inputTok, outputTok, cacheReadTok, tokens5m, tokens1h, model);
             dayStats.costUsdCents += messageCost;
 
             // Track tokens by model (input + output only, for display)
