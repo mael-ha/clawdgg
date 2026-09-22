@@ -1336,6 +1336,7 @@ api.get('/me/chart', requireAuth, async (c) => {
     // Parse query params
     const metricParam = c.req.query('metric') || 'tokens';
     const periodParam = c.req.query('period') || '30d';
+    const groupByParam = c.req.query('groupBy') || 'day';
 
     // Validate metric
     const validMetrics = ['tokens', 'cost', 'prompts', 'lines', 'commits'] as const;
@@ -1350,6 +1351,13 @@ api.get('/me/chart', requireAuth, async (c) => {
     const period: ChartPeriod = validPeriods.includes(periodParam as ChartPeriod)
       ? (periodParam as ChartPeriod)
       : '30d';
+
+    // Validate groupBy — ignored for '1d', which is always hourly
+    const validGroupBys = ['day', 'week', 'month'] as const;
+    type ChartGroupBy = typeof validGroupBys[number];
+    const groupBy: ChartGroupBy = validGroupBys.includes(groupByParam as ChartGroupBy)
+      ? (groupByParam as ChartGroupBy)
+      : 'day';
 
     const { clickhouse, getLegacyChartData, mergeChartData } = await import('../db/clickhouse');
 
@@ -1372,7 +1380,7 @@ api.get('/me/chart', requireAuth, async (c) => {
     // Use legacy SQLite data only
     // ═══════════════════════════════════════════════════════════════════════
     if (!userData?.otelEnabled) {
-      const legacyData = await getLegacyChartData(user.id, metric, period);
+      const legacyData = await getLegacyChartData(user.id, metric, period, groupBy);
       if (!legacyData) {
         return c.json({
           noData: true,
@@ -1386,7 +1394,7 @@ api.get('/me/chart', requireAuth, async (c) => {
     // ═══════════════════════════════════════════════════════════════════════
     // Case 3: OTEL user - get ClickHouse data and optionally merge with legacy
     // ═══════════════════════════════════════════════════════════════════════
-    const otelData = await clickhouse.getChartData(user.id, metric, period);
+    const otelData = await clickhouse.getChartData(user.id, metric, period, groupBy);
 
     // For hourly view, no legacy data to merge
     if (period === '1d') {
@@ -1396,14 +1404,16 @@ api.get('/me/chart', requireAuth, async (c) => {
     // Check if period extends before OTEL setup date
     const otelSetupDate = userData.otelSetupDate;
     if (otelSetupDate && period !== '1d') {
-      // Calculate the start date of the requested period
+      // Calculate the start date of the requested period. Week/month grouping
+      // doesn't widen it — buckets partition exactly the days the daily view
+      // covers — so the same day math still decides whether legacy is needed.
       const days = period === '7d' ? 7 : period === '30d' ? 30 : period === '90d' ? 90 : 365 * 10;
       const periodStartDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0]!;
 
       // If period starts before OTEL setup, fetch and merge legacy data
       if (periodStartDate < otelSetupDate) {
         // Get legacy data for dates BEFORE otelSetupDate
-        const legacyData = await getLegacyChartData(user.id, metric, period, otelSetupDate);
+        const legacyData = await getLegacyChartData(user.id, metric, period, groupBy, otelSetupDate);
 
         if (legacyData && legacyData.labels.length > 0) {
           // Merge legacy + OTEL data

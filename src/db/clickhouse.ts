@@ -29,6 +29,7 @@
 
 import { db } from './index';
 import { getModelPricing } from '../lib/pricing';
+import { bucketDailyRows, bucketLabel, bucketSql, type ChartGroupBy } from '../lib/chart-buckets';
 import { dailyStats } from './schema';
 import { eq, and, gte, lte, asc, desc } from 'drizzle-orm';
 
@@ -842,6 +843,7 @@ export async function getUserSessionStats(userId: string, days: number = 30): Pr
 
 export type ChartMetric = 'tokens' | 'cost' | 'prompts' | 'lines' | 'commits';
 export type ChartPeriod = '1d' | '7d' | '30d' | '90d' | 'all';
+export type { ChartGroupBy };
 
 export interface ChartDataPoint {
   date: string;
@@ -859,6 +861,10 @@ export interface ChartDataPoint {
 
 export interface ChartData {
   chartType: 'line' | 'bar' | 'dualBar';
+  // Canonical bucket keys, 1:1 with `labels` — 'YYYY-MM-DD' (day/week) or
+  // 'YYYY-MM' (month), or the hour label for the 1d view. mergeChartData aligns
+  // the legacy and OTEL series on these, never on the display label.
+  keys: string[];
   labels: string[];
   datasets: Array<{
     label: string;
@@ -892,6 +898,7 @@ export async function getLegacyChartData(
   userId: string,
   metric: ChartMetric,
   period: ChartPeriod,
+  groupBy: ChartGroupBy = 'day',
   endDate?: string // Optional: limit to dates before this (for OTEL users, this would be otelSetupDate)
 ): Promise<ChartData | null> {
   // "1d" (hourly) is not supported for legacy data
@@ -932,7 +939,12 @@ export async function getLegacyChartData(
     return null;
   }
 
+  // daily_stats is already one row per day — week/month collapse in JS, on the
+  // same canonical key the ClickHouse path derives in SQL.
+  const rows = bucketDailyRows(rawData, groupBy);
+
   // Transform to chart format
+  const keys: string[] = [];
   const labels: string[] = [];
   const datasets: ChartData['datasets'] = [];
   const hover: Record<string, Record<string, number>> = {};
@@ -969,8 +981,9 @@ export async function getLegacyChartData(
   // Build datasets based on metric
   const values: number[] = [];
 
-  for (const row of rawData) {
-    const dateLabel = formatDateLabel(row.date);
+  for (const row of rows) {
+    const dateLabel = bucketLabel(row.date, groupBy);
+    keys.push(row.date);
     labels.push(dateLabel);
 
     switch (metric) {
@@ -1020,10 +1033,10 @@ export async function getLegacyChartData(
   if (values.length > 0) {
     const maxIdx = values.indexOf(Math.max(...values));
     const maxValue = values[maxIdx] ?? 0;
-    const peakRow = rawData[maxIdx];
-    if (maxValue > 0 && peakRow) {
+    const peakLabel = labels[maxIdx];
+    if (maxValue > 0 && peakLabel) {
       peak = {
-        date: formatDateLabel(peakRow.date),
+        date: peakLabel,
         value: maxValue,
       };
     }
@@ -1043,6 +1056,7 @@ export async function getLegacyChartData(
 
   return {
     chartType,
+    keys,
     labels,
     datasets,
     ...(Object.keys(hover).length > 0 && { hover }),
@@ -1062,9 +1076,10 @@ export async function getLegacyChartData(
 export async function getChartData(
   userId: string,
   metric: ChartMetric,
-  period: ChartPeriod
+  period: ChartPeriod,
+  groupBy: ChartGroupBy = 'day'
 ): Promise<ChartData> {
-  // For "1d" (today), we group by hour; otherwise by date
+  // For "1d" (today), we group by hour; otherwise by the requested bucket
   const isHourly = period === '1d';
 
   // Calculate date range
@@ -1080,8 +1095,11 @@ export async function getChartData(
   let chartType: 'line' | 'bar' | 'dualBar' = 'line';
   let primaryColor = '#22d3ee'; // cyan
 
-  // For hourly view, we need to group by hour instead of date
-  const groupByClause = isHourly ? 'toHour(timestamp) as hour' : 'toString(toDate(timestamp)) as date';
+  // For hourly view, we need to group by hour instead of date.
+  // The date range itself is NOT snapped to bucket boundaries: week/month
+  // buckets stay an exact partition of the days the daily view would show, so
+  // their sums reconcile to it (the oldest bucket is simply partial).
+  const groupByClause = isHourly ? 'toHour(timestamp) as hour' : bucketSql(groupBy);
   const orderByClause = isHourly ? 'hour' : 'date';
 
   switch (metric) {
@@ -1163,6 +1181,7 @@ export async function getChartData(
   const rawData = await query<ChartDataPoint>(sql, { userId });
 
   // Transform data for charting
+  const keys: string[] = [];
   const labels: string[] = [];
   const datasets: ChartData['datasets'] = [];
   const hover: Record<string, Record<string, number>> = {};
@@ -1192,6 +1211,7 @@ export async function getChartData(
     if (isHourly) {
       for (let h = 0; h < 24; h++) {
         const label = formatHourLabel(h);
+        keys.push(label);
         labels.push(label);
         const row = dataMap.get(String(h));
         addedData.push(row?.linesAdded || 0);
@@ -1199,8 +1219,8 @@ export async function getChartData(
       }
     } else {
       for (const row of rawData) {
-        const dateLabel = formatDateLabel(row.date);
-        labels.push(dateLabel);
+        keys.push(row.date);
+        labels.push(bucketLabel(row.date, groupBy));
         addedData.push(row.linesAdded || 0);
         removedData.push(-(row.linesRemoved || 0));
       }
@@ -1217,6 +1237,7 @@ export async function getChartData(
     if (isHourly) {
       for (let h = 0; h < 24; h++) {
         const label = formatHourLabel(h);
+        keys.push(label);
         labels.push(label);
         const row = dataMap.get(String(h));
         values.push(row?.totalValue || 0);
@@ -1229,7 +1250,8 @@ export async function getChartData(
       }
     } else {
       for (const row of rawData) {
-        const dateLabel = formatDateLabel(row.date);
+        const dateLabel = bucketLabel(row.date, groupBy);
+        keys.push(row.date);
         labels.push(dateLabel);
         values.push(row.totalValue || 0);
         hover[dateLabel] = {
@@ -1248,13 +1270,15 @@ export async function getChartData(
 
     if (isHourly) {
       for (let h = 0; h < 24; h++) {
+        keys.push(formatHourLabel(h));
         labels.push(formatHourLabel(h));
         const row = dataMap.get(String(h));
         values.push(row?.totalValue || 0);
       }
     } else {
       for (const row of rawData) {
-        labels.push(formatDateLabel(row.date));
+        keys.push(row.date);
+        labels.push(bucketLabel(row.date, groupBy));
         values.push(row.totalValue || 0);
       }
     }
@@ -1300,7 +1324,7 @@ export async function getChartData(
         const peakRow = rawData[maxIdx];
         if (peakRow) {
           peak = {
-            date: formatDateLabel(peakRow.date),
+            date: bucketLabel(peakRow.date, groupBy),
             value: metric === 'lines'
               ? (peakRow.linesAdded || 0) - (peakRow.linesRemoved || 0)
               : (peakRow.totalValue || 0),
@@ -1324,6 +1348,7 @@ export async function getChartData(
 
   return {
     chartType,
+    keys,
     labels,
     datasets,
     ...(Object.keys(hover).length > 0 && { hover }),
@@ -1336,15 +1361,12 @@ export async function getChartData(
   };
 }
 
-// Format date label for chart (e.g., "Dec 24")
-function formatDateLabel(dateStr: string): string {
-  const date = new Date(dateStr);
-  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  return `${months[date.getMonth()]} ${date.getDate()}`;
-}
-
 /**
- * Merge legacy and OTEL chart data for seamless historical view
+ * Merge legacy and OTEL chart data for seamless historical view.
+ *
+ * Aligns the two backends on the canonical bucket key, never on position: with
+ * week/month grouping the bucket straddling the OTEL setup date holds rows from
+ * BOTH sources, and concatenating would render it as two bars.
  */
 export function mergeChartData(
   legacyData: ChartData | null,
@@ -1354,54 +1376,74 @@ export function mergeChartData(
     return otelData;
   }
 
-  // Merge labels and datasets
-  // Legacy data comes first chronologically
-  const mergedLabels = [...legacyData.labels, ...otelData.labels];
+  // Legacy only has "Lines Added" — pad it out to OTEL's dual structure
+  const isDualBar = otelData.chartType === 'dualBar' && legacyData.chartType === 'bar';
+  const shape = isDualBar
+    ? [{ label: 'Added', color: '#22c55e' }, { label: 'Removed', color: '#ef4444' }]
+    : otelData.datasets.map(ds => ({ label: ds.label, color: ds.color }));
 
-  // For datasets, we need to merge each dataset's data arrays
-  const mergedDatasets: ChartData['datasets'] = [];
+  // Legacy dataset labels don't always match OTEL's ("Lines Added" vs "Added"),
+  // so fall back to position when the label lookup misses
+  const seriesFor = (src: ChartData, index: number, label: string): number[] =>
+    src.datasets.find(ds => ds.label === label)?.data ?? src.datasets[index]?.data ?? [];
 
-  // Handle different chart types
-  if (otelData.chartType === 'dualBar' && legacyData.chartType === 'bar') {
-    // Legacy only has "Lines Added", OTEL has both Added and Removed
-    // We need to pad legacy data to match OTEL's dual structure
-    const legacyAdded = legacyData.datasets[0]?.data || [];
-    const legacyRemoved = new Array(legacyData.labels.length).fill(0);
+  const order: string[] = [];
+  const buckets = new Map<string, { label: string; values: number[]; hover?: Record<string, number> }>();
 
-    const otelAdded = otelData.datasets.find(d => d.label === 'Added')?.data || [];
-    const otelRemoved = otelData.datasets.find(d => d.label === 'Removed')?.data || [];
+  const absorb = (src: ChartData) => {
+    const series = shape.map((ds, i) => seriesFor(src, i, ds.label));
+    for (let i = 0; i < src.keys.length; i++) {
+      const key = src.keys[i]!;
+      const label = src.labels[i] ?? key;
+      let bucket = buckets.get(key);
+      if (!bucket) {
+        bucket = { label, values: new Array(shape.length).fill(0) };
+        buckets.set(key, bucket);
+        order.push(key);
+      }
+      for (let d = 0; d < shape.length; d++) {
+        bucket.values[d] = (bucket.values[d] ?? 0) + (series[d]?.[i] ?? 0);
+      }
+      const breakdown = src.hover?.[label];
+      if (breakdown) {
+        const acc = bucket.hover ?? (bucket.hover = {});
+        for (const [field, value] of Object.entries(breakdown)) {
+          acc[field] = (acc[field] ?? 0) + value;
+        }
+      }
+    }
+  };
 
-    mergedDatasets.push(
-      { label: 'Added', data: [...legacyAdded, ...otelAdded], color: '#22c55e' },
-      { label: 'Removed', data: [...legacyRemoved, ...otelRemoved], color: '#ef4444' }
-    );
+  absorb(legacyData);
+  absorb(otelData);
 
+  // Canonical keys ('YYYY-MM-DD', 'YYYY-MM') sort chronologically as strings
+  const mergedKeys = order.sort((a, b) => a.localeCompare(b));
+  const mergedLabels = mergedKeys.map(key => buckets.get(key)!.label);
+  const mergedDatasets: ChartData['datasets'] = shape.map((ds, d) => ({
+    label: ds.label,
+    data: mergedKeys.map(key => buckets.get(key)!.values[d] ?? 0),
+    color: ds.color,
+  }));
+
+  if (isDualBar) {
     return {
       chartType: 'dualBar',
+      keys: mergedKeys,
       labels: mergedLabels,
       datasets: mergedDatasets,
       summary: otelData.summary, // Use OTEL summary as it's more recent
     };
   }
 
-  // For matching chart types, simple concatenation
-  for (let i = 0; i < otelData.datasets.length; i++) {
-    const otelDs = otelData.datasets[i];
-    const legacyDs = legacyData.datasets[i];
-
-    if (otelDs) {
-      mergedDatasets.push({
-        label: otelDs.label,
-        data: [...(legacyDs?.data || []), ...otelDs.data],
-        color: otelDs.color,
-      });
-    }
-  }
-
   // Merge hover data if present
   let mergedHover: Record<string, Record<string, number>> | undefined;
-  if (legacyData.hover || otelData.hover) {
-    mergedHover = { ...(legacyData.hover || {}), ...(otelData.hover || {}) };
+  for (const key of mergedKeys) {
+    const breakdown = buckets.get(key)!.hover;
+    if (breakdown) {
+      mergedHover ??= {};
+      mergedHover[buckets.get(key)!.label] = breakdown;
+    }
   }
 
   // Recalculate summary from merged data
@@ -1438,6 +1480,7 @@ export function mergeChartData(
 
   return {
     chartType: otelData.chartType,
+    keys: mergedKeys,
     labels: mergedLabels,
     datasets: mergedDatasets,
     ...(mergedHover && { hover: mergedHover }),

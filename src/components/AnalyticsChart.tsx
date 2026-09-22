@@ -9,6 +9,7 @@ interface AnalyticsChartProps {
   userId: string;
   defaultMetric?: 'tokens' | 'cost' | 'prompts' | 'lines' | 'commits';
   defaultPeriod?: '7d' | '30d' | '90d' | 'all';
+  defaultGroupBy?: 'day' | 'week' | 'month';
 }
 
 // Metric configuration
@@ -28,9 +29,17 @@ const PERIODS = [
   { id: 'all', label: '∞' },
 ] as const;
 
+// Bucket granularity — ignored for "Today", which is always hourly
+const GROUP_BYS = [
+  { id: 'day', label: 'Day' },
+  { id: 'week', label: 'Week' },
+  { id: 'month', label: 'Month' },
+] as const;
+
 export const AnalyticsChart: FC<AnalyticsChartProps> = ({
   defaultMetric = 'tokens',
   defaultPeriod = '30d',
+  defaultGroupBy = 'day',
 }) => {
   return (
     <div class="analytics-chart-container">
@@ -54,22 +63,42 @@ export const AnalyticsChart: FC<AnalyticsChartProps> = ({
           ))}
         </div>
 
-        {/* Period selector tabs */}
-        <div class="flex gap-1 bg-gray-900/50 p-1 rounded-lg border border-gray-800" id="period-selector">
-          {PERIODS.map(({ id, label }) => (
-            <button
-              key={id}
-              data-period={id}
-              class={`period-tab px-3 py-1 rounded font-mono text-xs transition-all ${
-                id === defaultPeriod
-                  ? 'bg-gray-800 text-white'
-                  : 'text-gray-500 hover:text-gray-400'
-              }`}
-              onclick={`selectPeriod('${id}')`}
-            >
-              {label}
-            </button>
-          ))}
+        <div class="flex flex-wrap items-center gap-2">
+          {/* Granularity tabs */}
+          <div class="flex gap-1 bg-gray-900/50 p-1 rounded-lg border border-gray-800" id="groupby-selector">
+            {GROUP_BYS.map(({ id, label }) => (
+              <button
+                key={id}
+                data-groupby={id}
+                class={`groupby-tab px-3 py-1 rounded font-mono text-xs transition-all ${
+                  id === defaultGroupBy
+                    ? 'bg-gray-800 text-white'
+                    : 'text-gray-500 hover:text-gray-400'
+                }`}
+                onclick={`selectGroupBy('${id}')`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {/* Period selector tabs */}
+          <div class="flex gap-1 bg-gray-900/50 p-1 rounded-lg border border-gray-800" id="period-selector">
+            {PERIODS.map(({ id, label }) => (
+              <button
+                key={id}
+                data-period={id}
+                class={`period-tab px-3 py-1 rounded font-mono text-xs transition-all ${
+                  id === defaultPeriod
+                    ? 'bg-gray-800 text-white'
+                    : 'text-gray-500 hover:text-gray-400'
+                }`}
+                onclick={`selectPeriod('${id}')`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -118,7 +147,7 @@ export const AnalyticsChart: FC<AnalyticsChartProps> = ({
         </div>
         <div class="text-center">
           <div id="summary-average" class="text-xl font-bold text-white font-mono">—</div>
-          <div class="text-gray-600 text-xs font-mono">avg/day</div>
+          <div id="summary-average-label" class="text-gray-600 text-xs font-mono">avg/{defaultGroupBy}</div>
         </div>
         <div class="text-center">
           <div id="summary-peak" class="text-xl font-bold text-white font-mono">—</div>
@@ -137,8 +166,14 @@ export const AnalyticsChart: FC<AnalyticsChartProps> = ({
             // State
             let currentMetric = '${defaultMetric}';
             let currentPeriod = '${defaultPeriod}';
+            let currentGroupBy = '${defaultGroupBy}';
             let chartInstance = null;
             let hoverData = null;
+
+            // "Today" is always hourly — groupBy is ignored server-side
+            function effectiveGroupBy() {
+              return currentPeriod === '1d' ? 'hour' : currentGroupBy;
+            }
 
             // Format numbers with K/M/B suffix
             function formatNumber(n) {
@@ -149,9 +184,9 @@ export const AnalyticsChart: FC<AnalyticsChartProps> = ({
             }
 
             // Fetch chart data from API
-            async function fetchChartData(metric, period) {
+            async function fetchChartData(metric, period, groupBy) {
               try {
-                const response = await fetch('/api/me/chart?metric=' + metric + '&period=' + period, {
+                const response = await fetch('/api/me/chart?metric=' + metric + '&period=' + period + '&groupBy=' + groupBy, {
                   credentials: 'include'
                 });
                 const data = await response.json();
@@ -335,6 +370,7 @@ export const AnalyticsChart: FC<AnalyticsChartProps> = ({
             function updateSummary(summary) {
               document.getElementById('summary-total').textContent = formatNumber(summary.total);
               document.getElementById('summary-average').textContent = formatNumber(summary.average);
+              document.getElementById('summary-average-label').textContent = 'avg/' + effectiveGroupBy();
               document.getElementById('summary-peak').textContent = summary.peak ? summary.peak.date : '—';
 
               const trendEl = document.getElementById('summary-trend');
@@ -358,6 +394,13 @@ export const AnalyticsChart: FC<AnalyticsChartProps> = ({
               loadChart();
             };
 
+            // Select bucket granularity
+            window.selectGroupBy = function(groupBy) {
+              currentGroupBy = groupBy;
+              updateControls();
+              loadChart();
+            };
+
             // Update control visual state
             function updateControls() {
               // Update metric pills
@@ -374,6 +417,15 @@ export const AnalyticsChart: FC<AnalyticsChartProps> = ({
                 const isActive = btn.dataset.period === currentPeriod;
                 btn.className = 'period-tab px-3 py-1 rounded font-mono text-xs transition-all ' +
                   (isActive ? 'bg-gray-800 text-white' : 'text-gray-500 hover:text-gray-400');
+              });
+
+              // Update granularity tabs — dimmed while "Today" forces hourly
+              const groupByIgnored = currentPeriod === '1d';
+              document.querySelectorAll('.groupby-tab').forEach(btn => {
+                const isActive = !groupByIgnored && btn.dataset.groupby === currentGroupBy;
+                btn.className = 'groupby-tab px-3 py-1 rounded font-mono text-xs transition-all ' +
+                  (isActive ? 'bg-gray-800 text-white' : 'text-gray-500 hover:text-gray-400') +
+                  (groupByIgnored ? ' opacity-40' : '');
               });
             }
 
@@ -432,7 +484,7 @@ export const AnalyticsChart: FC<AnalyticsChartProps> = ({
               if (loading) loading.style.display = 'flex';
               if (canvas) canvas.style.display = 'none';
 
-              const data = await fetchChartData(currentMetric, currentPeriod);
+              const data = await fetchChartData(currentMetric, currentPeriod, currentGroupBy);
 
               // Handle special responses
               if (data && data.noData) {
