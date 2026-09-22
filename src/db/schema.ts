@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, index, uniqueIndex } from 'drizzle-orm/sqlite-core';
+import { sqliteTable, text, integer, real, index, uniqueIndex } from 'drizzle-orm/sqlite-core';
 import { sql } from 'drizzle-orm';
 
 // Users table
@@ -148,6 +148,27 @@ export const deviceAuths = sqliteTable('device_auths', {
   expiresAtIdx: index('expires_at_idx').on(table.expiresAt),
 }));
 
+// Plan usage snapshots (Pro/Max rate-limit windows captured via the statusLine hook)
+// One row per observed CHANGE of a window — see src/lib/plan-usage.ts for the
+// dedup rule. Timestamps are raw unix epoch SECONDS (not `mode: 'timestamp'`)
+// because resetsAt arrives from Claude Code already in that form.
+export const planUsageSnapshots = sqliteTable('plan_usage_snapshots', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  userId: text('user_id')
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  windowType: text('window_type').notNull(), // 'five_hour' | 'seven_day' | 'spend_limit'
+  usedPercentage: real('used_percentage').notNull(), // 0-100
+  resetsAt: integer('resets_at'), // null when Claude Code omitted it
+  capturedAt: integer('captured_at').notNull(),
+}, (table) => ({
+  userWindowCapturedIdx: index('plan_usage_user_window_captured_idx').on(
+    table.userId,
+    table.windowType,
+    table.capturedAt
+  ),
+}));
+
 // Export types
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
@@ -155,3 +176,5 @@ export type DailyStat = typeof dailyStats.$inferSelect;
 export type NewDailyStat = typeof dailyStats.$inferInsert;
 export type DeviceAuth = typeof deviceAuths.$inferSelect;
 export type NewDeviceAuth = typeof deviceAuths.$inferInsert;
+export type PlanUsageSnapshot = typeof planUsageSnapshots.$inferSelect;
+export type NewPlanUsageSnapshot = typeof planUsageSnapshots.$inferInsert;

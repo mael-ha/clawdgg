@@ -1,10 +1,11 @@
 import { Hono } from 'hono';
 import { db } from '../db';
-import { dailyStats, users } from '../db/schema';
+import { dailyStats, users, planUsageSnapshots } from '../db/schema';
 import { eq, sql, desc, and, gte, asc } from 'drizzle-orm';
 import { requireAuth, optionalAuth } from '../lib/auth-middleware';
 import type { StatsSubmission, LeaderboardEntry, LeaderboardResponse } from '../types';
 import { computeBadges, formatBadgesCompact, type BadgeInput } from '../lib/badges';
+import { normalizeEpochSeconds, parseRateLimits, shouldInsertSnapshot } from '../lib/plan-usage';
 
 const api = new Hono();
 
@@ -968,6 +969,83 @@ api.post('/otel/disable', requireAuth, async (c) => {
   } catch (error) {
     console.error('Error disabling OTel:', error);
     return c.json({ error: 'Failed to disable OTel' }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Plan Usage - Pro/Max rate-limit windows pushed by the CLI statusLine hook
+// ═══════════════════════════════════════════════════════════════════════════
+
+// POST /api/plan-usage - Record a snapshot per rate-limit window
+// Body: { rate_limits?: {...}, capturedAt?: <epoch seconds>, sessionId?: string }
+//
+// Claude Code re-renders the status line many times per minute, so this endpoint
+// is deliberately forgiving AND deliberately stingy about writes:
+//   - a payload with no usable window is a 200 no-op, never an error
+//   - a window is only written when it actually moved (see shouldInsertSnapshot)
+// sessionId is accepted but not stored — the table is keyed on user + window.
+api.post('/plan-usage', requireAuth, async (c) => {
+  try {
+    const user = c.get('user');
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    let body: { rate_limits?: unknown; capturedAt?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON' }, 400);
+    }
+
+    const { windows, rejected } = parseRateLimits(body?.rate_limits);
+
+    // Trust the client's capture time only when it's a plausible epoch that
+    // isn't in the future — the statusLine hook runs on the user's machine.
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const claimedAt = normalizeEpochSeconds(body?.capturedAt);
+    const capturedAt = claimedAt !== null && claimedAt <= nowSeconds + 60 ? claimedAt : nowSeconds;
+
+    let inserted = 0;
+    for (const window of windows) {
+      const latest = await db
+        .select({
+          usedPercentage: planUsageSnapshots.usedPercentage,
+          resetsAt: planUsageSnapshots.resetsAt,
+          capturedAt: planUsageSnapshots.capturedAt,
+        })
+        .from(planUsageSnapshots)
+        .where(
+          and(
+            eq(planUsageSnapshots.userId, user.id),
+            eq(planUsageSnapshots.windowType, window.windowType)
+          )
+        )
+        .orderBy(desc(planUsageSnapshots.capturedAt))
+        .limit(1)
+        .get();
+
+      if (!shouldInsertSnapshot(latest, window, capturedAt)) continue;
+
+      await db.insert(planUsageSnapshots).values({
+        userId: user.id,
+        windowType: window.windowType,
+        usedPercentage: window.usedPercentage,
+        resetsAt: window.resetsAt,
+        capturedAt,
+      });
+      inserted++;
+    }
+
+    return c.json({
+      success: true,
+      inserted,
+      skipped: windows.length - inserted,
+      rejected,
+    });
+  } catch (error) {
+    console.error('Error recording plan usage:', error);
+    return c.json({ error: 'Failed to record plan usage' }, 500);
   }
 });
 

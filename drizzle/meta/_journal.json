@@ -57,6 +57,13 @@
       "when": 1778345400000,
       "tag": "0007_add_user_token_gen",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1790000000000,
+      "tag": "0008_add_plan_usage_snapshots",
+      "breakpoints": true
     }
   ]
 }
