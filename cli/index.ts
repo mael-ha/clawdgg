@@ -6,6 +6,25 @@ import { join } from "node:path";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { getModelPricing, splitCacheCreationTokens } from "../src/lib/pricing";
+import {
+  API_BASE_URL,
+  CACHE_FILE,
+  CLAUDE_PROJECTS_DIR,
+  CLAUDE_SETTINGS_PATH,
+  CONFIG_DIR,
+  CONFIG_FILE,
+  LEGACY_CONFIG_FILE,
+  PREV_CONFIG_DIR,
+  PREV_CONFIG_FILE,
+  STATS_FILE,
+} from "./paths";
+import {
+  applyStatusLineSetting,
+  cmdStatusline,
+  removeStatusLineSetting,
+  STATUSLINE_COMMAND,
+  type StatusLineMergeResult,
+} from "./statusline";
 
 // ANSI color codes
 const colors = {
@@ -33,25 +52,6 @@ const log = {
     console.log(`\n${colors.bright}${colors.cyan}${msg}${colors.reset}\n`),
   dim: (msg: string) => console.log(`${colors.dim}${msg}${colors.reset}`),
 };
-
-// File paths
-const STATS_FILE = join(homedir(), ".claude", "stats-cache.json");
-const CLAUDE_PROJECTS_DIR = join(homedir(), ".claude", "projects");
-const CLAUDE_SETTINGS_PATH = join(homedir(), ".claude", "settings.json");
-const CONFIG_DIR = join(homedir(), ".config", "clawdgg");
-const CONFIG_FILE = join(CONFIG_DIR, "config.json");
-const CACHE_FILE = join(CONFIG_DIR, "cache.json");
-// Previous config location (renamed from `clawd` to `clawdgg` in May 2026 to
-// avoid namespace collision with unrelated upstream "clawd" projects).
-const PREV_CONFIG_DIR = join(homedir(), ".config", "clawd");
-const PREV_CONFIG_FILE = join(PREV_CONFIG_DIR, "config.json");
-// Original legacy config location (renamed to ~/.config/clawd in 2025).
-const LEGACY_CONFIG_DIR = join(homedir(), ".clawd-gg");
-const LEGACY_CONFIG_FILE = join(LEGACY_CONFIG_DIR, "config.json");
-
-// API configuration
-const API_BASE_URL =
-  process.env.CLAWDGG_API_URL || "https://clawd.gg";
 
 // Types
 interface DailyActivity {
@@ -1125,6 +1125,18 @@ async function cmdDoctor(): Promise<void> {
   }
 
   log.success("OTEL exporter: token in settings.json matches current login.");
+
+  // 3. Status line hook — the only source of plan-usage (5h / 7d) data.
+  //    Probe a throwaway object so one detection rule serves both paths.
+  const statusLineProbe = applyStatusLineSetting({ statusLine: settings?.statusLine });
+  if (statusLineProbe.action === "already-ours") {
+    log.success("Status line: plan usage (5h / 7d limits) is reporting.");
+  } else if (statusLineProbe.action === "conflict") {
+    log.warn(`Status line is someone else's (${statusLineProbe.existing}) — plan usage isn't reporting.`);
+  } else {
+    log.warn("No status line configured — plan usage isn't reporting. Run `clawdgg setup`.");
+  }
+
   log.success("Telemetry should be flowing. Check https://clawd.gg/u/" + (payload.username || ""));
 }
 
@@ -1434,6 +1446,31 @@ async function refreshOtelHeaderInClaudeSettings(token: string): Promise<boolean
   return true;
 }
 
+// Report what happened to the user's statusLine. We never replace one we
+// didn't write, so a conflict gets instructions instead of a silent overwrite.
+function reportStatusLineMerge(result: StatusLineMergeResult): void {
+  if (result.action === "already-ours") return;
+
+  if (result.action === "added") {
+    log.success("Status line registered — your plan limits (5h / 7d) sync too.");
+    // Claude Code runs the command through the shell, so a one-off `npx` user
+    // has nothing to run. Say so rather than leaving a broken status line.
+    if (!Bun.which("clawdgg")) {
+      log.dim(`    Install globally (npm i -g clawdgg) so \`${STATUSLINE_COMMAND}\` resolves.`);
+    }
+    console.log();
+    return;
+  }
+
+  log.warn("You already have a status line configured, so we left it alone:");
+  log.dim(`    ${result.existing}`);
+  console.log();
+  console.log(`  ${colors.dim}To sync plan usage too, call${colors.reset} ${colors.cyan}${STATUSLINE_COMMAND}${colors.reset} ${colors.dim}from your own`);
+  console.log(`  status line, or set${colors.reset} ${colors.cyan}"statusLine": { "type": "command", "command": "${STATUSLINE_COMMAND}" }${colors.reset}`);
+  console.log(`  ${colors.dim}in ${CLAUDE_SETTINGS_PATH}.${colors.reset}`);
+  console.log();
+}
+
 async function cmdSetup(): Promise<void> {
   log.title("Setting up auto-sync");
 
@@ -1473,11 +1510,16 @@ async function cmdSetup(): Promise<void> {
   const encodedToken = encodeURIComponent(`Bearer ${config.token}`);
   settings.env.OTEL_EXPORTER_OTLP_HEADERS = `Authorization=${encodedToken}`;
 
-  // 5. Write back
+  // 5. Register the status line hook — the only channel that exposes the
+  //    Pro/Max rate-limit windows. Never replaces a statusLine the user
+  //    already has.
+  const statusLine = applyStatusLineSetting(settings);
+
+  // 6. Write back
   await mkdir(join(homedir(), ".claude"), { recursive: true });
   await writeFile(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2));
 
-  // 6. Notify server (mark user as OTel-enabled)
+  // 7. Notify server (mark user as OTel-enabled)
   try {
     await fetch(`${API_BASE_URL}/api/otel/enable`, {
       method: "POST",
@@ -1487,12 +1529,13 @@ async function cmdSetup(): Promise<void> {
     // Non-critical, continue
   }
 
-  // 7. Success output
+  // 8. Success output
   console.log();
   log.success("Auto-sync enabled!");
   console.log();
   console.log(`  ${colors.cyan}Your stats will now stream to clawd.gg automatically.${colors.reset}`);
   console.log();
+  reportStatusLineMerge(statusLine);
   console.log(`  ${colors.yellow}⚠  Restart Claude Code to activate.${colors.reset}`);
   console.log();
   log.dim(`Config written to: ${CLAUDE_SETTINGS_PATH}`);
@@ -1516,6 +1559,9 @@ async function cmdUnsetup(): Promise<void> {
     log.error("Could not read settings file.");
     process.exit(1);
   }
+
+  // Remove our status line hook (leaves anyone else's alone)
+  const statusLineRemoval = removeStatusLineSetting(settings);
 
   // Remove OTel configuration
   if (settings.env) {
@@ -1550,6 +1596,9 @@ async function cmdUnsetup(): Promise<void> {
 
   console.log();
   log.success("Auto-sync disabled.");
+  if (statusLineRemoval === "removed") {
+    log.success("Status line hook removed.");
+  }
   console.log();
   log.dim("Restart Claude Code for changes to take effect.");
   log.dim("Your existing stats on clawd.gg are still there.");
@@ -1709,9 +1758,7 @@ ${colors.bright}${colors.cyan}clawd.gg${colors.reset} ${colors.dim}— let's go!
     // Check if already set up
     const alreadySetup = settings.env?.OTEL_EXPORTER_OTLP_ENDPOINT?.includes('clawd.gg');
 
-    if (alreadySetup) {
-      console.log(`      ${colors.green}✓${colors.reset} OTEL streaming already configured`);
-    } else {
+    if (!alreadySetup) {
       // Configure OTEL
       settings.env = settings.env || {};
       settings.env.CLAUDE_CODE_ENABLE_TELEMETRY = "1";
@@ -1721,10 +1768,20 @@ ${colors.bright}${colors.cyan}clawd.gg${colors.reset} ${colors.dim}— let's go!
       settings.env.OTEL_EXPORTER_OTLP_ENDPOINT = `${API_BASE_URL}/otel`;
       const encodedToken = encodeURIComponent(`Bearer ${config.token}`);
       settings.env.OTEL_EXPORTER_OTLP_HEADERS = `Authorization=${encodedToken}`;
+    }
 
+    // Status line hook (plan usage) — applied independently of OTEL so users
+    // who set up streaming before this existed still get it.
+    const statusLine = applyStatusLineSetting(settings);
+
+    if (!alreadySetup || statusLine.action === "added") {
       await mkdir(join(homedir(), ".claude"), { recursive: true });
       await writeFile(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2));
+    }
 
+    if (alreadySetup) {
+      console.log(`      ${colors.green}✓${colors.reset} OTEL streaming already configured`);
+    } else {
       // Notify server
       try {
         await fetch(`${API_BASE_URL}/api/otel/enable`, {
@@ -1736,6 +1793,12 @@ ${colors.bright}${colors.cyan}clawd.gg${colors.reset} ${colors.dim}— let's go!
       }
 
       console.log(`      ${colors.green}✓${colors.reset} OTEL streaming configured`);
+    }
+
+    if (statusLine.action === "conflict") {
+      console.log(`      ${colors.yellow}⚠${colors.reset} Kept your existing status line — run \`clawdgg setup\` to see how to add ours`);
+    } else {
+      console.log(`      ${colors.green}✓${colors.reset} Status line registered (plan usage)`);
     }
   } catch (error) {
     log.error(`Setup failed: ${error}`);
@@ -1819,6 +1882,11 @@ async function main() {
     }
     case "status":
       await cmdStatus();
+      break;
+    // Invoked by Claude Code's statusLine hook, not by hand — reads the
+    // session JSON on stdin and prints one line.
+    case "statusline":
+      await cmdStatusline();
       break;
     case "setup":
       await cmdSetup();
