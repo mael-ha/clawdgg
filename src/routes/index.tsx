@@ -44,7 +44,10 @@ const PAGE_SIZE = 25;
 function pageArgs(c: {
   req: { query: (key: string) => string | undefined };
 }): { board: BoardKey; scope: BoardScope } {
-  return { board: parseBoard(c.req.query('board')), scope: parseScope(c.req.query('scope')) };
+  // Board first: the scope is validated against THAT board's pair, so
+  // switching boards with a stale `scope` in the form lands on its default.
+  const board = parseBoard(c.req.query('board'));
+  return { board, scope: parseScope(c.req.query('scope'), board) };
 }
 
 /**

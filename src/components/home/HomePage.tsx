@@ -1,11 +1,18 @@
 import type { FC } from 'hono/jsx';
 import type { SessionUser } from '../../types';
 import { Wordmark } from '../Layout';
-import { BOARDS, type BoardKey, type BoardRow, type BoardScope, type GlobalPulse } from '../../lib/boards';
+import {
+  BOARDS,
+  SCOPE_LABELS,
+  type BoardKey,
+  type BoardRow,
+  type BoardScope,
+  type GlobalPulse,
+} from '../../lib/boards';
 import { Pitch } from './Pitch';
 import { BoardTabs, BOARD_PANEL_ID } from './BoardTabs';
 import { Podium } from './Podium';
-import { BoardTable, SCOPE_LABELS } from './BoardRows';
+import { BoardTable } from './BoardRows';
 import { Pulse } from './Pulse';
 
 /**
@@ -90,7 +97,7 @@ const EmptyBoard: FC<{ board: BoardKey; scope: BoardScope; loggedIn: boolean }> 
   <div class="rounded-[14px] border border-[#1a1f2b] bg-[#0b0d12] px-6 py-12 text-center">
     <div class="mb-3 text-4xl">{BOARDS[board].emoji}</div>
     <h3 class="mb-1.5 text-lg font-bold text-[#c9ccd4]">
-      no {BOARDS[board].label} {SCOPE_LABELS[scope]}
+      {board === 'streak' ? `no ${SCOPE_LABELS[scope]} to show` : `no ${BOARDS[board].label} ${SCOPE_LABELS[scope]}`}
     </h3>
     <p class="font-mono text-[13px] text-[#6f7686]">
       {scope === 'week'
@@ -107,6 +114,22 @@ const EmptyBoard: FC<{ board: BoardKey; scope: BoardScope; loggedIn: boolean }> 
     )}
   </div>
 );
+
+/**
+ * The crab, kept.
+ *
+ * It predates every layout this page has had and it is part of what the site
+ * IS — a terminal that happens to be a website. Monochrome, so it sits under
+ * the boards rather than competing with them.
+ */
+const CRAB = `    .---.
+   /     \\
+   \\.@-@./
+   /\`\\_/\`\\
+  //  _  \\\\
+ | \\     )|_
+/\`\\_\`>  <_/ \\
+\\__/'---'\\__/`;
 
 const Footer: FC = () => (
   <footer class="border-t border-[#141821] px-6 py-10">
@@ -132,6 +155,10 @@ const Footer: FC = () => (
       </div>
       <span>never sends prompt text</span>
     </div>
+    <div class="mt-8 text-center">
+      <pre class="inline-block text-xs leading-tight text-[#1f2937]" aria-hidden="true">{CRAB}</pre>
+    </div>
+    <div class="mt-4 text-center font-mono text-xs text-[#232b36]">// EOF</div>
   </footer>
 );
 
@@ -171,6 +198,7 @@ export const HomePage: FC<{ view: HomeView }> = ({ view }) => {
             <>
               <Podium
                 board={board}
+                scope={scope}
                 rows={rows.slice(0, 3)}
                 comparedTo={comparedTo}
                 scopeLabel={SCOPE_LABELS[scope]}

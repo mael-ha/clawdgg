@@ -1,5 +1,5 @@
 import type { FC } from 'hono/jsx';
-import { BOARDS, type BoardKey, type BoardRow } from '../../lib/boards';
+import { boardCaption, type BoardKey, type BoardRow, type BoardScope } from '../../lib/boards';
 import { MiniClock } from './MiniClock';
 import { RankDelta, SideFigures } from './RankDelta';
 
@@ -30,6 +30,7 @@ const CENTERED_GOLD = ['sm:order-2', 'sm:order-1', 'sm:order-3'] as const;
 
 interface PodiumProps {
   board: BoardKey;
+  scope: BoardScope;
   /** The first three rows of the board, in rank order. 0–3 of them. */
   rows: BoardRow[];
   comparedTo: string | null;
@@ -38,12 +39,13 @@ interface PodiumProps {
 
 const PodiumCard: FC<{
   board: BoardKey;
+  scope: BoardScope;
   row: BoardRow;
   place: number;
   order: string;
   comparedTo: string | null;
   scopeLabel: string;
-}> = ({ board, row, place, order, comparedTo, scopeLabel }) => (
+}> = ({ board, scope, row, place, order, comparedTo, scopeLabel }) => (
   <div
     class={`flex flex-col gap-2.5 rounded-[14px] border bg-[#0b0d12] p-[18px] ${BORDERS[place]} ${HEIGHTS[place]} ${order} ${
       row.isViewer ? 'ring-1 ring-cyan-400/40' : ''
@@ -73,7 +75,7 @@ const PodiumCard: FC<{
       {row.display}
     </span>
     <span class="text-[11px] text-[#6f7686]">
-      {BOARDS[board].caption} · {scopeLabel}
+      {boardCaption(board, scope)} · {scopeLabel}
     </span>
     <span class="mt-auto text-[11px] text-[#8a91a0]">
       <SideFigures row={row} />
@@ -81,7 +83,7 @@ const PodiumCard: FC<{
   </div>
 );
 
-export const Podium: FC<PodiumProps> = ({ board, rows, comparedTo, scopeLabel }) => {
+export const Podium: FC<PodiumProps> = ({ board, scope, rows, comparedTo, scopeLabel }) => {
   if (rows.length === 0) return null;
 
   // Two entrants get two columns, not three with a gap. One gets a single card
@@ -99,6 +101,7 @@ export const Podium: FC<PodiumProps> = ({ board, rows, comparedTo, scopeLabel })
         <PodiumCard
           key={row.userId}
           board={board}
+          scope={scope}
           row={row}
           place={place}
           order={rows.length >= 3 ? CENTERED_GOLD[place]! : ''}

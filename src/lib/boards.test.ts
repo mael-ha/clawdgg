@@ -9,6 +9,8 @@ import { rankSnapshots } from '../db/schema';
 import {
   BOARDS,
   BOARD_KEYS,
+  SCOPE_LABELS,
+  boardCaption,
   boardMetricName,
   boardRankChanges,
   boardRowFor,
@@ -136,6 +138,7 @@ function figures(overrides: Partial<BoardFigures> = {}): BoardFigures {
     promptChars: 0,
     prompts: 0,
     streak: 0,
+    longestStreak: 0,
     ...overrides,
   };
 }
@@ -151,10 +154,28 @@ describe('boardValue', () => {
   });
 
   it('reads each board off its own figure', () => {
-    expect(boardValue('value', sample)).toBe(1_284.4);
-    expect(boardValue('streak', sample)).toBe(19);
-    expect(boardValue('ultrathinks', sample)).toBe(312);
-    expect(boardValue('leverage', sample)).toBe(20);
+    expect(boardValue('value', sample, 'week')).toBe(1_284.4);
+    expect(boardValue('streak', sample, 'current')).toBe(19);
+    expect(boardValue('ultrathinks', sample, 'week')).toBe(312);
+    expect(boardValue('leverage', sample, 'week')).toBe(20);
+  });
+
+  /**
+   * 🔥 is the one board whose two scopes read different COLUMNS rather than
+   * the same figure over a different window — "this week's streak" is not a
+   * number anybody has.
+   */
+  it('reads the streak board off current or longest, by scope', () => {
+    const runner = figures({ streak: 4, longestStreak: 31 });
+    expect(boardValue('streak', runner, 'current')).toBe(4);
+    expect(boardValue('streak', runner, 'best')).toBe(31);
+  });
+
+  it('ignores the scope on the three boards that are windowed', () => {
+    for (const scope of ['week', 'all'] as const) {
+      expect(boardValue('value', sample, scope)).toBe(1_284.4);
+      expect(boardValue('ultrathinks', sample, scope)).toBe(312);
+    }
   });
 
   /**
@@ -164,13 +185,15 @@ describe('boardValue', () => {
    */
   it('never counts an ultrathink as a prompt', () => {
     const quiet = figures({ prompts: 10, ultrathinks: 7, promptChars: 100, outputTokens: 25 });
-    expect(boardValue('ultrathinks', quiet)).toBe(7);
-    expect(boardValue('leverage', quiet)).toBe(1);
+    expect(boardValue('ultrathinks', quiet, 'week')).toBe(7);
+    expect(boardValue('leverage', quiet, 'week')).toBe(1);
     expect(quiet.prompts).toBe(10);
   });
 
   it('has a figure of zero for a user with no rows', () => {
-    for (const board of BOARD_KEYS) expect(boardValue(board, figures())).toBe(0);
+    for (const board of BOARD_KEYS) {
+      for (const scope of BOARDS[board].scopes) expect(boardValue(board, figures(), scope)).toBe(0);
+    }
   });
 });
 
@@ -205,6 +228,7 @@ function boardUser(userId: string, overrides: Partial<BoardUser> = {}): BoardUse
     avatarUrl: null,
     timezone: 'UTC',
     streak: 0,
+    longestStreak: 0,
     visibility: defaultVisibility(),
     ...overrides,
   };
@@ -218,6 +242,7 @@ describe('rankBoard', () => {
   it('ranks the highest figure first, from 1', () => {
     const ranked = rankBoard(
       'value',
+      'week',
       [boardUser('a'), boardUser('b'), boardUser('c')],
       figureMap([
         ['a', { valueUsd: 10 }],
@@ -252,6 +277,7 @@ describe('rankBoard', () => {
     ]);
     const ranked = rankBoard(
       'value',
+      'week',
       [boardUser('github_10'), boardUser('github_1_x')],
       tied
     );
@@ -265,8 +291,8 @@ describe('rankBoard', () => {
       ['adam', { ultrathinks: 5 }],
       ['mia', { ultrathinks: 5 }],
     ]);
-    const first = rankBoard('ultrathinks', [boardUser('zoe'), boardUser('adam'), boardUser('mia')], tied);
-    const second = rankBoard('ultrathinks', [boardUser('mia'), boardUser('zoe'), boardUser('adam')], tied);
+    const first = rankBoard('ultrathinks', 'week', [boardUser('zoe'), boardUser('adam'), boardUser('mia')], tied);
+    const second = rankBoard('ultrathinks', 'week', [boardUser('mia'), boardUser('zoe'), boardUser('adam')], tied);
     expect(first.map((r) => r.userId)).toEqual(['adam', 'mia', 'zoe']);
     expect(second.map((r) => r.userId)).toEqual(first.map((r) => r.userId));
     expect(first.map((r) => r.rank)).toEqual([1, 2, 3]);
@@ -276,6 +302,7 @@ describe('rankBoard', () => {
   it('leaves out a user whose figure is zero', () => {
     const ranked = rankBoard(
       'ultrathinks',
+      'week',
       [boardUser('a'), boardUser('b')],
       figureMap([
         ['a', { ultrathinks: 0 }],
@@ -296,6 +323,7 @@ describe('rankBoard', () => {
     hidden.value = false;
     const ranked = rankBoard(
       'value',
+      'week',
       [boardUser('a'), boardUser('shy', { visibility: hidden }), boardUser('c')],
       figureMap([
         ['a', { valueUsd: 10 }],
@@ -314,6 +342,7 @@ describe('rankBoard', () => {
     hidden.ultrathink = false;
     const ranked = rankBoard(
       'value',
+      'week',
       [boardUser('shy', { visibility: hidden })],
       figureMap([['shy', { valueUsd: 99 }]])
     );
@@ -323,6 +352,7 @@ describe('rankBoard', () => {
   it('reads the streak board off the synced streak, not ClickHouse', () => {
     const ranked = rankBoard(
       'streak',
+      'current',
       [boardUser('a', { streak: 4 }), boardUser('b', { streak: 31 })],
       new Map()
     );
@@ -333,7 +363,7 @@ describe('rankBoard', () => {
   });
 
   it('has nothing to rank with no users', () => {
-    expect(rankBoard('value', [], new Map())).toEqual([]);
+    expect(rankBoard('value', 'week', [], new Map())).toEqual([]);
   });
 
   // Every board hides behind a section that exists, or a hidden profile would
@@ -361,7 +391,7 @@ describe('boardRowFor', () => {
   const figure = figures({ userId: 'a', ultrathinks: 312 });
 
   it('shows the clock, the class and both side figures by default', () => {
-    const row = boardRowFor('value', entry, boardUser('a', { streak: 19 }), figure, evidence, 3);
+    const row = boardRowFor('value', 'week', entry, boardUser('a', { streak: 19 }), figure, evidence, 3);
     expect(row.hours).toEqual(evidence.hours);
     expect(row.classLabel).toBe('☀️ morning orchestrator');
     expect(row.ultrathinks).toBe(312);
@@ -391,6 +421,7 @@ describe('boardRowFor', () => {
       visibility[section] = false;
       const row = boardRowFor(
         'value',
+        'week',
         entry,
         boardUser('a', { streak: 19, visibility }),
         figure,
@@ -412,7 +443,7 @@ describe('boardRowFor', () => {
     visibility.class = false;
     visibility.ultrathink = false;
     visibility.curve = false;
-    const row = boardRowFor('value', entry, boardUser('a', { visibility }), figure, evidence, undefined);
+    const row = boardRowFor('value', 'week', entry, boardUser('a', { visibility }), figure, evidence, undefined);
     expect(row.display).toBe('$1,284');
     expect(row.rank).toBe(2);
     expect(row.change).toBeUndefined();
@@ -424,13 +455,13 @@ describe('boardRowFor', () => {
    * than tell everyone they have none.
    */
   it('leaves out the ultrathink figure when the figures could not be read', () => {
-    const row = boardRowFor('streak', entry, boardUser('a', { streak: 19 }), undefined, evidence, undefined);
+    const row = boardRowFor('streak', 'best', entry, boardUser('a', { streak: 19 }), undefined, evidence, undefined);
     expect(row.ultrathinks).toBeUndefined();
     expect(row.streak).toBe(19);
   });
 
   it('has no clock at all when the class evidence could not be read', () => {
-    const row = boardRowFor('value', entry, boardUser('a'), figure, undefined, undefined);
+    const row = boardRowFor('value', 'week', entry, boardUser('a'), figure, undefined, undefined);
     expect(row.hours).toBeUndefined();
     expect(row.classLabel).toBeUndefined();
   });
@@ -532,6 +563,91 @@ describe('parseBoard / parseScope', () => {
   });
 });
 
+describe('scopes per board', () => {
+  // "This week's streak" is not a number anybody has, so 🔥 switches between
+  // the run you are on and the longest one you ever had instead.
+  it('offers current/best on the streak board and week/all on the others', () => {
+    expect(BOARDS.streak.scopes).toEqual(['current', 'best']);
+    for (const board of ['value', 'ultrathinks', 'leverage'] as const) {
+      expect(BOARDS[board].scopes).toEqual(['week', 'all']);
+    }
+  });
+
+  it('validates the scope against the board it belongs to', () => {
+    expect(parseScope('best', 'streak')).toBe('best');
+    expect(parseScope('current', 'streak')).toBe('current');
+    // Switching boards carries the old scope in the form: it must land on the
+    // new board's default rather than on a board that does not exist.
+    expect(parseScope('best', 'value')).toBe('week');
+    expect(parseScope('week', 'streak')).toBe('current');
+    expect(parseScope(undefined, 'streak')).toBe('current');
+  });
+
+  it('names every scope it can be switched to', () => {
+    for (const board of BOARD_KEYS) {
+      for (const scope of BOARDS[board].scopes) expect(SCOPE_LABELS[scope]).toBeTruthy();
+    }
+  });
+
+  it('says a different thing under each streak scope', () => {
+    expect(boardCaption('streak', 'current')).toContain('right now');
+    expect(boardCaption('streak', 'best')).toContain('ever');
+    expect(boardCaption('value', 'week')).toBe(BOARDS.value.caption);
+  });
+
+  it('ranks the two streak scopes off their own columns', () => {
+    const field = [
+      boardUser('a', { streak: 4, longestStreak: 90 }),
+      boardUser('b', { streak: 31, longestStreak: 31 }),
+    ];
+    expect(rankBoard('streak', 'current', field, new Map()).map((r) => r.userId)).toEqual(['b', 'a']);
+    expect(rankBoard('streak', 'best', field, new Map()).map((r) => r.userId)).toEqual(['a', 'b']);
+  });
+
+  // A user whose current run is 0 is off the 'current' board but still has a
+  // best ever to be ranked on.
+  it('leaves a lapsed streak on the best-ever board only', () => {
+    const lapsed = [boardUser('a', { streak: 0, longestStreak: 40 })];
+    expect(rankBoard('streak', 'current', lapsed, new Map())).toEqual([]);
+    expect(rankBoard('streak', 'best', lapsed, new Map()).map((r) => r.value)).toEqual([40]);
+  });
+
+  it('still drops a hidden curve from both streak scopes', () => {
+    const visibility = defaultVisibility();
+    visibility.curve = false;
+    const shy = [boardUser('shy', { streak: 12, longestStreak: 99, visibility })];
+    expect(rankBoard('streak', 'current', shy, new Map())).toEqual([]);
+    expect(rankBoard('streak', 'best', shy, new Map())).toEqual([]);
+  });
+
+  // "19 days · 🔥 19" is one number printed twice.
+  it('drops the 🔥 side figure on the board that already is it', () => {
+    const user = boardUser('a', { streak: 19, longestStreak: 40 });
+    const current = boardRowFor(
+      'streak',
+      'current',
+      { userId: 'a', value: 19, rank: 1 },
+      user,
+      undefined,
+      undefined,
+      undefined
+    );
+    const best = boardRowFor(
+      'streak',
+      'best',
+      { userId: 'a', value: 40, rank: 1 },
+      user,
+      undefined,
+      undefined,
+      undefined
+    );
+    expect(current.display).toBe('19 days');
+    expect(current.streak).toBeUndefined();
+    expect(best.display).toBe('40 days');
+    expect(best.streak).toBe(19);
+  });
+});
+
 describe('boardMetricName', () => {
   // Namespaced so it cannot collide with F5's own metrics in the same table.
   it('namespaces the board and scope', () => {
@@ -539,13 +655,14 @@ describe('boardMetricName', () => {
     expect(boardMetricName('leverage', 'all')).toBe('board:leverage:all');
   });
 
-  it('is unique per board and scope', () => {
+  it('is unique across every board and its own scopes', () => {
     const names = new Set<string>();
     for (const board of BOARD_KEYS) {
-      names.add(boardMetricName(board, 'week'));
-      names.add(boardMetricName(board, 'all'));
+      for (const scope of BOARDS[board].scopes) names.add(boardMetricName(board, scope));
     }
     expect(names.size).toBe(BOARD_KEYS.length * 2);
+    expect(names.has('board:streak:current')).toBe(true);
+    expect(names.has('board:streak:best')).toBe(true);
   });
 });
 

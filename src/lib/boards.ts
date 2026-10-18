@@ -60,7 +60,16 @@ type AppDb = typeof db;
 // ═══════════════════════════════════════════════════════════════════════════
 
 export type BoardKey = 'value' | 'streak' | 'ultrathinks' | 'leverage';
-export type BoardScope = 'week' | 'all';
+
+/**
+ * The two ways to look at a board — which are NOT the same two on every board.
+ *
+ * Three of them are time windows (this UTC week, or everything). The streak is
+ * not a quantity that accumulates over a window: "this week's streak" is not a
+ * number anyone has, so that board offers the pair that does exist — the run
+ * you are on now, and the longest one you have ever had.
+ */
+export type BoardScope = 'week' | 'all' | 'current' | 'best';
 
 export interface BoardMeta {
   emoji: string;
@@ -69,6 +78,8 @@ export interface BoardMeta {
   heading: string;
   /** One line under the podium figure, saying what it measures. */
   caption: string;
+  /** The scope switch for this board. The first one is the default. */
+  scopes: readonly [BoardScope, BoardScope];
   /**
    * The profile section whose owner-hidden flag takes a user off this board.
    *
@@ -77,8 +88,6 @@ export interface BoardMeta {
    * streak is counted from.
    */
   section: FingerprintSection;
-  /** True when the figure is a live "right now" number the scope cannot change. */
-  scopeless?: boolean;
 }
 
 export const BOARD_KEYS = ['value', 'streak', 'ultrathinks', 'leverage'] as const satisfies readonly BoardKey[];
@@ -89,21 +98,23 @@ export const BOARDS: Record<BoardKey, BoardMeta> = {
     label: 'value',
     heading: '💎 value',
     caption: 'API-equivalent of the work Claude did',
+    scopes: ['week', 'all'],
     section: 'value',
   },
   streak: {
     emoji: '🔥',
     label: 'streak',
     heading: '🔥 streak',
-    caption: 'consecutive days with a prompt, right now',
+    caption: 'consecutive days with a prompt',
+    scopes: ['current', 'best'],
     section: 'curve',
-    scopeless: true,
   },
   ultrathinks: {
     emoji: '🌈',
     label: 'ultrathinks',
     heading: '🌈 ultrathinks',
     caption: 'prompts that asked Claude to think harder',
+    scopes: ['week', 'all'],
     section: 'ultrathink',
   },
   leverage: {
@@ -111,16 +122,49 @@ export const BOARDS: Record<BoardKey, BoardMeta> = {
     label: 'leverage',
     heading: '⚡ leverage',
     caption: 'characters Claude wrote per character typed',
+    scopes: ['week', 'all'],
     section: 'anatomy',
   },
 };
+
+/** What the switch says, and what the figure is "of" in a sentence. */
+export const SCOPE_LABELS: Record<BoardScope, string> = {
+  week: 'this week',
+  all: 'all time',
+  current: 'current streak',
+  best: 'best ever',
+};
+
+/** The caption under a podium figure, which the streak's two scopes differ on. */
+export function boardCaption(board: BoardKey, scope: BoardScope): string {
+  if (board === 'streak') {
+    return scope === 'best'
+      ? 'the longest run of days they have ever had'
+      : 'consecutive days with a prompt, right now';
+  }
+  return BOARDS[board].caption;
+}
 
 export function parseBoard(raw: string | undefined): BoardKey {
   return BOARD_KEYS.includes(raw as BoardKey) ? (raw as BoardKey) : 'value';
 }
 
-export function parseScope(raw: string | undefined): BoardScope {
-  return raw === 'all' ? 'all' : 'week';
+/**
+ * The scope, validated against THIS board's pair.
+ *
+ * Board-aware because the pairs differ: `?board=value&scope=best` is not a
+ * board that exists, and switching from 🔥 to 💎 carries the old scope in the
+ * form. Falling back to the board's own default is what makes every
+ * combination of the two URL parameters land on something real.
+ */
+export function parseScope(raw: string | undefined, board: BoardKey = 'value'): BoardScope {
+  const scopes = BOARDS[board].scopes;
+  return scopes.includes(raw as BoardScope) ? (raw as BoardScope) : scopes[0];
+}
+
+/** True when the scope is a time window over ClickHouse rows, not a lifetime figure. */
+function isWeekWindow(scope: BoardScope): boolean {
+  return scope === 'week';
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -185,8 +229,10 @@ export interface BoardFigures {
   /** Characters typed, summed over prompts that recorded a length. */
   promptChars: number;
   prompts: number;
-  /** Current consecutive active days, as synced. Scope-independent. */
+  /** Current consecutive active days, as synced. No time window applies. */
   streak: number;
+  /** The longest run of days ever, as synced. */
+  longestStreak: number;
 }
 
 /**
@@ -204,13 +250,20 @@ export function leverageRatio(outputTokens: number, promptChars: number): number
   return ratioOfSums(outputTokens * CHARS_PER_TOKEN, promptChars);
 }
 
-/** The figure one board ranks on, for one user. */
-export function boardValue(board: BoardKey, figures: BoardFigures): number {
+/**
+ * The figure one board ranks on, for one user.
+ *
+ * The scope is a parameter because 🔥 reads a different COLUMN for each of its
+ * two (current run vs longest ever), where the other three read the same
+ * figure over a different window and so are handed figures already narrowed to
+ * it by fetchFigures.
+ */
+export function boardValue(board: BoardKey, figures: BoardFigures, scope: BoardScope): number {
   switch (board) {
     case 'value':
       return figures.valueUsd;
     case 'streak':
-      return figures.streak;
+      return scope === 'best' ? figures.longestStreak : figures.streak;
     case 'ultrathinks':
       return figures.ultrathinks;
     case 'leverage':
@@ -341,6 +394,7 @@ export interface BoardUser {
   avatarUrl: string | null;
   timezone: string;
   streak: number;
+  longestStreak: number;
   visibility: Visibility;
 }
 
@@ -359,6 +413,7 @@ export async function loadBoardUsers(database: AppDb = db): Promise<BoardUser[]>
       avatarUrl: users.avatarUrl,
       timezone: users.timezone,
       streak: users.currentStreak,
+      longestStreak: users.longestStreak,
       settings: profileSettings,
     })
     .from(users)
@@ -371,6 +426,9 @@ export async function loadBoardUsers(database: AppDb = db): Promise<BoardUser[]>
     avatarUrl: row.avatarUrl,
     timezone: normalizeTimezone(row.timezone),
     streak: row.streak || 0,
+    // Both columns come from the sync job's one pass over the active days, so
+    // the two 🔥 scopes cannot disagree about the same person.
+    longestStreak: row.longestStreak || 0,
     visibility: visibilityOf(row.settings as ProfileSettings | null),
   }));
 }
@@ -397,6 +455,7 @@ export interface RankedEntry {
  */
 export function rankBoard(
   board: BoardKey,
+  scope: BoardScope,
   boardUsers: BoardUser[],
   figuresByUser: Map<string, BoardFigures>
 ): RankedEntry[] {
@@ -405,8 +464,8 @@ export function rankBoard(
 
   for (const user of boardUsers) {
     if (!user.visibility[section]) continue;
-    const figures = figuresByUser.get(user.userId) ?? emptyFigures(user.userId, user.streak);
-    const value = boardValue(board, figures);
+    const figures = figuresByUser.get(user.userId) ?? emptyFigures(user);
+    const value = boardValue(board, figures, scope);
     if (value <= 0) continue;
     eligible.push({ userId: user.userId, value });
   }
@@ -422,15 +481,17 @@ export function rankBoard(
     .map((entry, index) => ({ ...entry, rank: index + 1 }));
 }
 
-function emptyFigures(userId: string, streak = 0): BoardFigures {
+/** A user ClickHouse had nothing for in the window. The streaks are still theirs. */
+function emptyFigures(user: Pick<BoardUser, 'userId' | 'streak' | 'longestStreak'>): BoardFigures {
   return {
-    userId,
+    userId: user.userId,
     valueUsd: 0,
     ultrathinks: 0,
     outputTokens: 0,
     promptChars: 0,
     prompts: 0,
-    streak,
+    streak: user.streak,
+    longestStreak: user.longestStreak,
   };
 }
 
@@ -501,10 +562,14 @@ async function fetchFigures(
   boardUsers: BoardUser[],
   now: Date
 ): Promise<Map<string, BoardFigures>> {
-  const streaks = new Map(boardUsers.map((u) => [u.userId, u.streak]));
+  const known = new Map(boardUsers.map((u) => [u.userId, u]));
   const measured = `${PROMPT_EVENT_SQL} AND prompt_length > 0`;
-  const window =
-    scope === 'week' ? `timestamp >= toDateTime64({since:String}, 3, 'UTC')` : '1 = 1';
+  // Only 'week' narrows the rows. The streak board's two scopes are lifetime
+  // figures read from SQLite, so its ClickHouse figures — the 🌈 and 🔥 beside
+  // each row — are all-time there, like 'all time' on the other boards.
+  const window = isWeekWindow(scope)
+    ? `timestamp >= toDateTime64({since:String}, 3, 'UTC')`
+    : '1 = 1';
   const local = localTsExpr(boardUsers, now);
 
   const [events, metrics] = await Promise.all([
@@ -549,7 +614,12 @@ async function fetchFigures(
   const figuresFor = (userId: string) => {
     const existing = byUser.get(userId);
     if (existing) return existing;
-    const fresh = emptyFigures(userId, streaks.get(userId) ?? 0);
+    const user = known.get(userId);
+    const fresh = emptyFigures({
+      userId,
+      streak: user?.streak ?? 0,
+      longestStreak: user?.longestStreak ?? 0,
+    });
     byUser.set(userId, fresh);
     return fresh;
   };
@@ -782,9 +852,11 @@ export async function snapshotBoardRanks(
 
   const values: { userId: string; day: string; metric: string; rank: number; value: number }[] = [];
   for (const board of BOARD_KEYS) {
-    for (const scope of ['week', 'all'] as BoardScope[]) {
-      const figures = scope === 'week' ? weekFigures : allFigures;
-      for (const entry of rankBoard(board, boardUsers, figures)) {
+    // Each board's OWN pair of scopes — 🔥 snapshots current and best, the
+    // others this week and all time, under their own metric names.
+    for (const scope of BOARDS[board].scopes) {
+      const figures = isWeekWindow(scope) ? weekFigures : allFigures;
+      for (const entry of rankBoard(board, scope, boardUsers, figures)) {
         values.push({
           userId: entry.userId,
           day,
@@ -892,6 +964,7 @@ export async function boardRankChanges(
  */
 export function boardRowFor(
   board: BoardKey,
+  scope: BoardScope,
   entry: RankedEntry,
   user: BoardUser,
   figures: BoardFigures | undefined,
@@ -916,7 +989,12 @@ export function boardRowFor(
   // during a ClickHouse outage the streak board still ranks, and the 🌈 column
   // beside it goes blank instead of claiming everyone has none.
   if (user.visibility.ultrathink && figures) row.ultrathinks = figures.ultrathinks;
-  if (user.visibility.curve) row.streak = user.streak;
+  // The 🔥 side figure is the CURRENT streak, so it is left off the board that
+  // already prints it — "19 days · 🔥 19" is one number twice. Beside a best
+  // ever it stays, because there the two differ and the pair is the story.
+  if (user.visibility.curve && !(board === 'streak' && scope === 'current')) {
+    row.streak = user.streak;
+  }
   return row;
 }
 
@@ -980,7 +1058,7 @@ async function buildBoardPage(options: BoardQuery): Promise<BoardPage> {
     complete = false;
   }
 
-  const ranked = rankBoard(board, boardUsers, figures);
+  const ranked = rankBoard(board, scope, boardUsers, figures);
   const usersById = new Map(boardUsers.map((u) => [u.userId, u]));
   const slice = ranked.slice(offset, offset + limit);
   const pageUsers = slice
@@ -1009,6 +1087,7 @@ async function buildBoardPage(options: BoardQuery): Promise<BoardPage> {
   const rows = slice.map((entry) =>
     boardRowFor(
       board,
+      scope,
       entry,
       usersById.get(entry.userId)!,
       figures.get(entry.userId),

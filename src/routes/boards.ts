@@ -15,6 +15,7 @@ import type { SessionUser } from '../types';
 import {
   BOARDS,
   BOARD_KEYS,
+  boardCaption,
   getBoardPage,
   getGlobalPulse,
   parseBoard,
@@ -38,7 +39,7 @@ function intParam(raw: string | undefined, fallback: number, max: number): numbe
 
 app.get('/', optionalAuth, async (c) => {
   const board = parseBoard(c.req.query('board'));
-  const scope = parseScope(c.req.query('scope'));
+  const scope = parseScope(c.req.query('scope'), board);
   const limit = Math.max(1, intParam(c.req.query('limit'), DEFAULT_LIMIT, MAX_LIMIT));
   const offset = intParam(c.req.query('offset'), 0, Number.MAX_SAFE_INTEGER);
 
@@ -56,7 +57,12 @@ app.get('/', optionalAuth, async (c) => {
     {
       board: page.board,
       scope: page.scope,
-      meta: { emoji: BOARDS[board].emoji, label: BOARDS[board].label, caption: BOARDS[board].caption },
+      meta: {
+        emoji: BOARDS[board].emoji,
+        label: BOARDS[board].label,
+        caption: boardCaption(board, scope),
+        scopes: BOARDS[board].scopes,
+      },
       total: page.total,
       offset: page.offset,
       limit,
@@ -82,7 +88,7 @@ app.get('/list', (c) =>
       emoji: BOARDS[key].emoji,
       label: BOARDS[key].label,
       caption: BOARDS[key].caption,
-      scopeless: BOARDS[key].scopeless ?? false,
+      scopes: BOARDS[key].scopes,
     })),
   })
 );

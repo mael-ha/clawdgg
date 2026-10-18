@@ -1,5 +1,5 @@
 import type { FC } from 'hono/jsx';
-import { BOARDS, type BoardKey, type BoardRow, type BoardScope } from '../../lib/boards';
+import { BOARDS, SCOPE_LABELS, type BoardKey, type BoardRow, type BoardScope } from '../../lib/boards';
 import { MiniClock } from './MiniClock';
 import { RankDelta, SideFigures } from './RankDelta';
 
@@ -20,11 +20,6 @@ const GRID =
   'grid items-center gap-3 px-4 sm:px-[18px] ' +
   'grid-cols-[2.5rem_2.25rem_1.875rem_minmax(0,1fr)_auto] ' +
   'sm:grid-cols-[3.5rem_2.75rem_2.75rem_minmax(0,1fr)_13.75rem_8.75rem_7.5rem]';
-
-export const SCOPE_LABELS: Record<BoardScope, string> = {
-  week: 'this week',
-  all: 'all time',
-};
 
 interface RowProps {
   row: BoardRow;
