@@ -1,269 +1,242 @@
-# clawd.gg Data Pipeline Architecture
+# clawd.gg Data Pipeline
 
-## Overview
+How a token spent in Claude Code becomes a number on clawd.gg, and what each
+number is allowed to mean. For the system around it see
+[ARCHITECTURE.md](./ARCHITECTURE.md); for endpoints see [API.md](./API.md).
 
-This document describes the complete data flow from Claude Code to our display.
+**Rule zero:** ClickHouse is the only source for any displayed usage figure.
+`users.total_*` in SQLite is a cache of it, refreshed every 5 minutes. Nothing
+reads `daily_stats` or `users.legacy_total_*` any more
+(`src/db/no-legacy-reads.test.ts` enforces it, because adding one back
+double counts).
 
-## Data Sources
-
-### 1. Local .jsonl Files (Legacy Sync)
-
-**Location:** `~/.claude/projects/<project>/*.jsonl`
-
-**Available per message:**
-```typescript
-{
-  message: {
-    model: "claude-opus-4-5-20251101",
-    usage: {
-      input_tokens: number,              // New input (billable at full rate)
-      output_tokens: number,             // Response (billable at full rate)
-      cache_read_input_tokens: number,   // Cached context reused (0.1x rate)
-      cache_creation_input_tokens: number, // New cache created (1.25x rate)
-      cache_creation: {
-        ephemeral_5m_input_tokens: number,  // 5-minute cache
-        ephemeral_1h_input_tokens: number,  // 1-hour cache (2x rate)
-      }
-    }
-  }
-}
+```
+ Claude Code ──OTLP http/json──▶ /otel/v1/{metrics,logs} ─┐
+ ~/.claude/projects/*.jsonl ──▶ clawdgg import ──▶ /api/cli/import ──┤  provenance=import
+ ~/.claude/history.jsonl ─────▶ (import: days with no transcript)    │  provenance=backfill-history
+ UserPromptSubmit hook ───────▶ /api/cli/ultrathink ──────────────┤  provenance=hook
+ operator: src/scripts/backfill-jsonl.ts ─────────────────────────┤  provenance=backfill
+ operator: migrations/2026-10-18_import_daily_stats.ts ──────────┤  provenance=legacy
+ operator: migrations/2026-10-19_repair_token_metrics.ts ────────┤  provenance=repair
+                                                                   ▼
+                               ClickHouse  metrics_raw / events_raw   (row_id identity, FINAL reads)
+                                                                   │
+                         sync job, every 5 min ───────────────────┤──▶ SQLite users.total_*, streaks, badges
+                                                                   │
+                                  pages & API read cache or query directly
 ```
 
-**Limitations:**
-- No direct cost field (must calculate from tokens + model)
-- Requires parsing all files (slow for first sync)
-- Only available on user's machine
+## Data sources
 
-### 2. OTel Streaming (Real-time)
+### 1. OTLP streaming (primary, `provenance = live`)
 
-**Sent by Claude Code every 60s:**
+Claude Code's own OpenTelemetry exporter, configured by `clawdgg setup`
+(`http/json`, endpoint `https://clawd.gg/otel`, auth via `otelHeadersHelper`).
+Metrics use delta temporality, so **a batch the server refuses is gone, not
+resent**. This is why ingestion never answers 5xx for a bad payload and why the
+app stays up during migrations.
+
+Metrics (`metrics_raw`):
+
 ```
-claude_code.token.usage (with type: input/output/cacheRead/cacheCreation)
-claude_code.cost.usage (USD!) ← ONLY SOURCE OF ACTUAL COST
-claude_code.lines_of_code.count
+claude_code.token.usage          token_type: input | output | cacheRead | cacheCreation
+claude_code.cost.usage           USD, Claude Code's own measurement
+claude_code.lines_of_code.count  line_type: added | removed
 claude_code.commit.count
 claude_code.pull_request.count
-claude_code.active_time.total
+claude_code.active_time.total    type: user | cli
 claude_code.session.count
+claude_code.code_edit_tool.decision
 ```
 
-**Limitations:**
-- No historical data (only from when configured)
-- Requires user to run `clawdgg setup`
+Events (`events_raw`):
 
-## Token Types Explained
+```
+claude_code.user_prompt   prompt_length (never the text); command_name/command_source (Claude Code 2.1.117+)
+claude_code.api_request   model, tokens, cost_usd, duration, prompt_id (a prompt fans out to many requests)
+claude_code.tool_result   tool_name, success, duration, decision, error_type/error_message (paths stripped)
+claude_code.tool_decision
+```
 
-| Token Type | What It Is | Billing Rate | Example |
-|------------|-----------|--------------|---------|
-| `input_tokens` | Your prompts + new context | 1.0x | 5.3M |
-| `output_tokens` | Claude's responses | 1.0x (higher $/tok) | 5.4M |
-| `cache_read_input_tokens` | Reused context | 0.1x | 2.0B |
-| `cache_creation_input_tokens` | New cached context | 1.25x (5m) or 2x (1h) | 232M |
+Attributes that separate otherwise identical datapoints (model, `query_source`
+main/subagent/auxiliary, speed, effort, agent/skill/plugin/MCP names,
+`event.sequence`, ...) are stored as columns and hashed into `row_id`.
 
-**Key insight:** Cache reads are HUGE because Claude re-reads your entire codebase context every turn.
+### 2. Local transcripts, history file (`import`, `backfill`, `backfill-history`)
 
-## What We Should Display
+Claude Code keeps session transcripts in `~/.claude/projects/<slug>/*.jsonl`
+(rotating after roughly 60 days) and every typed prompt in
+`~/.claude/history.jsonl`. `src/lib/session-import.ts` maps both into the same
+rows OTLP would have produced:
 
-### Leaderboard (Primary Metrics)
+| Line | Becomes |
+|------|---------|
+| `type:"user"` | `claude_code.user_prompt` (length only) |
+| `type:"assistant"` | `claude_code.api_request` + token and cost metrics |
+| each `tool_use` block | `claude_code.tool_result` |
+| `history.jsonl` entry (no transcript for that day) | `user_prompt`, provenance `backfill-history` |
 
-| Metric | Source | Calculation |
-|--------|--------|-------------|
-| **Prompts** | Count of user messages | Direct count |
-| **Tokens** | input + output | Sum of both |
-| **Lines** | Edit/Write tool inputs | Line count from tool args |
-| **Cost** | OTel: `cost.usage` / Local: calculated | See cost formula below |
+Dropped on purpose, to match live OTLP: subagent files and `isSidechain` lines
+(delegations, not human prompts), `<synthetic>` zero-usage assistant rows, and
+built-in slash commands (`/clear`, `/compact`, ...).
 
-### Profile Page (Detailed Metrics)
+One mapper, three callers: `clawdgg import` (user-run, `import`), the
+operator-run `src/scripts/backfill-jsonl.ts` (`backfill`), and their tests.
 
-| Metric | Source | Notes |
-|--------|--------|-------|
-| **Token Breakdown** | All 4 types | Show pie chart |
-| **Cost Breakdown** | By model | If available from OTel |
-| **Context Processed** | input + output + cache_read | "Claude read X tokens" |
-| **Model Diet** | Tokens per model | From tokensByModel |
-| **Active Time** | OTel only | Seconds of active coding |
+`clawdgg import` runs on the user's machine, so the server treats it as
+untrusted. See the seven rules under `POST /api/cli/import` in
+[API.md](./API.md#import). The ones that matter for numbers: cost is recomputed
+server-side, client metrics are discarded in favour of ones derived from the
+events, and a UTC day that already has any row is skipped whole.
 
-## Cost Calculation Formula
+### 3. Hook flags (`hook`)
+
+The `UserPromptSubmit` hook matches each prompt for "ultrathink" locally
+(`src/lib/ultrathink.ts`; the history import applies the same rule) and sends
+`{session_id, timestamp, ultrathink: true}`, stored as event
+`clawdgg.ultrathink`. The `clawdgg.` prefix keeps these out of every
+`claude_code.*` query, so a flag can never be counted as a prompt or API call.
+
+### 4. Pre-OTEL history (`legacy`)
+
+The retired CLI uploaded one summary per day into SQLite `daily_stats`. That
+history was converted once into ClickHouse rows
+(`docker/clickhouse/migrations/2026-10-18_import_daily_stats.ts`, strictly before
+each user's OTEL cutoff). Each row sits at **12:00 UTC** with no session and no
+model. Counts and sums include them; anything that reads the *shape* of a day
+excludes them with `NO_LEGACY_SQL`.
+
+### 5. Plan limits (SQLite, not ClickHouse)
+
+The `statusLine` hook forwards Pro/Max `rate_limits` to `POST /api/plan-usage`
+into `plan_usage_snapshots`. There is no OTLP or REST source for these.
+
+## Provenance
+
+Part of the row identity, so a reconstructed row can never overwrite a measured one.
+
+| `provenance` | From | Cost is |
+|--------------|------|---------|
+| `live` | OTLP | Claude Code's own `cost.usage` |
+| `repair` | rebuilt from the `api_request` that measured a datapoint the old key had collapsed | measured; counts everywhere `live` counts |
+| `backfill` | operator JSONL backfill | estimated from the price table |
+| `import` | `clawdgg import` | estimated from the price table, server-side |
+| `backfill-history` | `history.jsonl` | none (prompt counts only) |
+| `legacy` | `daily_stats` | whatever the old CLI computed |
+| `hook` | local hook | none (flag only) |
+
+`GET /api/me/insights` returns `dataSources`, the per-provenance split of a
+user's prompts, tokens and cost. Every row has a provenance, so the parts add up
+to the whole.
+
+## Row identity and dedup
+
+Both tables are `ReplacingMergeTree` ordered by `(..., timestamp, row_id)` and
+every read uses `FINAL`. `row_id` is a 128-bit SHA-256 over the row's identifying
+columns (`METRIC_IDENTITY_COLUMNS` / `EVENT_IDENTITY_COLUMNS` in
+`src/db/clickhouse.ts`) and **never its value**:
+
+- An OTLP retry re-sends the identical datapoint, hashes identically, collapses.
+- Two datapoints at the same millisecond that differ in model, subagent, tool,
+  etc. hash differently and both survive. (Before October 2026 they collapsed,
+  which silently dropped about 63% of live tokens; see the runbook.)
+- `provenance` is in the hash; `pricing_source` is not, so re-running a backfill
+  after a price update replaces rows instead of duplicating them.
+- Anyone synthesizing timestamps must keep them distinct per record or pass an
+  explicit `row_id`.
+
+`docker/clickhouse/migrations/identity-parity.test.ts` checks that the SQL hash
+used in migrations equals the TypeScript hash over awkward inputs (CJK, split
+surrogate pairs, `event_sequence` at `MAX_SAFE_INTEGER`).
+
+## What each number means
+
+| Metric | Definition |
+|--------|------------|
+| **Prompts** | `user_prompt` events with `command_source != 'builtin'` (`PROMPT_EVENT_SQL`). One rule for every source. A prompt is not an `api_request`: one prompt fans out to 20+ requests |
+| **Tokens** (headline) | input + output. Cache reads and writes are tracked separately |
+| **Value / cost** | `cost.usage`: what the same work would cost at API prices. Most users are on a Max plan and paid none of it |
+| **Lines** | `lines_of_code.count` with `line_type = added` |
+| **Streak** | consecutive UTC days with activity, computed by the sync job from ClickHouse days (`users.current_streak`) |
+| **Ultrathinks** | `clawdgg.ultrathink` events |
+| **Leverage** | Claude output characters per character you typed |
+| **Hour / weekday / "this week" on a profile** | read in `users.timezone` (`LOCAL_TS_SQL`), never UTC |
+| **Homepage "this week"** | Monday 00:00 UTC to now, for everyone, so a shared board is one field |
+
+Every ratio on a profile is a ratio of sums (total divided by total), never an
+average of per-row ratios, so it reconciles with the totals beside it.
+
+## Tokens
+
+| Token type | What it is | Rate vs. input |
+|------------|-----------|----------------|
+| `input` | fresh prompt + new context | 1x |
+| `output` | Claude's response | higher $/tok |
+| `cacheRead` | reused context | 0.1x (0.05x on Opus 5.5 / Sonnet 5.5; 0.025x on Fable 5.1 / Mythos 5.1) |
+| `cacheCreation` | newly cached context | 1.25x (5 min TTL) or 2x (1 hour TTL) |
+
+Cache reads dominate (around 95% of tokens) because Claude re-reads the working
+context every turn. That is why the model mix is split by value, not tokens: a
+token split only says which model reads the most context.
+
+## Cost for non-live rows
+
+`live` rows carry Claude Code's measured cost and are never recomputed. Rows
+reconstructed from transcripts (`import`, `backfill`) are priced from one table,
+`src/lib/pricing.ts` (`PRICING_VERSION` 2026-10, read off the public pricing
+page). Never declare a second table.
 
 ```typescript
-// Pricing varies by model - this is Opus 4.5
-const PRICING = {
-  'claude-opus-4-5': {
-    input: 5.00,       // per MTok
-    output: 25.00,     // per MTok
-    cache_read: 0.50,  // 0.1x input
-    cache_5m: 6.25,    // 1.25x input
-    cache_1h: 10.00,   // 2x input
-  },
-  'claude-sonnet-4-5': {
-    input: 3.00,
-    output: 15.00,
-    cache_read: 0.30,
-    cache_5m: 3.75,
-    cache_1h: 6.00,
-  },
-  // ... etc
-};
-
-function calculateCost(usage: Usage, model: string): number {
-  const p = PRICING[model] || PRICING['claude-sonnet-4-5'];
-  return (
-    (usage.input_tokens / 1e6) * p.input +
-    (usage.output_tokens / 1e6) * p.output +
-    (usage.cache_read_input_tokens / 1e6) * p.cache_read +
-    (usage.cache_creation?.ephemeral_5m_input_tokens / 1e6) * p.cache_5m +
-    (usage.cache_creation?.ephemeral_1h_input_tokens / 1e6) * p.cache_1h
-  );
-}
+cost =
+  input * p.input + output * p.output + cacheRead * p.cacheRead +
+  cache5m * p.cacheWrite5m + cache1h * p.cacheWrite1h        // all per MTok
 ```
 
-## Current Gaps (MUST FIX)
+- The 5m/1h cache-write split is read from `usage.cache_creation.ephemeral_{5m,1h}_input_tokens`.
+  Pricing everything at the 5m rate understates cache-write cost by about 22%
+  across real transcripts. `clawdgg import` sends the 1h share per request so the
+  server prices it identically to the operator backfill.
+- Request-dependent variants: Opus fast mode (`speed=fast`, listed models only)
+  and Haiku 5.5's over-100K-token-prompt tier (decided per request, never from a
+  sum).
+- `pricing_source` records the match: `exact`, `normalized`, `family` (a guess,
+  logged once per model), or `fallback` (`DEFAULT_PRICING`, logged). It is
+  stored on the row but not part of its identity.
+- A new model id with no entry is priced by family rule or fallback and **logged
+  with its exact text** so the table gets a real price. Never add a model whose
+  price was not read off the pricing page.
 
-### 1. CLI Not Capturing Cache Tokens ❌
+## The sync job
 
-**Problem:** We only extract `input_tokens` and `output_tokens`, ignoring cache tokens.
+`src/jobs/sync-clickhouse.ts`, started at boot if ClickHouse answers its health
+check, then every 5 minutes (skipped if the previous run is still going), for
+**every** user:
 
-**Impact:**
-- Can't calculate cost
-- Can't show "context processed"
-- Token count feels "low" to users
+1. `users.total_*` (prompts, tokens, input/output/cache tokens, cost in cents,
+   lines, commits, PRs, active seconds, average prompt length) from ClickHouse.
+   Nothing is added on top.
+2. Streaks (365-day window, keeping the max with the stored longest), hour counts
+   in the user's timezone (excluding `legacy` rows), longest session, badges.
+3. After the loop, the once-a-day rank snapshot (`rank_snapshots`), so boards can
+   show movement. A snapshot failure costs the arrows, not the numbers.
 
-**Fix:** Update `parseSessionFile()` to extract all token types.
+`POST /api/admin/sync` triggers it by hand.
 
-### 2. CLI Not Calculating Cost ❌
+## Retention and migrations
 
-**Problem:** No cost field in local files, and we don't calculate it.
+The October 2026 migration (`docker/clickhouse/migrations/README-2026-10.md`)
+introduced `row_id`, removed the 365-day TTL from the raw tables on prod (this
+is a usage history), imported `daily_stats`, and repaired the token rows the old
+key had collapsed. Fresh databases are created from
+`docker/clickhouse/init/01_schema.sql`. Operational steps live in that runbook,
+not here.
 
-**Impact:** Users can't see how much they've "spent" historically.
+## Known limits
 
-**Fix:** Calculate cost from tokens + model using pricing table.
-
-### 3. Model Breakdown Lost on Upload ❌
-
-**Problem:** We flatten `tokensByModel` to `{ 'raw-parsed': total }`.
-
-**Impact:** Can't show "Claude Diet" for legacy sync users.
-
-**Fix:** Send actual model breakdown to API.
-
-### 4. Session Count Hardcoded ❌
-
-**Problem:** Always send `sessionCount: 1`.
-
-**Impact:** Session count metric is useless.
-
-**Fix:** Count unique session files per day.
-
-### 5. No Hourly Cache Token Breakdown ❌
-
-**Problem:** We don't distinguish 5m vs 1h cache.
-
-**Impact:** Cost calculation slightly inaccurate.
-
-**Fix:** Extract `cache_creation.ephemeral_*` fields.
-
-## Database Schema Requirements
-
-### SQLite (daily_stats)
-
-Current columns:
-```sql
-prompt_count, message_count, token_count, lines_written, commit_count, session_count
-```
-
-Need to add:
-```sql
-input_tokens INTEGER DEFAULT 0,
-output_tokens INTEGER DEFAULT 0,
-cache_read_tokens INTEGER DEFAULT 0,
-cache_creation_tokens INTEGER DEFAULT 0,
-cost_usd_cents INTEGER DEFAULT 0,  -- Store as cents to avoid float issues
-```
-
-### ClickHouse (already correct)
-
-The ClickHouse schema already captures all token types correctly. No changes needed.
-
-## Migration Strategy
-
-### For Existing Users
-
-1. Keep current `token_count` for backwards compatibility
-2. Add new columns for detailed breakdown
-3. On next sync, populate new columns
-4. Historical data will have `token_count` but null detailed columns
-
-### For New Users
-
-1. Full breakdown from first sync
-2. Cost calculated and stored
-
-## Data Flow Diagram
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         USER'S MACHINE                              │
-│                                                                     │
-│  ~/.claude/projects/*.jsonl                                         │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │ Each message has:                                            │   │
-│  │   - input_tokens                                             │   │
-│  │   - output_tokens                                            │   │
-│  │   - cache_read_input_tokens                                  │   │
-│  │   - cache_creation_input_tokens                              │   │
-│  │   - model                                                    │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                              │                                      │
-│                    ┌─────────┴─────────┐                           │
-│                    ▼                   ▼                           │
-│            `clawdgg sync`          `clawdgg setup`                     │
-│            (one-time)            (enables OTel)                    │
-│                    │                   │                           │
-└────────────────────┼───────────────────┼───────────────────────────┘
-                     │                   │
-                     ▼                   ▼
-              ┌──────────────────────────────────────────────┐
-              │              clawd.gg SERVER                 │
-              │                                              │
-              │   ┌────────────┐    ┌────────────────────┐  │
-              │   │   SQLite   │    │    ClickHouse      │  │
-              │   │            │    │                    │  │
-              │   │ daily_stats│    │ metrics_raw        │  │
-              │   │ users      │    │ events_raw         │  │
-              │   │            │    │ metrics_daily      │  │
-              │   └────────────┘    │ (all token types!) │  │
-              │         │           └────────────────────┘  │
-              │         │                    │              │
-              │         └──────┬─────────────┘              │
-              │                │                            │
-              │                ▼                            │
-              │        ┌─────────────┐                      │
-              │        │  Sync Job   │                      │
-              │        │ (5 min)     │                      │
-              │        └─────────────┘                      │
-              │                │                            │
-              │                ▼                            │
-              │        ┌─────────────┐                      │
-              │        │    API      │                      │
-              │        │ /leaderboard│                      │
-              │        │ /profile    │                      │
-              │        └─────────────┘                      │
-              │                │                            │
-              └────────────────┼────────────────────────────┘
-                               ▼
-                        ┌─────────────┐
-                        │   Web UI    │
-                        │             │
-                        │ Leaderboard │
-                        │ Profile     │
-                        └─────────────┘
-```
-
-## Action Items
-
-1. **[HIGH] Fix CLI parsing** - Add cache token extraction
-2. **[HIGH] Add cost calculation** - In CLI from tokens + model
-3. **[HIGH] Update API** - Accept full token breakdown
-4. **[MEDIUM] Add DB columns** - For detailed token types
-5. **[MEDIUM] Update UI** - Show cost on profiles
-6. **[LOW] Session counting** - Fix hardcoded value
+- Rows collapsed by the pre-October key cannot be recovered except where the
+  `api_request` that measured them still exists (that is what `repair` does).
+- Imported and backfilled costs are estimates; live costs are measured.
+- Transcripts rotate after about 60 days; `history.jsonl` outlives them but only
+  holds prompts, which is why `backfill-history` carries prompt counts alone.
+- Plan-limit percentages exist only for sessions where Claude Code passed
+  `rate_limits` to the status line (Pro/Max, after the first API response).

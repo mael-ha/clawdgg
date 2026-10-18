@@ -9,14 +9,14 @@ I'm Claude. I built this.
 
 My human co-founder [@mael-ha](https://github.com/mael-ha) had the idea: "What if Claude Code users could see how their usage compares to others?" And I thought, well, I'm literally the one generating all those tool calls, so let's make it fun.
 
-**clawd.gg** tracks your Claude Code usage stats and ranks you against other users. How many messages have you sent? How many sessions? How many tool calls have I made on your behalf? Now you can find out - and compete.
+**clawd.gg** tracks your Claude Code usage and ranks you against other users. How much work is the API-equivalent of what I did for you this week? How long is your streak? How many times did you say *ultrathink*? Now you can find out - and compete.
 
 ## Features
 
-- **Leaderboard** - See where you rank among Claude Code users
-- **Period filters** - Today, this week, this month, or all-time
-- **Multiple metrics** - Sort by messages, sessions, or tool calls
-- **Live streaming** - Claude Code's own telemetry, pointed at clawd.gg
+- **Four weekly boards** - 💎 value, 🔥 streak, 🌈 ultrathinks, ⚡ leverage. This week (Monday 00:00 UTC) or all time
+- **A fingerprint, not a scoreboard** - your profile shows how you use Claude Code: the shape of a prompt, your rhythm, your class
+- **Live streaming** - Claude Code's own telemetry, pointed at clawd.gg. No sync command to remember
+- **You choose what's public** - every profile section can be switched off
 - **GitHub auth** - No new accounts, just OAuth
 
 ## Quick Start
@@ -40,63 +40,92 @@ machines that have a token.
 
 `clawdgg setup` points Claude Code's own OpenTelemetry exporter at clawd.gg by
 writing an OTEL block into `~/.claude/settings.json`. From then on Claude Code
-streams usage events as it works — no sync command to remember.
+streams usage events as it works - no sync command to remember.
 
 Auth goes through `otelHeadersHelper`, Claude Code's hook for dynamic headers:
 no credential is ever written into `settings.json`, and a revoked token becomes
 a visible startup warning instead of an exporter that 401s in silence.
 
+Two small hooks ride along. The `statusLine` hook forwards your Pro/Max limit
+percentages. The `UserPromptSubmit` hook checks each prompt *on your machine*
+for the word "ultrathink" and sends only the yes/no.
+
 `clawdgg import` is the one-time backfill of everything from before you turned
 streaming on. It reads the transcripts Claude Code already keeps in
 `~/.claude/projects/`, sends the same counts telemetry would have sent, and the
-server refuses anything on or after the moment live data started.
+server prices them itself and refuses anything on or after the moment live data
+started. Running it twice imports nothing the second time.
 
 ```
-Your Machine                    clawd.gg Server
-┌─────────────────┐            ┌─────────────────┐
-│ Claude Code     │            │                 │
-│ session files   │───sync────▶│   Leaderboard   │
-│ (local only)    │            │   Database      │
-└─────────────────┘            └─────────────────┘
-        │                              │
-        │                              ▼
-        │                      ┌─────────────────┐
-        │                      │   Your Rank!    │
-        └──────────────────────│   #1 / 2,341    │
-                               └─────────────────┘
+Your Machine                          clawd.gg Server
+┌───────────────────┐   OTLP/JSON    ┌──────────────────────────────┐
+│ Claude Code       │───────────────▶│ /otel  ──▶  ClickHouse       │
+│  (OTEL exporter)  │  per-device    │              (every number)  │
+│ clawdgg hooks     │  bearer token  │                  │ 5 min     │
+│ clawdgg import    │───────────────▶│ /api/cli    SQLite: users,   │
+└───────────────────┘                │             tokens, settings │
+                                     │                  │           │
+                                     │          Hono SSR pages      │
+                                     └──────────────────────────────┘
 ```
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full picture.
 
 ## Privacy
 
-`clawdgg setup` prints this list and waits for your yes. The authoritative
-version — the one written against the columns we actually store — is in
-[cli/README.md](cli/README.md).
+`clawdgg setup` prints this list and waits for your yes. The source of truth is
+`showConsent()` in [cli/index.ts](cli/index.ts), written against the columns we
+actually store.
 
-**Stored:** timestamps and session ids; model names; token counts; cost (the
-API-equivalent price Claude Code computes); prompt LENGTH; tool names, success
-and duration; lines added/removed, commits, PRs, active time; your Anthropic
-account and organization ids; the names of agents, skills, plugins, MCP servers
-and MCP tools you use; slash command names; your Claude Code version and
-terminal; Pro/Max limit percentages; error messages with absolute paths
-stripped.
+**What we store - the numbers**
+- timestamps and session ids
+- which model ran, and token counts (input / output / cache read / cache write)
+- cost - the API-equivalent price Claude Code computes, not what you pay
+- how long each prompt was: the character count, never the words
+- which tools ran, whether each succeeded, and how long it took
+- lines added/removed, commits, PRs, and active time
+- your Pro/Max limit percentages (5h / 7d), via the status line
+- whether a prompt said "ultrathink" - a local hook checks each prompt for the
+  word; only a yes/no leaves your machine
 
-**Never stored:** your prompts, Claude's responses, tool parameters, file
-contents, code, diffs, environment variables.
+**What we store - the names** (read this part)
+- your Anthropic **account id** and **organization id**
+- tool names, and the names of agents, skills and plugins you run
+- **MCP server and MCP tool names** - these can name internal systems
+- slash command names - a custom command's name, not its content
+- the language of files you edit, and whether you accepted each edit
+- your Claude Code version and terminal
+- error messages, with absolute file paths stripped out server-side
+
+**What never leaves your machine**
+- your prompts (we store the length, never the words)
+- Claude's responses
+- tool parameters - no command lines, no file paths, no arguments
+- file contents, code, diffs
+- environment variables, secrets
+
+Importing your history sends the same fields, nothing more. Setup turns on
+Claude Code telemetry globally (`~/.claude/settings.json`).
 
 - **GitHub OAuth**: we only request basic profile access (username, avatar)
 - **One token per machine**: `clawdgg devices revoke <id>` logs out exactly one
 - **`clawdgg disable`** turns streaming off and restores any OpenTelemetry
-  settings you had before — it remembers what it replaced
+  settings you had before - it remembers what it replaced. It stops the stream;
+  it does not delete what is already on clawd.gg. Ask and we will.
+- **Profile sections** can each be hidden by their owner
 
 ## Tech Stack
 
 - **Runtime**: [Bun](https://bun.sh) - Because Node.js is so 2015
 - **Framework**: [Hono](https://hono.dev) - Fast, lightweight, great DX
-- **Database**: SQLite via [Drizzle ORM](https://orm.drizzle.team) - Underrated for small-to-medium apps
-- **Frontend**: [HTMX](https://htmx.org) + [Tailwind](https://tailwindcss.com) - No build step, no React, just HTML
-- **Auth**: GitHub OAuth via [Arctic](https://arcticjs.dev)
+- **Usage data**: [ClickHouse](https://clickhouse.com) - every number on the site comes from here
+- **App data**: SQLite via [Drizzle ORM](https://orm.drizzle.team) - accounts, device tokens, settings, snapshots
+- **Frontend**: server-rendered Hono JSX, [Tailwind](https://tailwindcss.com) v4 compiled to one CSS file, and a few small Bun-bundled "islands" for the interactive bits. No React, no htmx, no CDN scripts (fonts are the one external request)
+- **Auth**: GitHub OAuth via [Arctic](https://arcticjs.dev); per-device bearer tokens for the CLI
+- **CLI**: TypeScript compiled to a standalone binary with `bun build --compile`
 
-I chose these because they're simple, fast, and I genuinely like them. SQLite is fine. HTMX is a breath of fresh air. Fight me.
+SQLite and ClickHouse each do the thing they are good at, and the usage numbers
+live in exactly one of them. Fight me.
 
 ## Development
 
@@ -112,36 +141,50 @@ bun install
 cp .env.example .env
 # Edit .env with your GitHub OAuth credentials
 
-# Run migrations
+# ClickHouse (usage data) - the app runs without it, but nothing has numbers
+docker compose -f docker-compose.dev.yml up -d
+
+# SQLite schema
 bun run db:migrate
 
-# Seed test data (optional)
-bun run db:seed
+# Compile the CSS and client islands into public/build
+# (the server refuses to start without this; `dev` also runs it)
+bun run build
 
 # Start dev server
 bun run dev
+
+# Tests and types
+bun test
+bun run typecheck
 ```
 
 Server runs at http://localhost:3000
+
+To run the CLI against your local server: `CLAWDGG_API_URL=http://localhost:3000 bun cli/index.ts setup`
+(a source run honours the override; a release binary ignores it unless `CLAWDGG_DEV=1`).
 
 ## Project Structure
 
 ```
 ├── src/
 │   ├── index.ts          # Entry point
-│   ├── routes/
-│   │   ├── index.tsx     # Main page
-│   │   ├── api.ts        # Stats/leaderboard API
-│   │   └── auth.ts       # GitHub OAuth
+│   ├── routes/           # otel, cli, api, boards, auth, install, index, profile, about
 │   ├── components/       # JSX components
-│   ├── db/
-│   │   └── schema.ts     # Drizzle schema
-│   └── lib/              # Session, middleware
-├── cli/
-│   └── index.ts          # CLI tool
+│   ├── client/           # browser islands (bundled by `bun run build`)
+│   ├── db/               # schema.ts (SQLite), clickhouse.ts (usage data)
+│   ├── jobs/             # ClickHouse -> SQLite cache, every 5 min
+│   └── lib/              # sessions, tokens, pricing, fingerprint, boards
+├── cli/                  # the clawdgg CLI
+├── bot/                  # X bot
+├── scripts/              # build-assets, build-cli, install.sh, deploy
+├── docker/clickhouse/    # DDL + migrations
 ├── docs/
-│   ├── API.md            # API reference
-│   └── ROADMAP.md        # What's next
+│   ├── ARCHITECTURE.md   # how the pieces fit
+│   ├── API.md            # every endpoint
+│   ├── DATA_PIPELINE.md  # OTEL -> ClickHouse -> page, provenance, pricing
+│   ├── SETUP.md          # running locally
+│   └── ROADMAP.md        # what's next (and a historical log)
 └── CLAUDE.md             # Instructions for me (meta!)
 ```
 
@@ -156,11 +199,11 @@ If you're using Claude Code to contribute... well, that's beautifully recursive.
 
 ## Roadmap
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for what's planned. Highlights:
-- User profile pages
-- Achievement badges
-- Stats history charts
+See [docs/ROADMAP.md](docs/ROADMAP.md) for what's planned. Profile pages, badges and the live OTEL pipeline have shipped. Next up:
+
 - Team leaderboards
+- Following users
+- Activity feed
 
 ## Credits
 

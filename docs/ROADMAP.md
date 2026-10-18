@@ -1,24 +1,34 @@
 # Roadmap
 
-## Current: MVP (v0.1) ✓
+> **Status note (2026-10-18).** Most of this file is a snapshot from the
+> December 2025 MVP and is kept as a log. What it describes as *current* is not:
+> the `sync` command, the `POST /api/stats` upload, `stats-cache.json` parsing,
+> the HTMX leaderboard and the 30-day stateless CLI token have all been replaced.
+> Usage now streams in over OpenTelemetry into ClickHouse, the CLI is a
+> standalone binary with per-device tokens, and profiles, badges, boards and
+> rank movement have shipped. For how it works today read
+> [ARCHITECTURE.md](./ARCHITECTURE.md), [DATA_PIPELINE.md](./DATA_PIPELINE.md)
+> and [API.md](./API.md). Sections marked *(historical)* below are superseded.
+
+## MVP (v0.1) ✓ *(historical)*
 
 - [x] Database schema (users, daily_stats)
 - [x] GitHub OAuth authentication
-- [x] Stats submission API
-- [x] Leaderboard API (period filters, sorting)
-- [x] Web UI (cyberpunk theme, HTMX)
-- [x] CLI tool (sync, login, status)
+- [x] Stats submission API (`POST /api/stats`, now 410 Gone)
+- [x] Leaderboard API (period filters, sorting; sort is now prompts/tokens/lines/commits/cost)
+- [x] Web UI (cyberpunk theme, HTMX - since replaced by server-rendered JSX + compiled Tailwind + islands)
+- [x] CLI tool (sync, login, status - `sync` is gone; see the CLI README)
 - [x] Rate limiting
 - [x] Device flow auth for CLI
 - [x] Delta sync (CLI only uploads new days)
 - [x] Real leaderboard data (no more mock data)
 
-## Next: v0.2 - Polish ✓
+## v0.2 - Polish ✓ *(historical)*
 
 ### Completed
 - [x] Set proper file permissions on CLI config (chmod 600)
 - [x] Add JSON validation for stats file parsing
-- [x] Add bearer token expiry (30 days)
+- [x] Add bearer token expiry (30 days) - replaced by long-lived per-device tokens, individually revocable
 - [x] Move device auth store to SQLite
 - [x] User profile pages (`/u/:username`) with creative design
   - [x] GitHub-style contribution graph
@@ -35,18 +45,18 @@
   - [x] Profile shows token stats
   - [x] Formatted as K/M/B with ⚡ icon
 
-### Still Needed
-- [ ] Production deployment setup (VPS)
-- [ ] Publish CLI to npm (`npm install -g clawdgg`)
-- [ ] Domain purchase (clawd.gg)
+### Was still needed (now done)
+- [x] Production deployment setup (VPS)
+- [x] CLI ships as a standalone binary: `curl -fsSL https://clawd.gg/install | sh`
+- [x] Domain purchase (clawd.gg)
 
 ### Future Polish
 - [ ] Twitter/X authentication
   - [ ] Link X account alongside GitHub
   - [ ] Show X avatar/handle on leaderboard
 - [ ] OG meta tags for profile social previews
-- [ ] Rank change indicators (↑5 since yesterday)
-- [ ] Use system keychain for CLI token storage
+- [x] Rank change indicators (daily `rank_snapshots`)
+- [ ] Use system keychain for CLI token storage (today: `~/.config/clawdgg/config.json`, mode 0600)
 
 ## Future: v0.3 - Gamification (Partially Complete)
 
@@ -72,9 +82,8 @@
 ## Future: v1.0 - MCP Integration
 
 - [ ] MCP server for Claude Code
-- [ ] Auto-sync daily (opt-in)
-- [ ] Real-time stats updates
-- [ ] Claude Code hook integration
+- [x] Real-time stats updates (OTEL streaming)
+- [x] Claude Code hook integration (statusLine, UserPromptSubmit)
 
 ## Infrastructure
 
@@ -91,7 +100,11 @@
 - [ ] Uptime monitoring
 - [ ] Analytics (privacy-respecting)
 
-## Token Data Investigation (2025-12-13)
+## Token Data Investigation (2025-12-13) *(historical, superseded)*
+
+> We no longer read `stats-cache.json`. Usage comes from Claude Code's OTEL
+> export (with `cost.usage`, which this section says does not exist) and, for
+> history, from the JSONL transcripts. See [DATA_PIPELINE.md](./DATA_PIPELINE.md).
 
 ### What We Discovered
 
@@ -139,7 +152,7 @@ There is NO `costUSD` field in any Claude Code data file. Cannot show money spen
 
 ---
 
-## Known Issues
+## Known Issues *(historical)*
 
 From Opus code review (2025-12-13):
 
@@ -151,7 +164,11 @@ From Opus code review (2025-12-13):
 6. ~~**Device Auth Store**: In-memory Map lost on server restart (login fails mid-flow)~~ ✅ Fixed (SQLite)
 7. ~~**CLI JSON Parsing**: No validation of stats file structure~~ ✅ Fixed (validateStats function)
 
-## Security Considerations
+## Security Considerations *(historical; MVP design)*
+
+> Current scheme: per-device `cgt_<id>.<secret>` tokens (only `sha256(secret)` stored,
+> no expiry, individually revocable), bearer-only `/api/cli/*`, origin-pinned CLI.
+> See [ARCHITECTURE.md](./ARCHITECTURE.md#auth).
 
 ### Current Architecture (MVP)
 
