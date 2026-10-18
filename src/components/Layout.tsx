@@ -19,6 +19,15 @@ interface OpenGraph {
   description?: string;
   image?: string;
   url?: string;
+  /**
+   * A preview image to unfurl at full width, with its dimensions declared.
+   *
+   * Opt-in, and separate from `image`, because the two are different cards: X
+   * crops a `summary` image to a small square and shows a 1200×630 one whole
+   * only when asked with `summary_large_image`. A page with nothing drawn for
+   * it keeps the square, which is the right shape for a site icon.
+   */
+  card?: { url: string; width: number; height: number; type: string };
 }
 
 interface LayoutProps extends PropsWithChildren {
@@ -174,11 +183,22 @@ export const Layout: FC<LayoutProps> = ({
       <meta property="og:title" content={og?.title ?? title} />
       <meta property="og:description" content={og?.description ?? description} />
       {og?.url && <meta property="og:url" content={og.url} />}
-      {og?.image && <meta property="og:image" content={og.image} />}
-      <meta name="twitter:card" content="summary" />
+      {og?.card ? (
+        <>
+          <meta property="og:image" content={og.card.url} />
+          <meta property="og:image:width" content={String(og.card.width)} />
+          <meta property="og:image:height" content={String(og.card.height)} />
+          <meta property="og:image:type" content={og.card.type} />
+        </>
+      ) : (
+        og?.image && <meta property="og:image" content={og.image} />
+      )}
+      <meta name="twitter:card" content={og?.card ? 'summary_large_image' : 'summary'} />
       <meta name="twitter:title" content={og?.title ?? title} />
       <meta name="twitter:description" content={og?.description ?? description} />
-      {og?.image && <meta name="twitter:image" content={og.image} />}
+      {(og?.card || og?.image) && (
+        <meta name="twitter:image" content={og.card?.url ?? og.image!} />
+      )}
 
       {/* Fonts */}
       <link rel="preconnect" href="https://fonts.googleapis.com" />

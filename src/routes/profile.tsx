@@ -23,6 +23,7 @@ import {
 } from '../lib/profile-data';
 import { DEFAULT_TIMEZONE } from '../lib/timezone';
 import { ProfileNotFound, ProfilePage } from '../components/profile/ProfilePage';
+import { CARD_HEIGHT, CARD_WIDTH } from '../components/profile/ShareCard';
 import { className } from '../components/profile/palette';
 import { group, money } from '../components/profile/format';
 import type { CurveView } from '../components/profile/curve';
@@ -274,9 +275,15 @@ app.get('/:username', async (c) => {
       og={{
         title: `@${user.githubUsername} on clawd.gg`,
         description: summary,
-        // SVG, not PNG — src/routes/og.ts says why, and what it would cost
-        // to change that.
-        image: `${appUrl}/u/${user.githubUsername}/card.svg`,
+        // PNG, because X does not unfurl SVG — and 1200×630 declared, so it
+        // unfurls whole rather than cropped to a square. src/routes/og.ts
+        // serves both encodings of the same drawing.
+        card: {
+          url: `${appUrl}/u/${user.githubUsername}/card.png`,
+          width: CARD_WIDTH,
+          height: CARD_HEIGHT,
+          type: 'image/png',
+        },
         url: shareUrl,
       }}
     >

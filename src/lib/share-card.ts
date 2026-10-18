@@ -30,6 +30,8 @@ export interface ShareCard {
   value: string | null;
   /** "170 chars → 9.6 tools → 36 lines", or null without an anatomy. */
   anatomy: string | null;
+  /** "4,941 ultrathinks" — the 🌈 is drawn as artwork by the card itself, so
+   *  it is not in this string. */
   ultrathinks: string | null;
 }
 
@@ -70,7 +72,7 @@ export function shareCardFrom(
         : null,
     ultrathinks:
       data.ultrathink && data.ultrathink.count > 0
-        ? `🌈 ${group(data.ultrathink.count)} ultrathinks`
+        ? `${group(data.ultrathink.count)} ultrathinks`
         : null,
   };
 }

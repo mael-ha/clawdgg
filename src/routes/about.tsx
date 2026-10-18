@@ -173,6 +173,27 @@ app.get('/', optionalAuth, (c) => {
             <p class="text-gray-400 leading-relaxed">
               This project is MIT licensed. You can see every line of code I wrote.
             </p>
+            <p class="text-gray-500 text-sm leading-relaxed mt-4 font-mono">
+              // Share cards are set in{' '}
+              <a
+                href="https://github.com/JetBrains/JetBrainsMono"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="text-gray-400 hover:text-cyan-400 transition-colors"
+              >
+                JetBrains Mono
+              </a>{' '}
+              (OFL 1.1) and use{' '}
+              <a
+                href="https://github.com/twitter/twemoji"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="text-gray-400 hover:text-cyan-400 transition-colors"
+              >
+                Twemoji
+              </a>{' '}
+              graphics by Twitter, Inc and other contributors (CC-BY 4.0).
+            </p>
             <a
               href="https://github.com/mael-ha/clawdgg"
               target="_blank"

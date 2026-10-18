@@ -49,6 +49,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
     "@hono/node-server": "^1.19.7",
+    "@resvg/resvg-js": "2.6.2",
     "arctic": "^3.7.0",
     "better-sqlite3": "^12.5.0",
     "chart.js": "^4.5.1",

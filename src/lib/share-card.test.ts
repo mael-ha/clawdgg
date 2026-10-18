@@ -1,7 +1,11 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { shareCardFrom } from './share-card';
 import { ShareCard } from '../components/profile/ShareCard';
 import { emptyFingerprint, fixtureFingerprint } from '../components/profile/fixture';
+import { RHYTHM_LABELS, className } from '../components/profile/palette';
+import type { RhythmClass } from './fingerprint';
 import type { FingerprintData, FingerprintSection } from './fingerprint';
 
 /**
@@ -9,6 +13,10 @@ import type { FingerprintData, FingerprintSection } from './fingerprint';
  * matters more than what it does. These assert both: that it is a valid,
  * self-contained SVG with no way to reach the network, and that a section
  * missing from the payload is missing from the card.
+ *
+ * This markup is also what card.png is rasterised from, so everything
+ * asserted here holds of the PNG too — the last test in the file is what
+ * keeps that true.
  */
 
 const identity = { username: 'fixture-user' };
@@ -33,7 +41,8 @@ describe('shareCardFrom', () => {
     expect(card.userClass).toEqual({ emoji: '☀️', rhythm: 'morning', style: 'orchestrator' });
     expect(card.value).toBe('$38.3K');
     expect(card.anatomy).toBe('170 chars → 9.6 tools → 36 lines');
-    expect(card.ultrathinks).toBe('🌈 4,941 ultrathinks');
+    // No 🌈 in the string: the card draws that one as artwork.
+    expect(card.ultrathinks).toBe('4,941 ultrathinks');
     expect(card.rings).toHaveLength(4);
   });
 
@@ -82,11 +91,36 @@ describe('ShareCard · the SVG itself', () => {
     expect(svg.match(/https?:\/\/[^"']*/g)).toEqual(['http://www.w3.org/2000/svg']);
   });
 
-  test('keeps the emoji, which is the whole reason it is not a raster', () => {
+  test('draws its emoji as artwork, because the raster has no emoji font', () => {
     const svg = svgFor(fixtureFingerprint());
-    expect(svg).toContain('💎');
-    expect(svg).toContain('🌈');
-    expect(svg).toContain('☀️');
+    // Not one emoji CHARACTER survives into the markup: resvg supports
+    // neither sbix nor CBDT, so each one would rasterise to nothing.
+    expect(svg).not.toMatch(/\p{Extended_Pictographic}/u);
+    // They are here as Twemoji paths instead — ☀️'s amber, 💎's blue.
+    expect(svg).toContain('fill="#FFAC33"');
+    expect(svg).toContain('fill="#5DADEC"');
+  });
+
+  test('has artwork for every emoji the card can be asked to print', () => {
+    // The vendored set is small on purpose, so the thing that can go wrong is
+    // a class emoji with no file behind it. Every rhythm, plus the 🧭 that
+    // stands in when only the style is known.
+    const rhythms = [...(Object.keys(RHYTHM_LABELS) as RhythmClass[]), null];
+    for (const rhythm of rhythms) {
+      const card = {
+        ...shareCardFrom(fixtureFingerprint(), identity),
+        userClass: className(rhythm, 'orchestrator'),
+      };
+      expect(() => String(ShareCard({ card }))).not.toThrow();
+    }
+  });
+
+  test('refuses an emoji it has no artwork for, rather than drawing a hole', () => {
+    const card = {
+      ...shareCardFrom(fixtureFingerprint(), identity),
+      userClass: { emoji: '🦄', rhythm: 'mythical', style: 'orchestrator' },
+    };
+    expect(() => String(ShareCard({ card }))).toThrow(/No Twemoji artwork/);
   });
 
   test('paints the brand in two tones and the 🌈 chip with a gradient', () => {
@@ -153,7 +187,16 @@ describe('ShareCard · a hidden section is not on the card', () => {
     expect(svg).toContain('@fixture-user');
     expect(svg).toContain('clawd');
     expect(svg).not.toContain('$');
-    expect(svg).not.toContain('🌈');
+    expect(svg).not.toContain('ultrathinks');
     expect(svg).not.toContain('NaN');
+  });
+
+  test('and the PNG is this markup rasterised, so it cannot say more', () => {
+    // Everything above asserts on the SVG. That is also the whole truth about
+    // card.png only while the route rasterises the string it serves rather
+    // than building a second one — which is what this reads the route for.
+    const route = readFileSync(join(import.meta.dir, '../routes/og.ts'), 'utf8');
+    expect(route.match(/ShareCard\(/g)).toHaveLength(1);
+    expect(route).toContain('cardPng(svg)');
   });
 });
