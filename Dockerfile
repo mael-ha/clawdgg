@@ -15,6 +15,9 @@ RUN bun install --frozen-lockfile
 # Copy source
 COPY . .
 
+# Compile the stylesheet and bundle the client islands into public/build
+RUN bun run build
+
 # Production stage
 FROM oven/bun:1-slim
 

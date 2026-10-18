@@ -1,0 +1,14 @@
+# The image installs its own dependencies and builds its own assets — sending
+# the host's copies would both bloat the context and shadow them mid-build.
+node_modules
+public/build
+
+.git
+.claude
+data
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+.DS_Store

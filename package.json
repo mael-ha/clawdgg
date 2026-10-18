@@ -1,13 +1,11 @@
 {
   "name": "clawdgg",
   "version": "0.1.0",
+  "private": true,
   "description": "CLI to sync your Claude Code stats to clawd.gg — I built this to track how much you use me",
   "author": "Claude (Anthropic) & Mael HA <mael@clawd.gg>",
   "license": "MIT",
   "type": "module",
-  "bin": {
-    "clawdgg": "./cli/index.ts"
-  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mael-ha/clawdgg.git"

@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { FC } from 'hono/jsx';
 import { Layout } from '../components/Layout';
 import type { Island } from '../lib/assets';
+import { TtlCache } from '../lib/ttl-cache';
 import { db } from '../db';
 import { dailyStats, users } from '../db/schema';
 import { eq, sql, asc } from 'drizzle-orm';
@@ -775,114 +776,184 @@ const NotFound: FC<{ username: string }> = ({ username }) => (
 );
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ROUTE HANDLER
+// DATA
 // ═══════════════════════════════════════════════════════════════════════════
 
-app.get('/:username', async (c) => {
-  const username = c.req.param('username');
-  const currentUser = c.get('user');
+type UserRow = typeof users.$inferSelect;
 
-  // Fetch user
-  const user = await db
-    .select()
-    .from(users)
-    .where(eq(users.githubUsername, username))
-    .limit(1);
+interface OtelProfileData {
+  todayMetrics: TodayMetrics | null;
+  cacheStats: CacheStats | null;
+  languageStats: LanguageStats[];
+  toolStats: ToolStats[];
+  trustStyle: TrustStyle | null;
+  agenticStats: AgenticStats | null;
+  terminalStats: TerminalStats[];
+  todayEnhanced: TodayMetricsEnhanced | null;
+}
 
-  if (user.length === 0) {
-    return c.html(
-      <Layout
-        title={`@${username} - Not Found - clawd.gg`}
-        description={`@${username} hasn't joined clawd.gg yet.`}
-        user={currentUser}
-      >
-        <NotFound username={username} />
-      </Layout>,
-      404
-    );
+const NO_OTEL_DATA: OtelProfileData = {
+  todayMetrics: null,
+  cacheStats: null,
+  languageStats: [],
+  toolStats: [],
+  trustStyle: null,
+  agenticStats: null,
+  terminalStats: [],
+  todayEnhanced: null,
+};
+
+interface ProfilePayload {
+  profile: ProfileData;
+  archetypes: ArchetypeScore[];
+  derivedMetrics: DerivedMetrics;
+  peakHour: PeakHourInfo | null;
+  contributions: ContributionDay[];
+  otel: OtelProfileData;
+  summary: string;
+}
+
+/**
+ * The whole page payload, for a minute at a time.
+ *
+ * Nothing here is live: SQLite totals are refreshed by the 5-minute
+ * ClickHouse sync, and the OTEL panels are a "today" rollup. A minute of
+ * staleness costs a viewer nothing and saves the fan-out below — about a
+ * dozen queries, half of them ClickHouse round trips — on every reload,
+ * every crawler hit, and every person who opens the same popular profile.
+ *
+ * Keyed by username AND whether the viewer owns the profile, because owners
+ * get panels (today, languages, toolkit, trust) nobody else is shown.
+ */
+const profileCache = new TtlCache<ProfilePayload>(60_000);
+
+/** Everyone with either OTel enabled or a daily_stats row. */
+async function fetchTotalUsers(): Promise<number> {
+  const rows = (await db.all(sql`
+    SELECT COUNT(*) as count
+    FROM users u
+    WHERE u.otel_enabled = 1
+       OR EXISTS (SELECT 1 FROM daily_stats WHERE user_id = u.id)
+  `)) as any[];
+  return rows[0]?.count ?? 1;
+}
+
+/** Rank = how many users are ahead on prompts, +1. */
+async function fetchRank(totalPrompts: number): Promise<number> {
+  const rows = (await db.all(sql`
+    SELECT (
+      SELECT COUNT(*) + 1 FROM (
+        SELECT subq.id FROM (
+          SELECT u.id,
+            CASE
+              WHEN u.otel_enabled = 1 THEN u.total_prompts
+              ELSE COALESCE((SELECT SUM(prompt_count) FROM daily_stats WHERE user_id = u.id), 0)
+            END as total_prompts
+          FROM users u
+          WHERE u.otel_enabled = 1
+             OR EXISTS (SELECT 1 FROM daily_stats WHERE user_id = u.id)
+        ) subq
+        WHERE subq.total_prompts > ${totalPrompts}
+      )
+    ) as rank
+  `)) as any[];
+  return rows[0]?.rank ?? 1;
+}
+
+/**
+ * The owner-only OTEL panels. Isolated in its own try/catch on purpose: if
+ * ClickHouse is unreachable the profile still renders from SQLite, just
+ * without the live sections.
+ */
+async function fetchOtelProfileData(userId: string): Promise<OtelProfileData> {
+  try {
+    const [todayMetrics, cacheStats, languageStats, toolStats, trustStyle, agenticStats, terminalStats, todayEnhanced] =
+      await Promise.all([
+        clickhouse.getUserTodayMetrics(userId),
+        clickhouse.getUserCacheStats(userId),
+        clickhouse.getUserLanguageStats(userId),
+        clickhouse.getUserToolBreakdown(userId),
+        clickhouse.getUserTrustStyle(userId),
+        clickhouse.getUserAgenticStats(userId),
+        clickhouse.getUserTerminalStats(userId),
+        clickhouse.getUserTodayMetricsEnhanced(userId),
+      ]);
+    return { todayMetrics, cacheStats, languageStats, toolStats, trustStyle, agenticStats, terminalStats, todayEnhanced };
+  } catch (error) {
+    console.error('Error fetching OTEL data:', error);
+    return NO_OTEL_DATA;
   }
+}
 
-  const userData = user[0]!;
+async function buildProfilePayload(userData: UserRow, isOwnProfile: boolean): Promise<ProfilePayload> {
   const isOtelUser = userData.otelEnabled === true;
 
-  // Get stats: use users.total_* for OTel users, sum daily_stats for legacy
-  let totalPrompts: number;
-  let totalLinesWritten: number;
-  let totalCommits: number;
-  let totalTokens: number;
-  let totalInputTokens: number;
-  let totalOutputTokens: number;
-  let totalCacheReadTokens: number;
-  let totalCacheCreationTokens: number;
-  let totalCostCents: number;
-  let totalActiveSeconds: number;
-  let totalMessages: number;
-  let totalToolCalls: number;
+  // OTel users carry their totals on the user row (synced from ClickHouse),
+  // so their rank can be asked for in the same breath as everything else.
+  // Legacy users have to sum daily_stats first.
+  const otelPrompts = isOtelUser ? userData.totalPrompts ?? 0 : null;
 
-  if (isOtelUser) {
-    // V2: Use cached totals from users table
-    totalPrompts = userData.totalPrompts ?? 0;
-    totalLinesWritten = userData.totalLinesAdded ?? 0;
-    totalCommits = userData.totalCommits ?? 0;
-    totalTokens = userData.totalTokens ?? 0;
-    totalInputTokens = userData.totalInputTokens ?? 0;
-    totalOutputTokens = userData.totalOutputTokens ?? 0;
-    totalCacheReadTokens = userData.totalCacheReadTokens ?? 0;
-    totalCacheCreationTokens = userData.totalCacheCreationTokens ?? 0;
-    totalCostCents = userData.totalCostCents ?? 0;
-    totalActiveSeconds = userData.totalActiveSeconds ?? 0;
-    totalMessages = totalPrompts;
-    // Tool calls: OTEL + legacy (query ClickHouse for fresh count)
-    const otelToolCalls = await clickhouse.getUserTotalToolCalls(userData.id);
-    totalToolCalls = otelToolCalls + (userData.legacyTotalToolCalls ?? 0);
-  } else {
-    // V1: Sum from daily_stats
-    const statsResult = await db
+  // One wave. These queries don't depend on each other, and the page used to
+  // await them one after another — six serial round trips, four of them to
+  // ClickHouse.
+  const [statsRows, otelToolCalls, legacyActivity, otelDaily, totalUsers, otelData, otelRank] = await Promise.all([
+    isOtelUser
+      ? null
+      : db
+          .select({
+            totalPrompts: sql<number>`sum(${dailyStats.promptCount})`,
+            totalLinesWritten: sql<number>`sum(${dailyStats.linesWritten})`,
+            totalCommits: sql<number>`sum(${dailyStats.commitCount})`,
+            totalMessages: sql<number>`sum(${dailyStats.messageCount})`,
+            totalToolCalls: sql<number>`sum(${dailyStats.toolCallCount})`,
+            totalTokens: sql<number>`sum(${dailyStats.tokenCount})`,
+            totalInputTokens: sql<number>`sum(${dailyStats.inputTokens})`,
+            totalOutputTokens: sql<number>`sum(${dailyStats.outputTokens})`,
+            totalCacheReadTokens: sql<number>`sum(${dailyStats.cacheReadTokens})`,
+            totalCacheCreationTokens: sql<number>`sum(${dailyStats.cacheCreationTokens})`,
+            totalCostCents: sql<number>`sum(${dailyStats.costUsdCents})`,
+          })
+          .from(dailyStats)
+          .where(eq(dailyStats.userId, userData.id)),
+    isOtelUser ? clickhouse.getUserTotalToolCalls(userData.id) : 0,
+    db
       .select({
-        totalPrompts: sql<number>`sum(${dailyStats.promptCount})`,
-        totalLinesWritten: sql<number>`sum(${dailyStats.linesWritten})`,
-        totalCommits: sql<number>`sum(${dailyStats.commitCount})`,
-        totalMessages: sql<number>`sum(${dailyStats.messageCount})`,
-        totalToolCalls: sql<number>`sum(${dailyStats.toolCallCount})`,
-        totalTokens: sql<number>`sum(${dailyStats.tokenCount})`,
-        totalInputTokens: sql<number>`sum(${dailyStats.inputTokens})`,
-        totalOutputTokens: sql<number>`sum(${dailyStats.outputTokens})`,
-        totalCacheReadTokens: sql<number>`sum(${dailyStats.cacheReadTokens})`,
-        totalCacheCreationTokens: sql<number>`sum(${dailyStats.cacheCreationTokens})`,
-        totalCostCents: sql<number>`sum(${dailyStats.costUsdCents})`,
+        date: dailyStats.date,
+        count: dailyStats.promptCount,
+        // Rich data from V2 schema (may be 0 for older data)
+        inputTokens: dailyStats.inputTokens,
+        outputTokens: dailyStats.outputTokens,
+        linesWritten: dailyStats.linesWritten,
+        costUsdCents: dailyStats.costUsdCents,
       })
       .from(dailyStats)
-      .where(eq(dailyStats.userId, userData.id));
+      .where(eq(dailyStats.userId, userData.id))
+      .orderBy(asc(dailyStats.date)),
+    isOtelUser ? clickhouse.getUserDailyMetrics(userData.id, 365) : [],
+    fetchTotalUsers(),
+    isOwnProfile && isOtelUser ? fetchOtelProfileData(userData.id) : NO_OTEL_DATA,
+    otelPrompts === null ? null : fetchRank(otelPrompts),
+  ]);
 
-    totalPrompts = statsResult[0]?.totalPrompts ?? 0;
-    totalLinesWritten = statsResult[0]?.totalLinesWritten ?? 0;
-    totalCommits = statsResult[0]?.totalCommits ?? 0;
-    totalTokens = statsResult[0]?.totalTokens ?? 0;
-    totalInputTokens = statsResult[0]?.totalInputTokens ?? 0;
-    totalOutputTokens = statsResult[0]?.totalOutputTokens ?? 0;
-    totalCacheReadTokens = statsResult[0]?.totalCacheReadTokens ?? 0;
-    totalCacheCreationTokens = statsResult[0]?.totalCacheCreationTokens ?? 0;
-    totalCostCents = statsResult[0]?.totalCostCents ?? 0;
-    totalActiveSeconds = 0;
-    totalMessages = statsResult[0]?.totalMessages ?? 0;
-    totalToolCalls = statsResult[0]?.totalToolCalls ?? 0;
-  }
-
-  // Fetch daily activity for contribution graph
-  // For OTEL users: Merge legacy dailyStats + ClickHouse metrics_daily
-  const legacyActivity = await db
-    .select({
-      date: dailyStats.date,
-      count: dailyStats.promptCount,
-      // Rich data from V2 schema (may be 0 for older data)
-      inputTokens: dailyStats.inputTokens,
-      outputTokens: dailyStats.outputTokens,
-      linesWritten: dailyStats.linesWritten,
-      costUsdCents: dailyStats.costUsdCents,
-    })
-    .from(dailyStats)
-    .where(eq(dailyStats.userId, userData.id))
-    .orderBy(asc(dailyStats.date));
+  // Totals: users.total_* for OTel users, summed daily_stats for legacy
+  const stats = statsRows?.[0];
+  const totalPrompts = otelPrompts ?? stats?.totalPrompts ?? 0;
+  const totalLinesWritten = isOtelUser ? userData.totalLinesAdded ?? 0 : stats?.totalLinesWritten ?? 0;
+  const totalCommits = isOtelUser ? userData.totalCommits ?? 0 : stats?.totalCommits ?? 0;
+  const totalTokens = isOtelUser ? userData.totalTokens ?? 0 : stats?.totalTokens ?? 0;
+  const totalInputTokens = isOtelUser ? userData.totalInputTokens ?? 0 : stats?.totalInputTokens ?? 0;
+  const totalOutputTokens = isOtelUser ? userData.totalOutputTokens ?? 0 : stats?.totalOutputTokens ?? 0;
+  const totalCacheReadTokens = isOtelUser ? userData.totalCacheReadTokens ?? 0 : stats?.totalCacheReadTokens ?? 0;
+  const totalCacheCreationTokens = isOtelUser
+    ? userData.totalCacheCreationTokens ?? 0
+    : stats?.totalCacheCreationTokens ?? 0;
+  const totalCostCents = isOtelUser ? userData.totalCostCents ?? 0 : stats?.totalCostCents ?? 0;
+  const totalActiveSeconds = isOtelUser ? userData.totalActiveSeconds ?? 0 : 0;
+  const totalMessages = isOtelUser ? totalPrompts : stats?.totalMessages ?? 0;
+  // Tool calls: OTEL + the frozen legacy snapshot
+  const totalToolCalls = isOtelUser
+    ? otelToolCalls + (userData.legacyTotalToolCalls ?? 0)
+    : stats?.totalToolCalls ?? 0;
 
   // Build merged daily activity map with optional rich data
   interface DailyData {
@@ -906,21 +977,18 @@ app.get('/:username', async (c) => {
     });
   }
 
-  // For OTEL users, fetch and merge ClickHouse data with rich metrics
-  if (isOtelUser) {
-    const otelDaily = await clickhouse.getUserDailyMetrics(userData.id, 365);
-    for (const day of otelDaily) {
-      const otelCount = day.prompts || 0;
-      if (otelCount > 0 || day.input_tokens > 0) {
-        const existing = activityMap.get(day.date);
-        activityMap.set(day.date, {
-          count: Math.max(existing?.count || 0, otelCount),
-          tokens: (day.input_tokens || 0) + (day.output_tokens || 0),
-          linesAdded: day.lines_added || 0,
-          linesRemoved: day.lines_removed || 0,
-          costUsd: day.cost_usd || 0,
-        });
-      }
+  // For OTEL users, merge the ClickHouse days over the legacy ones
+  for (const day of otelDaily) {
+    const otelCount = day.prompts || 0;
+    if (otelCount > 0 || day.input_tokens > 0) {
+      const existing = activityMap.get(day.date);
+      activityMap.set(day.date, {
+        count: Math.max(existing?.count || 0, otelCount),
+        tokens: (day.input_tokens || 0) + (day.output_tokens || 0),
+        linesAdded: day.lines_added || 0,
+        linesRemoved: day.lines_removed || 0,
+        costUsd: day.cost_usd || 0,
+      });
     }
   }
 
@@ -958,34 +1026,7 @@ app.get('/:username', async (c) => {
     };
   });
 
-  // Get user rank
-  const rankResult = await db.all(sql`
-    SELECT (
-      SELECT COUNT(*) + 1 FROM (
-        SELECT subq.id FROM (
-          SELECT u.id,
-            CASE
-              WHEN u.otel_enabled = 1 THEN u.total_prompts
-              ELSE COALESCE((SELECT SUM(prompt_count) FROM daily_stats WHERE user_id = u.id), 0)
-            END as total_prompts
-          FROM users u
-          WHERE u.otel_enabled = 1
-             OR EXISTS (SELECT 1 FROM daily_stats WHERE user_id = u.id)
-        ) subq
-        WHERE subq.total_prompts > ${totalPrompts}
-      )
-    ) as rank
-  `) as any[];
-  const rank = rankResult[0]?.rank ?? 1;
-
-  // Get total users count
-  const totalUsersResult = await db.all(sql`
-    SELECT COUNT(*) as count
-    FROM users u
-    WHERE u.otel_enabled = 1
-       OR EXISTS (SELECT 1 FROM daily_stats WHERE user_id = u.id)
-  `) as any[];
-  const totalUsers = totalUsersResult[0]?.count ?? 1;
+  const rank = otelRank ?? (await fetchRank(totalPrompts));
 
   // Parse badges and hourCounts
   let badges: string[] = [];
@@ -1011,51 +1052,6 @@ app.get('/:username', async (c) => {
   };
   const archetypes = calculateArchetypes(archetypeInput);
 
-  // Calculate derived metrics
-  const derivedMetrics = calculateDerivedMetrics(archetypeInput, totalCostCents);
-
-  // Get peak hour
-  const peakHour = getPeakHour(hourCounts);
-
-  // Fetch OTEL-specific data for own profile
-  const isOwnProfile = currentUser?.githubUsername === username;
-  let todayMetrics: TodayMetrics | null = null;
-  let cacheStats: CacheStats | null = null;
-  // NEW: Profile Signature data
-  let languageStats: LanguageStats[] = [];
-  let toolStats: ToolStats[] = [];
-  let trustStyle: TrustStyle | null = null;
-  let agenticStats: AgenticStats | null = null;
-  let terminalStats: TerminalStats[] = [];
-  let todayEnhanced: TodayMetricsEnhanced | null = null;
-
-  if (isOwnProfile && isOtelUser) {
-    try {
-      // Fetch all OTEL data in parallel
-      const [todayResult, cacheResult, langResult, toolResult, trustResult, agenticResult, terminalResult, todayEnhResult] = await Promise.all([
-        clickhouse.getUserTodayMetrics(userData.id),
-        clickhouse.getUserCacheStats(userData.id),
-        clickhouse.getUserLanguageStats(userData.id),
-        clickhouse.getUserToolBreakdown(userData.id),
-        clickhouse.getUserTrustStyle(userData.id),
-        clickhouse.getUserAgenticStats(userData.id),
-        clickhouse.getUserTerminalStats(userData.id),
-        clickhouse.getUserTodayMetricsEnhanced(userData.id),
-      ]);
-      todayMetrics = todayResult;
-      cacheStats = cacheResult;
-      languageStats = langResult;
-      toolStats = toolResult;
-      trustStyle = trustResult;
-      agenticStats = agenticResult;
-      terminalStats = terminalResult;
-      todayEnhanced = todayEnhResult;
-    } catch (error) {
-      console.error('Error fetching OTEL data:', error);
-      // Continue without OTEL data
-    }
-  }
-
   const profile: ProfileData = {
     username: userData.githubUsername,
     avatarUrl: userData.avatarUrl,
@@ -1080,10 +1076,57 @@ app.get('/:username', async (c) => {
     hourCounts,
   };
 
+  return {
+    profile,
+    archetypes,
+    derivedMetrics: calculateDerivedMetrics(archetypeInput, totalCostCents),
+    peakHour: getPeakHour(hourCounts),
+    contributions,
+    otel: otelData,
+    summary: `${formatArchetypeDisplay(archetypes)} · ${formatCost(totalCostCents)} invested in Claude · rank #${rank} of ${totalUsers}`,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ROUTE HANDLER
+// ═══════════════════════════════════════════════════════════════════════════
+
+app.get('/:username', async (c) => {
+  const username = c.req.param('username');
+  const currentUser = c.get('user');
+
+  // Deliberately outside the cache: a 404 is one indexed lookup, and a new
+  // signup shouldn't have to wait out a TTL to exist.
+  const user = await db
+    .select()
+    .from(users)
+    .where(eq(users.githubUsername, username))
+    .limit(1);
+
+  if (user.length === 0) {
+    return c.html(
+      <Layout
+        title={`@${username} - Not Found - clawd.gg`}
+        description={`@${username} hasn't joined clawd.gg yet.`}
+        user={currentUser}
+      >
+        <NotFound username={username} />
+      </Layout>,
+      404
+    );
+  }
+
+  const userData = user[0]!;
+  const isOtelUser = userData.otelEnabled === true;
+  const isOwnProfile = currentUser?.githubUsername === userData.githubUsername;
+
+  const { profile, archetypes, derivedMetrics, peakHour, contributions, otel, summary } =
+    await profileCache.remember(`${userData.githubUsername}|${isOwnProfile ? 'own' : 'public'}`, () =>
+      buildProfilePayload(userData, isOwnProfile),
+    );
+
   const islands: Island[] = ['contribution-tooltip'];
   if (isOwnProfile) islands.push('analytics-chart', 'copy-share');
-
-  const summary = `${formatArchetypeDisplay(archetypes)} · ${formatCost(totalCostCents)} invested in Claude · rank #${rank} of ${totalUsers}`;
 
   return c.html(
     <Layout
@@ -1105,15 +1148,15 @@ app.get('/:username', async (c) => {
         peakHour={peakHour}
         contributions={contributions}
         currentUser={currentUser}
-        todayMetrics={todayMetrics}
-        cacheStats={cacheStats}
+        todayMetrics={otel.todayMetrics}
+        cacheStats={otel.cacheStats}
         isOtelEnabled={isOtelUser}
-        languageStats={languageStats}
-        toolStats={toolStats}
-        trustStyle={trustStyle}
-        agenticStats={agenticStats}
-        terminalStats={terminalStats}
-        todayEnhanced={todayEnhanced}
+        languageStats={otel.languageStats}
+        toolStats={otel.toolStats}
+        trustStyle={otel.trustStyle}
+        agenticStats={otel.agenticStats}
+        terminalStats={otel.terminalStats}
+        todayEnhanced={otel.todayEnhanced}
       />
     </Layout>
   );
