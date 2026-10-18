@@ -49,7 +49,26 @@ interface ClickHouseResponse {
 /**
  * Execute a ClickHouse query
  */
-export async function query<T = any>(sql: string, params?: Record<string, any>): Promise<T[]> {
+/** Default per-statement budget. A read that takes longer is a read that failed. */
+const QUERY_TIMEOUT_MS = 10_000;
+
+export interface QueryOptions {
+  /**
+   * Override the 10s budget. Only for statements that are SUPPOSED to take
+   * minutes: a synchronous `ALTER ... DELETE` (mutations_sync = 2) and the big
+   * `INSERT ... SELECT` in the one-off migrations. Aborting one of those
+   * mid-flight leaves the table half-changed, which is the one outcome worse
+   * than waiting — so the migration asks for the time it needs rather than
+   * racing the default.
+   */
+  timeoutMs?: number;
+}
+
+export async function query<T = any>(
+  sql: string,
+  params?: Record<string, any>,
+  options?: QueryOptions
+): Promise<T[]> {
   const url = new URL(CLICKHOUSE_URL);
   url.searchParams.set('database', CLICKHOUSE_DATABASE);
   url.searchParams.set('default_format', 'JSONEachRow');
@@ -69,7 +88,7 @@ export async function query<T = any>(sql: string, params?: Record<string, any>):
     headers: {
       'Content-Type': 'text/plain',
     },
-    signal: AbortSignal.timeout(10000), // 10 second timeout
+    signal: AbortSignal.timeout(options?.timeoutMs ?? QUERY_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -467,7 +486,14 @@ const EVENT_IDENTITY_NUMERIC_DEFAULTS: Record<string, number> = {
 // ('a', 'bc') and ('ab', 'c') can never hash alike.
 const IDENTITY_SEPARATOR = '\u001f';
 
-function identityHash(parts: string[]): string {
+/**
+ * Exported for identities that are NOT a column list — the token/cost repair
+ * hashes (source event row_id, metric_name, token_type) so each derived row
+ * inherits the identity of the request it was rebuilt from. Any such caller
+ * must pass the same parts, in the same order, that its SQL side concatenates
+ * (identitySqlExpr), or the two disagree on every row.
+ */
+export function identityHash(parts: string[]): string {
   return createHash('sha256')
     .update(parts.join(IDENTITY_SEPARATOR))
     .digest('hex')
