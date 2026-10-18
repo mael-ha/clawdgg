@@ -96,6 +96,26 @@ export const API_URL_RESOLUTION = resolveApiBaseUrl();
 export const API_BASE_URL = API_URL_RESOLUTION.url;
 
 /**
+ * Is a token issued by `pinnedOrigin` safe to send to `apiBaseUrl`?
+ *
+ * The origin is recorded at login, and a token is never sent anywhere else. A
+ * bearer is a credential for ONE server: point the CLI at a different one —
+ * with CLAWDGG_API_URL, or by running an old binary whose default has since
+ * changed — and the old behaviour was to hand that server the token and ask it
+ * for the user's stats.
+ *
+ * A config with no pinned origin predates this and is trusted, since there was
+ * only ever one server to have issued it.
+ */
+export function tokenIsForThisOrigin(
+  pinnedOrigin: unknown,
+  apiBaseUrl: string = API_BASE_URL
+): boolean {
+  if (typeof pinnedOrigin !== "string" || !pinnedOrigin) return true;
+  return pinnedOrigin.replace(/\/+$/, "") === apiBaseUrl.replace(/\/+$/, "");
+}
+
+/**
  * How to invoke ourselves, as an ARGV.
  *
  * Claude Code runs the settings.json hooks (`otelHeadersHelper`, `statusLine`)

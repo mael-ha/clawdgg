@@ -17,7 +17,7 @@
 import { readFile, appendFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { API_BASE_URL, CONFIG_DIR, CONFIG_FILE, selfArgv } from "./paths";
+import { API_BASE_URL, CONFIG_DIR, CONFIG_FILE, selfArgv, tokenIsForThisOrigin } from "./paths";
 import { isOurStatusLineCommand } from "./settings";
 import { markTokenRevoked, mergeState, readState } from "./token-state";
 import { parseRateLimits } from "../src/lib/plan-usage";
@@ -155,10 +155,13 @@ async function appendDebugCapture(raw: string): Promise<void> {
 }
 
 // Deliberately NOT index.ts's loadConfig — see the header note about stdout.
+// The origin check is the same one, though: a token is a credential for the
+// server that issued it, and this path POSTs to API_BASE_URL.
 async function readTokenQuietly(): Promise<string | null> {
   try {
     if (!existsSync(CONFIG_FILE)) return null;
     const parsed = JSON.parse(await readFile(CONFIG_FILE, "utf-8"));
+    if (!tokenIsForThisOrigin(parsed?.apiOrigin)) return null;
     if (typeof parsed?.token === "string" && parsed.token) return parsed.token;
   } catch {
     // Unreadable config: no token, no report. Never a thrown prompt.

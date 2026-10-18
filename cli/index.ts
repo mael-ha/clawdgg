@@ -17,6 +17,7 @@ import { createInterface } from "node:readline";
 import {
   API_BASE_URL,
   API_URL_RESOLUTION,
+  tokenIsForThisOrigin,
   CLAUDE_HISTORY_PATH,
   CLAUDE_PROJECTS_DIR,
   CLAUDE_SETTINGS_PATH,
@@ -104,6 +105,8 @@ interface Config {
   username?: string;
   /** device_tokens.id of our own token — what `devices` marks as "this machine". */
   deviceId?: string;
+  /** The API origin that issued the token. It is never sent anywhere else. */
+  apiOrigin?: string;
   /** ISO timestamp of the consent that enabled telemetry. */
   consentAt?: string;
   /** Values in ~/.claude/settings.json that `setup` displaced, for `disable`. */
@@ -118,11 +121,30 @@ interface Config {
   lastKnownLongestStreak?: number;
 }
 
+/** True when the saved token belongs to a different server than this run. */
+let tokenOriginMismatch: string | null = null;
+
+/**
+ * Read the saved config.
+ *
+ * A token pinned to another origin is REMOVED from what this returns (in
+ * memory only — the file is left alone). Every command then behaves as if we
+ * were not logged in, which is the one behaviour that cannot leak a bearer to
+ * a server that did not issue it.
+ */
 async function loadConfig(): Promise<Config> {
   try {
     if (!existsSync(CONFIG_FILE)) return {};
     const parsed = JSON.parse(await readFile(CONFIG_FILE, "utf-8"));
-    return parsed && typeof parsed === "object" ? parsed : {};
+    if (!parsed || typeof parsed !== "object") return {};
+
+    const config = parsed as Config;
+    if (!tokenIsForThisOrigin(config.apiOrigin)) {
+      tokenOriginMismatch = config.apiOrigin ?? null;
+      const { token, deviceId, ...rest } = config;
+      return rest;
+    }
+    return config;
   } catch {
     return {};
   }
@@ -313,6 +335,8 @@ async function initiateLogin(): Promise<Config> {
         userId,
         username,
         deviceId: deviceTokenId(token) ?? undefined,
+        // Pinned here, checked on every read: this token is for this server.
+        apiOrigin: API_BASE_URL,
       };
       await saveConfig(config);
       // A fresh token means whatever we recorded as revoked is history.
@@ -1156,6 +1180,15 @@ async function cmdDoctor(): Promise<void> {
   }
 
   // 2. Local credentials.
+  if (tokenOriginMismatch) {
+    checks.push({
+      status: "fail",
+      label: `Your token was issued by ${tokenOriginMismatch}, not ${API_BASE_URL}`,
+      detail: "withheld — a bearer token is a credential for one server only",
+      fix: `clawdgg login`,
+    });
+  }
+
   if (!isWellFormedToken(config.token)) {
     checks.push({
       status: "fail",
