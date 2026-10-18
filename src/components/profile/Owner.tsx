@@ -27,7 +27,9 @@ const SAW_BOX = { width: 1000, height: 150 };
  */
 function untilReset(resetsAt: number): string {
   const seconds = resetsAt - Math.floor(Date.now() / 1000);
-  return seconds > 0 ? `in ${countdown(seconds)}` : 'reset due';
+  // Reads after the word "resets", so both halves have to make a sentence:
+  // "resets in 2d 4h" and "resets due now".
+  return seconds > 0 ? `in ${countdown(seconds)}` : 'due now';
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

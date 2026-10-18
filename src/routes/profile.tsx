@@ -271,7 +271,9 @@ app.get('/:username', async (c) => {
       og={{
         title: `@${user.githubUsername} on clawd.gg`,
         description: summary,
-        image: `${appUrl}/u/${user.githubUsername}/card.png`,
+        // SVG, not PNG — src/routes/og.ts says why, and what it would cost
+        // to change that.
+        image: `${appUrl}/u/${user.githubUsername}/card.svg`,
         url: shareUrl,
       }}
     >

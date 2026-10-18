@@ -19,6 +19,8 @@ import { mkdir, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ProfilePage } from '../components/profile/ProfilePage';
 import { fixtureProfile, type FixtureOptions } from '../components/profile/fixture';
+import { ShareCard } from '../components/profile/ShareCard';
+import { shareCardFrom } from '../lib/share-card';
 
 const outDir = process.argv[2];
 if (!outDir) {
@@ -83,3 +85,10 @@ for (const view of VIEWS) {
   await Bun.write(path, html);
   console.log(`${path}  ${(html.length / 1024).toFixed(0)} KB`);
 }
+
+// The share card is already a standalone SVG document, so it is written as
+// one — exactly the bytes /u/:username/card.svg serves.
+const card = shareCardFrom(fixtureProfile().fingerprint, { username: 'fixture-user' });
+const cardPath = join(outDir, 'share-card.svg');
+await Bun.write(cardPath, String(ShareCard({ card })));
+console.log(cardPath);

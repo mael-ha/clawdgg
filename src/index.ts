@@ -7,6 +7,7 @@ import api from './routes/api';
 import boards from './routes/boards';
 import cli from './routes/cli';
 import install from './routes/install';
+import og from './routes/og';
 import otel from './routes/otel';
 import pages from './routes/index';
 import profile from './routes/profile';
@@ -68,6 +69,9 @@ app.route('/api/cli', cli);
 // Before /api, same reason as /api/cli: api's own routing would shadow it.
 app.route('/api/boards', boards);
 app.route('/api', api);
+// Before the profile pages: the link-preview card is an image route under
+// the same /u prefix, with its own cache headers and no Layout.
+app.route('/u', og);
 app.route('/u', profile);
 app.route('/about', about);
 app.route('/', pages);
