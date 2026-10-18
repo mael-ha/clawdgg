@@ -1,4 +1,5 @@
 import type { FC } from 'hono/jsx';
+import { formatTokens } from '../lib/format';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TOKEN BAR - Horizontal stacked bar visualization of token composition
@@ -11,13 +12,6 @@ interface TokenBarProps {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
-}
-
-function formatTokens(n: number): string {
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
-  return n.toString();
 }
 
 // Token segments in display order

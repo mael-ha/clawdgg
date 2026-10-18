@@ -5,6 +5,7 @@ import { dailyStats, users } from '../db/schema';
 import { sql, desc, eq } from 'drizzle-orm';
 import type { LeaderboardEntry } from '../types';
 import { BADGES } from '../lib/badges';
+import { formatCost, formatNumber, formatRelativeTime, formatTokens } from '../lib/format';
 
 // Extend Hono types for our app
 type Variables = {
@@ -27,42 +28,6 @@ type Period = 'today' | 'week' | 'month' | 'all';
 // Helper Functions
 // ═══════════════════════════════════════════════════════════════════════════
 
-function formatNumber(n: number): string {
-  if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
-  if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
-  return n.toString();
-}
-
-function formatTokens(n: number): string {
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
-  return n.toString();
-}
-
-function formatCost(cents: number): string {
-  if (cents >= 10000) return `$${Math.round(cents / 100)}`;
-  if (cents >= 100) return `$${(cents / 100).toFixed(0)}`;
-  if (cents > 0) return `$${(cents / 100).toFixed(2)}`;
-  return '';
-}
-
-function formatRelativeTime(date: Date | null): string {
-  if (!date) return '';
-  const now = Date.now();
-  const diff = now - date.getTime();
-
-  const minutes = Math.floor(diff / 60000);
-  const hours = Math.floor(diff / 3600000);
-  const days = Math.floor(diff / 86400000);
-
-  if (minutes < 1) return 'now';
-  if (minutes < 60) return `${minutes}m`;
-  if (hours < 24) return `${hours}h`;
-  if (days < 7) return `${days}d`;
-  return `${Math.floor(days / 7)}w`;
-}
-
 function getBadgeEmojis(badgeIds: string[], max: number = 3): string[] {
   return badgeIds
     .slice(0, max)
@@ -82,8 +47,9 @@ const Header = ({ user }: HeaderProps) => (
   <header class="border-b border-cyan-500/20 bg-black/80 backdrop-blur-md sticky top-0 z-50">
     <div class="max-w-5xl mx-auto px-4 py-4 flex justify-between items-center">
       <a href="/" class="flex items-center gap-3 group">
-        <div class="text-cyan-400 font-mono text-xl font-bold tracking-tight glitch-text" data-text="clawd.gg">
-          <span class="text-magenta-400">&gt;</span> clawd.gg
+        <div class="font-mono text-xl font-bold tracking-tight">
+          <span class="text-magenta-400">&gt;</span>{' '}
+          <span class="text-gray-100">clawd</span><span class="text-cyan-400">.gg</span>
         </div>
       </a>
 

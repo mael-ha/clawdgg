@@ -22,8 +22,12 @@ const NavBar: FC<{ user?: SessionUser | null }> = ({ user }) => (
       <div class="flex h-16 items-center justify-between">
         {/* Logo */}
         <a href="/" class="flex items-center gap-3 group">
-          <div class="text-cyan-400 font-mono text-xl font-bold tracking-tight glitch-text" data-text="clawd.gg">
-            <span class="text-magenta-400">&gt;</span> clawd.gg
+          {/* Brand: two spans, two tones. The glitch-text ghost layers belong
+              to hero type — at 20px they landed on top of the word and the
+              logo read as a rendering bug. */}
+          <div class="font-mono text-xl font-bold tracking-tight">
+            <span class="text-magenta-400">&gt;</span>{' '}
+            <span class="text-gray-100">clawd</span><span class="text-cyan-400">.gg</span>
           </div>
           <span class="hidden sm:inline-block text-xs text-gray-500 font-mono">
             // claude code leaderboard

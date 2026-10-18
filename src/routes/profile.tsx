@@ -5,6 +5,7 @@ import { db } from '../db';
 import { dailyStats, users } from '../db/schema';
 import { eq, sql, asc } from 'drizzle-orm';
 import { getBadges, BADGES } from '../lib/badges';
+import { formatCost, formatHours, formatTokens } from '../lib/format';
 import { getTokenComparison } from '../lib/comparisons';
 import {
   calculateArchetypes,
@@ -44,34 +45,6 @@ type Variables = {
 const app = new Hono<{ Variables: Variables }>();
 
 // ═══════════════════════════════════════════════════════════════════════════
-// UTILITIES
-// ═══════════════════════════════════════════════════════════════════════════
-
-// Format tokens with K/M/B suffix
-function formatTokens(n: number): string {
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
-  return n.toString();
-}
-
-// Format cost in dollars
-function formatCost(cents: number): string {
-  const dollars = cents / 100;
-  if (dollars >= 1000) return `$${(dollars / 1000).toFixed(1)}K`;
-  if (dollars >= 1) return `$${dollars.toFixed(0)}`;
-  return `$${dollars.toFixed(2)}`;
-}
-
-// Format hours as readable string
-function formatHours(seconds: number): string {
-  const hours = Math.floor(seconds / 3600);
-  if (hours >= 1) return `${hours}h`;
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}m`;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // COMPONENTS
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -85,13 +58,6 @@ interface ContributionDay {
   linesAdded?: number;
   linesRemoved?: number;
   costUsd?: number;
-}
-
-// Format number for tooltip
-function formatTooltipNumber(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
-  return n.toString();
 }
 
 const ContributionGraph: FC<{ days: ContributionDay[] }> = ({ days }) => {

@@ -1,4 +1,5 @@
 import type { FC } from 'hono/jsx';
+import { formatNumber } from '../lib/format';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ACTIVITY RADAR - 24-hour radial clock visualization
@@ -34,12 +35,6 @@ function formatHour(hour: number): string {
 function formatHourRange(hour: number): string {
   const nextHour = (hour + 1) % 24;
   return `${formatHour(hour)} – ${formatHour(nextHour)}`;
-}
-
-function formatNumber(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return n.toString();
 }
 
 export const ActivityRadar: FC<ActivityRadarProps> = ({ hourCounts }) => {

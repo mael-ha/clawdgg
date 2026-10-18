@@ -1,5 +1,6 @@
 import type { FC } from 'hono/jsx';
 import type { ToolStats } from '../db/clickhouse';
+import { formatNumber } from '../lib/format';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TOOLKIT CHART - Horizontal stacked bar showing tool usage composition
@@ -26,12 +27,6 @@ const TOOL_COLORS: Record<string, string> = {
 
 function getToolColor(tool: string): string {
   return TOOL_COLORS[tool] ?? TOOL_COLORS.default;
-}
-
-function formatNumber(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return n.toString();
 }
 
 const MIN_WIDTH_PERCENT = 3;

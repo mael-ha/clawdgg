@@ -4,7 +4,7 @@ import { dailyStats, users, planUsageSnapshots } from '../db/schema';
 import { eq, sql, desc, and, gte, asc } from 'drizzle-orm';
 import { requireAuth, optionalAuth } from '../lib/auth-middleware';
 import type { StatsSubmission, LeaderboardEntry, LeaderboardResponse } from '../types';
-import { computeBadges, formatBadgesCompact, type BadgeInput } from '../lib/badges';
+import { computeBadges, type BadgeInput } from '../lib/badges';
 import { normalizeEpochSeconds, parseRateLimits, shouldInsertSnapshot } from '../lib/plan-usage';
 
 const api = new Hono();
@@ -398,11 +398,6 @@ api.get('/leaderboard', optionalAuth, async (c) => {
         pageSize: limit,
       };
 
-      // Check if this is an HTMX request
-      const isHtmxRequest = c.req.header('HX-Request') === 'true';
-      if (isHtmxRequest) {
-        return c.html(renderLeaderboardHtml(entries, period, page, total, limit));
-      }
       return c.json(response);
     }
 
@@ -567,130 +562,12 @@ api.get('/leaderboard', optionalAuth, async (c) => {
       pageSize: limit,
     };
 
-    const isHtmxRequest = c.req.header('HX-Request') === 'true';
-    if (isHtmxRequest) {
-      return c.html(renderLeaderboardHtml(entries, period, page, total, limit));
-    }
     return c.json(response);
   } catch (error) {
     console.error('Error fetching leaderboard:', error);
     return c.json({ error: 'Failed to fetch leaderboard' }, 500);
   }
 });
-
-// Helper function to render leaderboard HTML for HTMX
-function renderLeaderboardHtml(
-  entries: LeaderboardEntry[],
-  period: string,
-  page: number,
-  total: number,
-  pageSize: number
-): string {
-  if (entries.length === 0) {
-    return `
-      <div class="text-center py-8 text-gray-500">
-        <p>No data available for this period.</p>
-      </div>
-    `;
-  }
-
-  const rows = entries.map((entry) => {
-    const badgeEmojis = entry.badges ? formatBadgesCompact(entry.badges) : '';
-    const formattedTokens = formatTokensCompact(entry.tokenCount);
-    const formattedLines = entry.linesWritten > 0 ? formatTokensCompact(entry.linesWritten) : '—';
-    return `
-    <tr class="border-b border-gray-100 hover:bg-gray-50">
-      <td class="py-3 px-4 text-center font-medium">${entry.rank}</td>
-      <td class="py-3 px-4">
-        <div class="flex items-center gap-3">
-          ${entry.avatarUrl
-            ? `<img src="${escapeHtml(entry.avatarUrl)}" alt="" class="w-8 h-8 rounded-full" />`
-            : `<div class="w-8 h-8 rounded-full bg-gray-200"></div>`
-          }
-          <a href="/u/${escapeHtml(entry.githubUsername)}"
-             class="font-medium text-blue-600 hover:underline">
-            ${escapeHtml(entry.githubUsername)}
-          </a>
-          ${badgeEmojis ? `<span class="text-sm" title="Badges">${badgeEmojis}</span>` : ''}
-        </div>
-      </td>
-      <td class="py-3 px-4 text-center">${entry.promptCount.toLocaleString()}</td>
-      <td class="py-3 px-4 text-center">${formattedLines}</td>
-      <td class="py-3 px-4 text-center">${formattedTokens}</td>
-    </tr>
-  `;
-  }).join('');
-
-  const totalPages = Math.ceil(total / pageSize);
-  const hasPrev = page > 1;
-  const hasNext = page < totalPages;
-
-  return `
-    <table class="w-full">
-      <thead>
-        <tr class="border-b-2 border-gray-200 text-left">
-          <th class="py-3 px-4 text-center w-16">#</th>
-          <th class="py-3 px-4">User</th>
-          <th class="py-3 px-4 text-center">Prompts</th>
-          <th class="py-3 px-4 text-center">Lines</th>
-          <th class="py-3 px-4 text-center">Tokens</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${rows}
-      </tbody>
-    </table>
-    <div class="flex justify-between items-center mt-4 px-4">
-      <span class="text-sm text-gray-500">
-        Showing ${((page - 1) * pageSize) + 1}-${Math.min(page * pageSize, total)} of ${total}
-      </span>
-      <div class="flex gap-2">
-        ${hasPrev
-          ? `<button hx-get="/api/leaderboard?period=${period}&page=${page - 1}&limit=${pageSize}"
-                     hx-target="#leaderboard-content"
-                     hx-swap="innerHTML"
-                     class="px-3 py-1 border rounded hover:bg-gray-100">
-               Previous
-             </button>`
-          : `<button disabled class="px-3 py-1 border rounded text-gray-300 cursor-not-allowed">
-               Previous
-             </button>`
-        }
-        ${hasNext
-          ? `<button hx-get="/api/leaderboard?period=${period}&page=${page + 1}&limit=${pageSize}"
-                     hx-target="#leaderboard-content"
-                     hx-swap="innerHTML"
-                     class="px-3 py-1 border rounded hover:bg-gray-100">
-               Next
-             </button>`
-          : `<button disabled class="px-3 py-1 border rounded text-gray-300 cursor-not-allowed">
-               Next
-             </button>`
-        }
-      </div>
-    </div>
-  `;
-}
-
-// Helper function to escape HTML
-function escapeHtml(text: string): string {
-  const map: Record<string, string> = {
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#039;',
-  };
-  return text.replace(/[&<>"']/g, (char) => map[char] || char);
-}
-
-// Helper function to format tokens with K/M/B suffix
-function formatTokensCompact(n: number): string {
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
-  return n.toString();
-}
 
 // GET /api/me - Get current user's profile data (requires auth)
 // Dashboard V2: Now includes archetype, cost, and derived metrics

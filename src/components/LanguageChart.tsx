@@ -1,5 +1,6 @@
 import type { FC } from 'hono/jsx';
 import type { LanguageStats } from '../db/clickhouse';
+import { formatNumber } from '../lib/format';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LANGUAGE CHART - Horizontal stacked bar showing language composition
@@ -34,12 +35,6 @@ const LANGUAGE_COLORS: Record<string, string> = {
 
 function getLanguageColor(language: string): string {
   return LANGUAGE_COLORS[language] ?? LANGUAGE_COLORS.default;
-}
-
-function formatNumber(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return n.toString();
 }
 
 const MIN_WIDTH_PERCENT = 3; // Minimum visual width for visibility
