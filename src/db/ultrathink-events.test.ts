@@ -17,6 +17,7 @@ import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+  CAPPED_ULTRATHINKS_SQL,
   PROMPT_EVENT_SQL,
   ULTRATHINK_EVENT_NAME,
   ULTRATHINK_EVENT_SQL,
@@ -65,7 +66,10 @@ describe('the flag cannot be mistaken for a measurement', () => {
       const namesEvent =
         sql.includes('event_name') ||
         sql.includes('${PROMPT_EVENT_SQL}') ||
-        sql.includes('${ULTRATHINK_EVENT_SQL}');
+        sql.includes('${ULTRATHINK_EVENT_SQL}') ||
+        // CAPPED_ULTRATHINKS_SQL is two countIfs, both naming their event.
+        sql.includes('${CAPPED_ULTRATHINKS_SQL}') ||
+        sql.includes('${CLAUDE_CODE_EVENT_SQL}');
       if (!namesEvent) offenders.push(sql.slice(0, 200).replace(/\s+/g, ' ').trim());
     }
 
@@ -76,8 +80,16 @@ describe('the flag cannot be mistaken for a measurement', () => {
 
   it('is counted only where it is asked for by name', () => {
     expect(ULTRATHINK_EVENT_SQL).toBe(`event_name = '${ULTRATHINK_EVENT_NAME}'`);
-    // The fingerprint is the only reader, and it asks by name.
-    expect(fingerprint).toContain('ULTRATHINK_EVENT_SQL');
+
+    // The readers go through CAPPED_ULTRATHINKS_SQL, which is BUILT from that
+    // predicate — so the flag is still only ever counted by name, and now it is
+    // also capped at the number of prompts the same day holds. The fingerprint
+    // used to count it bare; a bare count can exceed its own denominator.
+    expect(CAPPED_ULTRATHINKS_SQL).toContain(ULTRATHINK_EVENT_SQL);
+    expect(CAPPED_ULTRATHINKS_SQL).toContain(PROMPT_EVENT_SQL);
+    expect(CAPPED_ULTRATHINKS_SQL).toStartWith('least(');
+    expect(fingerprint).toContain('CAPPED_ULTRATHINKS_SQL');
+    expect(fingerprint).not.toMatch(/countIf\(\$\{ULTRATHINK_EVENT_SQL\}\)/);
   });
 
   // api_request and tool_result are the other two counts a flag could pollute.
