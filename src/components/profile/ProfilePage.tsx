@@ -89,7 +89,14 @@ export const ProfilePage: FC<ProfileViewProps> = ({
         ) : (
           <>
             {fingerprint.anatomy && (
-              <Anatomy anatomy={fingerprint.anatomy} visibility={visibility} />
+              <Anatomy
+                anatomy={fingerprint.anatomy}
+                // The median prompt length is built on the same characters the
+                // conversation counts, so it carries the same caveat — but
+                // only when `conversation` is in this payload to say so.
+                historyDerivedCharsPct={fingerprint.conversation?.historyDerivedCharsPct}
+                visibility={visibility}
+              />
             )}
 
             {fingerprint.rings && (

@@ -73,7 +73,9 @@ og.get('/:username/card.svg', async (c) => {
       const data = await getFingerprint(user.id, {
         username: user.githubUsername,
         timezone: user.timezone,
-        // Always the public view, whoever is asking.
+        // Always the public view, whoever is asking — which also keeps the
+        // zone name out of the payload this card is built from.
+        isOwner: false,
         hidden: hiddenSections(settings),
       });
 

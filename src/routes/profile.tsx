@@ -120,6 +120,9 @@ async function buildPayload(user: ProfileUser, isOwner: boolean): Promise<Profil
     getFingerprint(user.id, {
       username: user.githubUsername,
       timezone: user.timezone,
+      // The payload now gates the zone name itself — a visitor's copy has no
+      // `timezone` at all. See FingerprintData.timezone.
+      isOwner,
       // The owner always sees everything, including what they have hidden.
       hidden: isOwner ? [] : hiddenFromOthers,
     }),
@@ -283,9 +286,10 @@ app.get('/:username', async (c) => {
           username: user.githubUsername,
           avatarUrl: user.avatarUrl,
           joinedOn: user.firstSessionDate,
-          // Owner only: a zone name is location data. ?as=visitor drops it too,
-          // which is what makes the preview an honest preview.
-          timezone: isOwner ? user.timezone : null,
+          // Straight off the payload, which only carries it for the owner —
+          // so ?as=visitor drops it too, which is what makes the preview an
+          // honest preview.
+          timezone: payload.fingerprint.timezone ?? null,
           timezoneAssumed: user.timezone === DEFAULT_TIMEZONE,
         }}
         year={payload.year}

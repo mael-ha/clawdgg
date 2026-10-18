@@ -44,7 +44,12 @@ function figuresOf(section: FingerprintSection): string[] {
     case 'value':
       return [money(data.value!.thisWeek), money(data.value!.allTime), 'API-EQUIVALENT VALUE'];
     case 'anatomy':
-      return ['ANATOMY OF YOUR AVERAGE PROMPT', '✍️ you type', 'it ships', 'median, per prompt'];
+      return [
+        'ANATOMY OF YOUR AVERAGE PROMPT',
+        '✍️ you type',
+        'it ships',
+        'API-equivalent, per prompt',
+      ];
     case 'conversation':
       return ['THE CONVERSATION', 'Claude sent back', 'for every character you type', '~558M'];
     case 'rings':
@@ -138,6 +143,7 @@ describe('ProfilePage · empty and partial states', () => {
       outputTokens: 1_000,
       approxOutputChars: 4_000,
       ratio: null,
+      historyDerivedCharsPct: 0,
     };
     props.fingerprint.anatomy!.allTime.prompts = 1;
     const html = render(<ProfilePage {...props} />);
@@ -204,6 +210,34 @@ describe('ProfilePage · empty and partial states', () => {
     const html = render(<ProfilePage {...props} />);
     expect(html).not.toContain('weekly limit');
     expect(html).not.toContain('no plan usage reported yet');
+  });
+
+  test('a figure built on recovered prompt lengths says so', () => {
+    // history.jsonl records a paste as "[Pasted text #1 +40 lines]", so the
+    // characters it contributes understate what was sent — and the median
+    // prompt length and the conversation ratio are both built on them.
+    const loud = fixtureProfile();
+    expect(loud.fingerprint.conversation!.historyDerivedCharsPct).toBeGreaterThan(5);
+    const caveated = render(<ProfilePage {...loud} />);
+    expect(caveated).toContain('reads low');
+    expect(caveated).toContain('characters typed*');
+    expect(caveated).toContain('chars*');
+
+    const clean = fixtureProfile();
+    clean.fingerprint.conversation!.historyDerivedCharsPct = 0.4;
+    const quiet = render(<ProfilePage {...clean} />);
+    expect(quiet).not.toContain('reads low');
+    expect(quiet).toContain('characters typed ');
+    expect(quiet).toContain('median, per prompt');
+  });
+
+  test('the caveat is not shown when conversation is hidden but anatomy is not', () => {
+    // The share lives on `conversation`. With that section gone there is
+    // nothing to claim, so the median is printed plainly rather than with an
+    // asterisk pointing at a footnote that is no longer on the page.
+    const html = page({ hide: ['conversation'] });
+    expect(html).toContain('median, per prompt');
+    expect(html).not.toContain('reads low');
   });
 
   test('an owner on the default timezone is told their hours are UTC', () => {

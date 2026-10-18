@@ -125,6 +125,9 @@ export function fixtureFingerprint(): FingerprintData {
       outputTokens: 139_500_000,
       approxOutputChars: 558_000_000,
       ratio: 150.8,
+      // Above the caveat threshold on purpose: a profile with a recovered
+      // stretch in it is the interesting case to look at, not the clean one.
+      historyDerivedCharsPct: 31.4,
     },
     rings: {
       hours,
@@ -353,6 +356,8 @@ export function fixtureProfile(options: FixtureOptions = {}): ProfilePageProps &
     ? [...base.sections]
     : options.hide ?? [];
   const fingerprint = applyHidden(base, hide);
+  // A visitor's payload has no zone at all — see FingerprintData.timezone.
+  if (!options.owner) delete fingerprint.timezone;
 
   const blank = options.empty || options.takenDown;
 
@@ -362,9 +367,9 @@ export function fixtureProfile(options: FixtureOptions = {}): ProfilePageProps &
       username: fingerprint.username,
       avatarUrl: null,
       joinedOn: blank ? null : '2025-11-10',
-      // Owner only, like the real route: a visitor is never told the zone.
-      timezone: options.owner ? fingerprint.timezone : null,
-      timezoneAssumed: fingerprint.timezone === 'UTC',
+      // Straight off the payload, which carries the zone for the owner only.
+      timezone: fingerprint.timezone ?? null,
+      timezoneAssumed: base.timezone === 'UTC',
     },
     year:
       blank || hide.includes('year')
@@ -408,7 +413,13 @@ export function emptyFingerprint(): FingerprintData {
     hidden: [],
     value: { thisWeek: 0, lastWeek: 0, deltaPct: null, allTime: 0, weekStart: `${FIXTURE_TODAY}T00:00:00.000Z` },
     anatomy: { allTime: { ...zeroFigures }, last30d: { ...zeroFigures } },
-    conversation: { charsTyped: 0, outputTokens: 0, approxOutputChars: 0, ratio: null },
+    conversation: {
+      charsTyped: 0,
+      outputTokens: 0,
+      approxOutputChars: 0,
+      ratio: null,
+      historyDerivedCharsPct: 0,
+    },
     rings: {
       hours: Array<number>(24).fill(0),
       weekdays: Array<number>(7).fill(0),

@@ -39,6 +39,24 @@ interface Pill {
 const pillFor = ({ section, visibility }: Pill) =>
   visibility ? <VisibilityPill section={section} isPublic={visibility[section]} /> : null;
 
+/**
+ * Above this share, a typed-character figure is told on itself.
+ *
+ * Characters recovered from ~/.claude/history.jsonl are the REPL's DISPLAY
+ * string, where a paste reads `[Pasted text #1 +40 lines]` instead of its
+ * forty lines — so they understate what was actually sent, and so do the
+ * median prompt length and the conversation ratio built on them. A couple of
+ * percent moves nothing; a quarter of someone's history does.
+ */
+const HISTORY_CAVEAT_PCT = 5;
+
+const historyNote = (sharePct: number): string | undefined =>
+  sharePct >= HISTORY_CAVEAT_PCT
+    ? `${Math.round(sharePct)}% of these characters were recovered from the ` +
+      `local prompt history, which records a paste as "[Pasted text +40 lines]" ` +
+      `rather than its lines — so this reads low.`
+    : undefined;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // The header
 // ═══════════════════════════════════════════════════════════════════════════
@@ -164,8 +182,10 @@ const AnatomyFigure: FC<{
   figure: string;
   unit?: string;
   note: string;
-}> = ({ label, color, figure, unit, note }) => (
-  <div class="flex flex-col gap-0.5">
+  /** The long form of a caveat the note only hints at. */
+  title?: string;
+}> = ({ label, color, figure, unit, note, title }) => (
+  <div class="flex flex-col gap-0.5" title={title}>
     <span class={`font-mono text-[11px] sm:text-[12px] ${color}`}>{label}</span>
     <span class="font-mono text-[24px] font-extrabold tracking-[-0.02em] text-fp-text sm:text-[38px]">
       {figure}
@@ -177,11 +197,14 @@ const AnatomyFigure: FC<{
   </div>
 );
 
-export const Anatomy: FC<{ anatomy: AnatomyFigures; visibility: Visibility | null }> = ({
-  anatomy,
-  visibility,
-}) => {
+export const Anatomy: FC<{
+  anatomy: AnatomyFigures;
+  /** From `conversation`, when that section is in this payload. */
+  historyDerivedCharsPct?: number;
+  visibility: Visibility | null;
+}> = ({ anatomy, historyDerivedCharsPct, visibility }) => {
   const figures = anatomy.allTime;
+  const caveat = historyNote(historyDerivedCharsPct ?? 0);
 
   return (
     <Card>
@@ -201,8 +224,9 @@ export const Anatomy: FC<{ anatomy: AnatomyFigures; visibility: Visibility | nul
             label="✍️ you type"
             color="text-cyan-300"
             figure={group(figures.medianPromptChars)}
-            unit="chars"
-            note="median, per prompt"
+            unit={caveat ? 'chars*' : 'chars'}
+            note={caveat ? 'median · recovered lengths read low' : 'median, per prompt'}
+            title={caveat}
           />
           <Arrow />
           <AnatomyFigure
@@ -387,27 +411,34 @@ export const ConversationBlock: FC<{
   conversation: ConversationFigures;
   prompts: number;
   visibility: Visibility | null;
-}> = ({ conversation, prompts, visibility }) => (
+}> = ({ conversation, prompts, visibility }) => {
+  const caveat = historyNote(conversation.historyDerivedCharsPct);
+
+  return (
   <Card>
     <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
       <div class="flex items-center gap-3">
         <CardLabel>📏 THE CONVERSATION · ALL TIME</CardLabel>
         {pillFor({ section: 'conversation', visibility })}
       </div>
-      <CardLabel class="text-fp-faint">output chars ≈ 4 per token</CardLabel>
+      <CardLabel class="text-fp-faint">
+        output chars ≈ 4 per token
+        {caveat ? ` · *${Math.round(conversation.historyDerivedCharsPct)}% of typed chars recovered, reads low` : ''}
+      </CardLabel>
     </div>
 
     {conversation.charsTyped === 0 && conversation.outputTokens === 0 ? (
       <Nothing>no conversation recorded yet</Nothing>
     ) : (
       <div class="grid grid-cols-3 items-end gap-2 sm:gap-[18px]">
-        <div class="flex flex-col gap-1">
+        <div class="flex flex-col gap-1" title={caveat}>
           <span class="font-mono text-[10px] text-fp-dim sm:text-[12px]">you sent</span>
           <span class="font-mono text-[20px] font-extrabold leading-none tracking-[-0.03em] text-fp-text sm:text-[44px]">
             <span class="text-cyan-400">↑</span> {compact(conversation.charsTyped)}
           </span>
           <span class="hidden font-mono text-[12px] text-fp-dim sm:block">
-            characters typed{prompts > 0 ? ` · ${group(prompts)} prompts` : ''}
+            {caveat ? 'characters typed*' : 'characters typed'}
+            {prompts > 0 ? ` · ${group(prompts)} prompts` : ''}
           </span>
         </div>
 
@@ -434,4 +465,5 @@ export const ConversationBlock: FC<{
       </div>
     )}
   </Card>
-);
+  );
+};
