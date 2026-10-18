@@ -559,6 +559,22 @@ export const PROMPT_EVENT_SQL =
 export const NO_LEGACY_SQL = `provenance != 'legacy'`;
 
 /**
+ * A prompt that contained the word "ultrathink", recorded WITHOUT its text.
+ *
+ * These are synthetic rows: there is no such OTEL event. A local Claude Code
+ * hook (and the history import) decides the yes/no on the user's machine and
+ * only the flag leaves it — see cli/index.ts `prompt-hook`.
+ *
+ * `clawdgg.` rather than `claude_code.` on purpose. The prefix is what keeps
+ * these rows out of every existing query: PROMPT_EVENT_SQL, the api_request
+ * and tool_result counts all name a `claude_code.*` event, so a flag can never
+ * be mistaken for a prompt or an API call. src/db/ultrathink-events.test.ts
+ * holds the read layer to that.
+ */
+export const ULTRATHINK_EVENT_NAME = 'clawdgg.ultrathink';
+export const ULTRATHINK_EVENT_SQL = `event_name = '${ULTRATHINK_EVENT_NAME}'`;
+
+/**
  * `timestamp` in the user's own wall clock. Every hour-of-day, weekday and
  * week-boundary read goes through this, never bare `toHour(timestamp)`.
  *

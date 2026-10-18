@@ -7,6 +7,8 @@ import type { LeaderboardEntry, LeaderboardResponse } from '../types';
 import { normalizeEpochSeconds, parseRateLimits, shouldInsertSnapshot } from '../lib/plan-usage';
 import { getModelDisplayName } from '../lib/pricing';
 import { isValidTimezone, normalizeTimezone } from '../lib/timezone';
+import { getFingerprint, type FingerprintData, type FingerprintSection } from '../lib/fingerprint';
+import { TtlCache } from '../lib/ttl-cache';
 
 const api = new Hono();
 
@@ -400,6 +402,57 @@ api.post('/otel/enable', requireAuth, async (c) => {
   } catch (error) {
     console.error('Error enabling OTel:', error);
     return c.json({ error: 'Failed to enable OTel' }, 500);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET /api/u/:username/fingerprint — the profile's data layer
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// PUBLIC, because a profile is. Sections the owner has hidden are left OUT of
+// the payload for everyone else rather than zeroed, and `sections` / `hidden`
+// name which is which — a viewer sees a gap, never a wrong number.
+//
+// The cache is short and never holds a failure: `getFingerprint` throws if
+// ClickHouse is unreachable, and the throw never reaches the cache, so the next
+// request retries instead of serving an empty fingerprint for a whole minute.
+// An all-zero fingerprint is indistinguishable from "this person has never
+// used Claude Code", which is the one thing it must not be able to say wrongly.
+const FINGERPRINT_TTL_MS = 60_000;
+const fingerprintCache = new TtlCache<FingerprintData>(FINGERPRINT_TTL_MS);
+
+api.get('/u/:username/fingerprint', optionalAuth, async (c) => {
+  const username = c.req.param('username');
+
+  const row = await db
+    .select({ id: users.id, githubUsername: users.githubUsername, timezone: users.timezone })
+    .from(users)
+    .where(eq(users.githubUsername, username))
+    .get();
+
+  if (!row) return c.json({ error: 'No such user' }, 404);
+
+  const isOwner = c.get('user')?.githubUsername === row.githubUsername;
+
+  try {
+    // F6 replaces the empty list with the owner's profile_settings. Until the
+    // settings exist there is nothing anyone can have hidden, so an empty list
+    // is the truth rather than a placeholder.
+    const hidden: FingerprintSection[] = isOwner ? [] : [];
+
+    const data = await fingerprintCache.remember(
+      `${row.id}|${isOwner ? 'owner' : 'public'}`,
+      () =>
+        getFingerprint(row.id, {
+          username: row.githubUsername,
+          timezone: row.timezone,
+          hidden,
+        })
+    );
+    return c.json(data);
+  } catch (error) {
+    console.error(`[fingerprint] ${username}:`, error);
+    return c.json({ error: 'Failed to build fingerprint' }, 503);
   }
 });
 

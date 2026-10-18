@@ -188,7 +188,7 @@ describe('hour-of-day and weekday reads use the user\'s own clock', () => {
     );
   });
 
-  it.each(['db/clickhouse.ts', 'jobs/sync-clickhouse.ts'])(
+  it.each(['db/clickhouse.ts', 'jobs/sync-clickhouse.ts', 'lib/fingerprint.ts'])(
     '%s never buckets a bare UTC timestamp by hour or weekday',
     relPath => {
       const offenders = codeLines(sourceOf(relPath)).filter(
