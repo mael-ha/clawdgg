@@ -27,6 +27,7 @@
  *   - claude_code.session.count
  */
 
+import { createHash } from 'node:crypto';
 import { db } from './index';
 import { getModelPricing } from '../lib/pricing';
 import { bucketDailyRows, bucketLabel, bucketSql, type ChartGroupBy } from '../lib/chart-buckets';
@@ -165,6 +166,11 @@ export interface MetricRow {
   mcp_tool_name?: string;
   start_type?: string;       // session.count: fresh | resume | continue | agents_view
   provenance?: RowProvenance;
+  /**
+   * Deterministic per-row identity (see metricRowId). Part of the
+   * ReplacingMergeTree sorting key — leave it unset and insertMetrics fills it.
+   */
+  row_id?: string;
 }
 
 export interface EventRow {
@@ -206,6 +212,11 @@ export interface EventRow {
   account_uuid?: string;
   organization_id?: string;
   provenance?: RowProvenance;
+  /**
+   * Deterministic per-row identity (see eventRowId). Part of the
+   * ReplacingMergeTree sorting key — leave it unset and insertEvents fills it.
+   */
+  row_id?: string;
 }
 
 export interface DailyMetrics {
@@ -256,6 +267,137 @@ export interface HourlyActivity {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Row Identity (ReplacingMergeTree dedup key)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * `row_id` is a deterministic hash of everything that IDENTIFIES a row, and of
+ * nothing that merely measures it.
+ *
+ * Why it exists: ReplacingMergeTree collapses rows that share the sorting key,
+ * and every read uses FINAL. The old keys were
+ *   metrics_raw (user_id, metric_name, token_type, line_type, timestamp)
+ *   events_raw  (user_id, session_id, event_name, timestamp, tool_name)
+ * but Claude Code emits several datapoints with the SAME timestamp that differ
+ * only by model, query_source, speed, effort, agent/skill/plugin/mcp name, or
+ * tool/decision/language. Those collapsed into one row and their values were
+ * lost — main-thread and subagent token usage at the same instant became a
+ * single number. Hashing every identifying attribute into the key keeps them
+ * apart.
+ *
+ * Why the value is excluded: an OTLP retry re-sends the identical datapoint, so
+ * it must hash identically for the dedup to still work. Values can legitimately
+ * differ between a first delivery and a retry of a cumulative counter, and
+ * including them would turn every retry into a duplicate row.
+ *
+ * `provenance` IS part of the identity: a backfill-estimated row must never
+ * collapse onto a live row carrying Claude Code's own measured cost. It
+ * defaults to 'live' here to match the column DEFAULT, so a row hashed in TS
+ * and the same row hashed in SQL (migrations) agree.
+ *
+ * `pricing_source` is NOT part of the identity: it annotates how a cost was
+ * estimated, so re-running a backfill after a price-table update must update
+ * the row rather than add one.
+ *
+ * CALLERS THAT SYNTHESIZE TIMESTAMPS (JSONL backfill, daily_stats import):
+ * two records that land on the same synthesized timestamp with the same
+ * attributes are, by this definition, one row. Give each record a distinct
+ * timestamp or pass an explicit `row_id`.
+ */
+export const METRIC_IDENTITY_COLUMNS = [
+  'timestamp',
+  'user_id',
+  'session_id',
+  'metric_name',
+  'model',
+  'token_type',
+  'line_type',
+  'tool',
+  'decision',
+  'language',
+  'source',
+  'query_source',
+  'speed',
+  'effort',
+  'agent_name',
+  'skill_name',
+  'plugin_name',
+  'mcp_server_name',
+  'mcp_tool_name',
+  'start_type',
+  'terminal_type',
+  'app_version',
+  'account_uuid',
+  'organization_id',
+  'provenance',
+] as const;
+
+export const EVENT_IDENTITY_COLUMNS = [
+  'timestamp',
+  'user_id',
+  'session_id',
+  'event_name',
+  'tool_name',
+  'tool_use_id',
+  'model',
+  'decision',
+  'source',
+  'request_id',
+  'prompt_id',
+  'command_name',
+  'command_source',
+  'query_source',
+  'speed',
+  'effort',
+  'agent_name',
+  'skill_name',
+  'status_code',
+  'error_message',
+  'provenance',
+] as const;
+
+// Unit separator: cannot appear in an OTLP attribute value we keep, so
+// ('a', 'bc') and ('ab', 'c') can never hash alike.
+const IDENTITY_SEPARATOR = '\u001f';
+
+function identityHash(parts: string[]): string {
+  return createHash('sha256')
+    .update(parts.join(IDENTITY_SEPARATOR))
+    .digest('hex')
+    .slice(0, 32); // 128 bits — collision-free at any volume this project will see
+}
+
+/**
+ * The ClickHouse expression that computes the same hash as identityHash() for
+ * rows already in the table. Used by the v2 migration; asserted against the
+ * checked-in .sql by src/db/clickhouse.test.ts so the two cannot drift.
+ */
+export function identitySqlExpr(columns: readonly string[]): string {
+  const list = columns.map(c => `toString(${c})`).join(', ');
+  return `substring(lower(hex(SHA256(arrayStringConcat([${list}], char(31))))), 1, 32)`;
+}
+
+export function metricRowId(row: MetricRow): string {
+  const r = row as unknown as Record<string, unknown>;
+  return identityHash(
+    METRIC_IDENTITY_COLUMNS.map(c =>
+      c === 'provenance' ? String(row.provenance ?? 'live') : String(r[c] ?? '')
+    )
+  );
+}
+
+export function eventRowId(row: EventRow): string {
+  const r = row as unknown as Record<string, unknown>;
+  return identityHash(
+    EVENT_IDENTITY_COLUMNS.map(c => {
+      if (c === 'provenance') return String(row.provenance ?? 'live');
+      if (c === 'status_code') return String(row.status_code ?? 0);
+      return String(r[c] ?? '');
+    })
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Insert Functions
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -263,14 +405,14 @@ export interface HourlyActivity {
  * Insert raw metrics (from OTel)
  */
 export async function insertMetrics(metrics: MetricRow[]): Promise<void> {
-  await insert('metrics_raw', metrics);
+  await insert('metrics_raw', metrics.map(m => ({ ...m, row_id: m.row_id || metricRowId(m) })));
 }
 
 /**
  * Insert raw events (from OTel)
  */
 export async function insertEvents(events: EventRow[]): Promise<void> {
-  await insert('events_raw', events);
+  await insert('events_raw', events.map(e => ({ ...e, row_id: e.row_id || eventRowId(e) })));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

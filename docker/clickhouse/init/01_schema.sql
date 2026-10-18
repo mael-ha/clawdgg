@@ -6,6 +6,15 @@
 -- - Raw tables use ReplacingMergeTree for deduplication (handles OTEL retries)
 -- - All aggregation happens at query time using FINAL clause
 -- - No materialized views - simpler, more reliable, guaranteed accurate
+--
+-- DEDUPLICATION: every sorting key ends in `row_id`, a SHA-256 of all of the
+-- row's IDENTIFYING fields (not its value) computed at insert time by
+-- metricRowId()/eventRowId() in src/db/clickhouse.ts. An OTLP retry of the same
+-- datapoint hashes identically and still collapses; two genuinely different
+-- datapoints that share a timestamp (main vs subagent token usage, two models
+-- in the same export interval) now differ and both survive. Changing the field
+-- list means re-hashing every existing row — see
+-- docker/clickhouse/migrations/2026-10-18_dedup_identity_v2.sql.
 -- ═══════════════════════════════════════════════════════════════════════════
 
 CREATE DATABASE IF NOT EXISTS clawd;
@@ -59,11 +68,14 @@ CREATE TABLE IF NOT EXISTS metrics_raw (
     -- 'exact' | 'normalized' | 'family' | 'fallback' (see src/lib/pricing.ts).
     -- Empty means no price table was consulted — live OTLP rows carry Claude
     -- Code's own measured cost, and token metrics carry no cost at all.
-    pricing_source String DEFAULT ''
+    pricing_source String DEFAULT '',
+    -- Per-row identity hash — see DEDUPLICATION above. Never empty on a row
+    -- written through insertMetrics().
+    row_id String DEFAULT ''
 ) ENGINE = ReplacingMergeTree()
--- CRITICAL: line_type must be in ORDER BY to prevent deduplication of added/removed rows
--- Note: session_id removed from ORDER BY for better query performance (not needed for dedup)
-ORDER BY (user_id, metric_name, token_type, line_type, timestamp)
+-- CRITICAL: row_id is what actually keeps distinct datapoints apart. token_type
+-- and line_type stay in the key for scan locality; they are redundant for dedup.
+ORDER BY (user_id, metric_name, token_type, line_type, timestamp, row_id)
 PARTITION BY toYYYYMM(timestamp)
 TTL toDateTime(timestamp) + INTERVAL 365 DAY
 SETTINGS index_granularity = 8192;
@@ -122,9 +134,13 @@ CREATE TABLE IF NOT EXISTS events_raw (
     -- was ESTIMATED: 'exact' | 'normalized' | 'family' | 'fallback'
     -- (see src/lib/pricing.ts). Empty means no price table was consulted —
     -- live OTLP rows carry Claude Code's own measured cost_usd.
-    pricing_source String DEFAULT ''
+    pricing_source String DEFAULT '',
+    -- Per-row identity hash — see DEDUPLICATION above. Never empty on a row
+    -- written through insertEvents().
+    row_id String DEFAULT ''
 ) ENGINE = ReplacingMergeTree()
-ORDER BY (user_id, session_id, event_name, timestamp, tool_name)
+-- row_id is what keeps two tool_results in the same millisecond apart.
+ORDER BY (user_id, session_id, event_name, timestamp, tool_name, row_id)
 PARTITION BY toYYYYMM(timestamp)
 TTL toDateTime(timestamp) + INTERVAL 365 DAY
 SETTINGS index_granularity = 8192;
