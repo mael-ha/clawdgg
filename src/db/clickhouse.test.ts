@@ -4,12 +4,15 @@ import { join } from 'node:path';
 import {
   EVENT_IDENTITY_COLUMNS,
   METRIC_IDENTITY_COLUMNS,
+  MODEL_ID_SQL,
+  PROMPT_EVENT_SQL,
   eventRowId,
   identitySqlExpr,
   metricRowId,
   type EventRow,
   type MetricRow,
 } from './clickhouse';
+import { stripModelDecorations } from '../lib/pricing';
 
 const REPO_ROOT = join(import.meta.dir, '..', '..');
 
@@ -195,6 +198,57 @@ describe('identitySqlExpr', () => {
 
   it('separates fields with the same unit separator the TS hash uses', () => {
     expect(identitySqlExpr(['a', 'b'])).toContain('char(31)');
+  });
+});
+
+describe('PROMPT_EVENT_SQL', () => {
+  const source = readFileSync(join(import.meta.dir, 'clickhouse.ts'), 'utf8');
+
+  it('excludes builtin slash commands and nothing else', () => {
+    expect(PROMPT_EVENT_SQL).toBe(
+      "event_name = 'claude_code.user_prompt' AND command_source != 'builtin'"
+    );
+  });
+
+  // A surface that counts prompts its own way is a surface that disagrees with
+  // the others, which is the one thing the prompt number must never do.
+  it('is the only prompt predicate in the file', () => {
+    const bareChecks = source
+      .split('\n')
+      .filter(line => line.includes("'claude_code.user_prompt'") && !line.trimStart().startsWith('*'))
+      // the declaration itself is the one legitimate mention
+      .filter(line => !line.includes('export const PROMPT_EVENT_SQL'));
+    expect(bareChecks).toEqual([
+      "  `event_name = 'claude_code.user_prompt' AND command_source != 'builtin'`;",
+    ]);
+  });
+
+  it('is used by every prompt query', () => {
+    // 14 call sites at the time of writing; the guard is that none regressed
+    // to a bare event_name check, which the test above enforces.
+    expect(source.match(/\$\{PROMPT_EVENT_SQL\}/g)?.length).toBeGreaterThanOrEqual(14);
+  });
+});
+
+describe('MODEL_ID_SQL', () => {
+  it('strips the same decorations as the TS normalizer', () => {
+    // The TS and SQL normalizers must agree, or a model is priced under one id
+    // and displayed under another.
+    expect(stripModelDecorations('claude-sonnet-4-5-20250929[1m]')).toBe(
+      'claude-sonnet-4-5-20250929'
+    );
+    expect(stripModelDecorations('us.anthropic.claude-sonnet-5-v1:0')).toBe('claude-sonnet-5');
+    expect(stripModelDecorations('CLAUDE-OPUS-5-5')).toBe('claude-opus-5-5');
+  });
+
+  it('emits regex literals ClickHouse will unescape to the right pattern', () => {
+    // One `\` in the pattern becomes `\\` in the SQL literal, which ClickHouse
+    // unescapes back to `\` for RE2.
+    expect(MODEL_ID_SQL).toContain(String.raw`'^(?:us|eu|apac|global)\\.'`);
+    expect(MODEL_ID_SQL).toContain(String.raw`'\\[[^\\]]*\\]$'`);
+    expect(MODEL_ID_SQL).toContain(String.raw`'-v\\d+:\\d+$'`);
+    expect(MODEL_ID_SQL.startsWith('replaceRegexpOne(')).toBe(true);
+    expect(MODEL_ID_SQL).toContain('lower(model)');
   });
 });
 

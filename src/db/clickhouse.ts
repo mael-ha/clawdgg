@@ -416,6 +416,59 @@ export async function insertEvents(events: EventRow[]): Promise<void> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Query Helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * What counts as a "prompt". USE THIS, never a bare event_name check — the
+ * number it produces is the headline metric on every surface, so it has to
+ * mean the same thing everywhere.
+ *
+ * THE RULE: a user_prompt event, excluding builtin slash commands.
+ *
+ * Since Claude Code 2.1.117 a slash command also emits claude_code.user_prompt,
+ * tagged with `command_name` / `command_source`. `command_source = 'builtin'`
+ * is a UI action — /clear, /compact, /model, /resume — not a request to Claude,
+ * and counting those inflates the number with keystrokes that never reached a
+ * model. Custom, plugin and `mcp` commands ARE requests and still count.
+ *
+ * Rows with `command_source = ''` count: free-typed prompts (no command at
+ * all), anything ingested before 2.1.117, and JSONL-reconstructed rows — the
+ * backfill drops prompts starting with "/" at the source, so a builtin command
+ * never reaches ClickHouse as a backfill row in the first place. Any importer
+ * must mirror that: either skip builtin commands or set command_source so this
+ * predicate can.
+ */
+export const PROMPT_EVENT_SQL =
+  `event_name = 'claude_code.user_prompt' AND command_source != 'builtin'`;
+
+/**
+ * Model id reduced to its bare form for GROUPING, mirroring
+ * stripModelDecorations() in src/lib/pricing.ts: a Bedrock region/vendor
+ * prefix, a `-v1:0` revision, and a bracketed context variant all come off, so
+ * `claude-opus-5-5` and `claude-opus-5-5[1m]` are one row in the model mix
+ * instead of two labels for the same model. The date snapshot stays — it is
+ * what the user recognises and a real price-table key.
+ */
+const MODEL_DECORATION_PATTERNS = [
+  String.raw`^(?:us|eu|apac|global)\.`,
+  String.raw`^anthropic\.`,
+  String.raw`\[[^\]]*\]$`,
+  String.raw`-v\d+:\d+$`,
+];
+
+// ClickHouse string literals process backslash escapes, so every `\` in the
+// pattern has to survive one extra round of unescaping on the way in.
+function chRegexLiteral(pattern: string): string {
+  return `'${pattern.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+}
+
+export const MODEL_ID_SQL = MODEL_DECORATION_PATTERNS.reduce(
+  (expr, pattern) => `replaceRegexpOne(${expr}, ${chRegexLiteral(pattern)}, '')`,
+  'lower(model)'
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Query Functions (all use FINAL for deduplication)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -434,8 +487,8 @@ export async function getUserTotals(userId?: string): Promise<UserTotals[]> {
       event_stats AS (
         SELECT
           user_id,
-          countIf(event_name = 'claude_code.user_prompt') as total_prompts,
-          sumIf(prompt_length, event_name = 'claude_code.user_prompt') as total_prompt_chars
+          countIf(${PROMPT_EVENT_SQL}) as total_prompts,
+          sumIf(prompt_length, ${PROMPT_EVENT_SQL}) as total_prompt_chars
         FROM events_raw FINAL
         ${whereClause}
         GROUP BY user_id
@@ -486,7 +539,7 @@ export async function getUserDailyMetrics(userId: string, days: number = 365): P
       daily_events AS (
         SELECT
           toDate(timestamp) as date,
-          countIf(event_name = 'claude_code.user_prompt') as prompts,
+          countIf(${PROMPT_EVENT_SQL}) as prompts,
           uniqExact(session_id) as sessions
         FROM events_raw FINAL
         WHERE user_id = {userId:String}
@@ -536,13 +589,17 @@ export async function getUserDailyMetrics(userId: string, days: number = 365): P
 
 /**
  * Get model usage breakdown for a user (Claude Diet)
+ *
+ * Grouped on the decoration-stripped id (MODEL_ID_SQL), so the 1M-context
+ * variant `…[1m]` and the Bedrock/Vertex spellings do not show up as extra
+ * models alongside the id they are variants of.
  */
 export async function getUserModelUsage(userId: string, days?: number): Promise<ModelUsage[]> {
   const dateFilter = days ? `AND toDate(timestamp) >= today() - ${days}` : '';
 
   const sql = `
     SELECT
-      model,
+      ${MODEL_ID_SQL} as model,
       toUInt64(sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'input')) as input_tokens,
       toUInt64(sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'output')) as output_tokens,
       toFloat64(sumIf(value, metric_name = 'claude_code.cost.usage')) as cost_usd
@@ -604,8 +661,8 @@ export async function getLeaderboard(
       event_stats AS (
         SELECT
           user_id,
-          countIf(event_name = 'claude_code.user_prompt') as total_prompts,
-          sumIf(prompt_length, event_name = 'claude_code.user_prompt') as total_prompt_chars
+          countIf(${PROMPT_EVENT_SQL}) as total_prompts,
+          sumIf(prompt_length, ${PROMPT_EVENT_SQL}) as total_prompt_chars
         FROM events_raw FINAL
         WHERE ${dateFilter}
         GROUP BY user_id
@@ -688,7 +745,7 @@ export async function getUserRank(
       event_stats AS (
         SELECT
           user_id,
-          countIf(event_name = 'claude_code.user_prompt') as total_prompts
+          countIf(${PROMPT_EVENT_SQL}) as total_prompts
         FROM events_raw FINAL
         WHERE ${dateFilter}
         GROUP BY user_id
@@ -754,7 +811,7 @@ export async function getUserTodayMetrics(userId: string): Promise<TodayMetrics 
     WITH
       today_events AS (
         SELECT
-          countIf(event_name = 'claude_code.user_prompt') as prompts,
+          countIf(${PROMPT_EVENT_SQL}) as prompts,
           MAX(timestamp) as lastActivity
         FROM events_raw FINAL
         WHERE user_id = {userId:String}
@@ -918,7 +975,7 @@ export async function getActivityHeatmap(userId: string, days: number = 90): Pro
       toUInt64(COUNT(*)) as promptCount
     FROM events_raw FINAL
     WHERE user_id = {userId:String}
-      AND event_name = 'claude_code.user_prompt'
+      AND ${PROMPT_EVENT_SQL}
       AND timestamp >= now() - INTERVAL {days:UInt32} DAY
     GROUP BY hour, dayOfWeek
     ORDER BY dayOfWeek, hour
@@ -944,7 +1001,7 @@ export async function getUserVelocityTrend(userId: string, days: number = 30): P
       daily_events AS (
         SELECT
           toDate(timestamp) as date,
-          countIf(event_name = 'claude_code.user_prompt') as prompts
+          countIf(${PROMPT_EVENT_SQL}) as prompts
         FROM events_raw FINAL
         WHERE user_id = {userId:String}
           AND toDate(timestamp) >= today() - {days:UInt32}
@@ -994,7 +1051,7 @@ export async function getUserSessionStats(userId: string, days: number = 30): Pr
         dateDiff('second', MIN(timestamp), MAX(timestamp)) / 60 as duration_minutes
       FROM events_raw FINAL
       WHERE user_id = {userId:String}
-        AND event_name = 'claude_code.user_prompt'
+        AND ${PROMPT_EVENT_SQL}
         AND timestamp >= now() - INTERVAL {days:UInt32} DAY
         AND session_id != ''
       GROUP BY session_id
@@ -1314,7 +1371,7 @@ export async function getChartData(
       sql = `
         SELECT
           ${groupByClause},
-          toUInt64(countIf(event_name = 'claude_code.user_prompt')) as totalValue
+          toUInt64(countIf(${PROMPT_EVENT_SQL})) as totalValue
         FROM events_raw FINAL
         WHERE user_id = {userId:String} ${dateFilter}
         GROUP BY ${orderByClause}
@@ -1808,7 +1865,7 @@ export async function getUserAgenticStats(userId: string, days?: number): Promis
       totals AS (
         SELECT
           toUInt64(countIf(event_name = 'claude_code.api_request')) as totalApiCalls,
-          toUInt64(countIf(event_name = 'claude_code.user_prompt')) as totalPrompts
+          toUInt64(countIf(${PROMPT_EVENT_SQL})) as totalPrompts
         FROM events_raw FINAL
         WHERE user_id = {userId:String}
           ${dateFilter}
@@ -1817,7 +1874,7 @@ export async function getUserAgenticStats(userId: string, days?: number): Promis
         SELECT
           session_id,
           countIf(event_name = 'claude_code.api_request') as api_calls,
-          countIf(event_name = 'claude_code.user_prompt') as prompts
+          countIf(${PROMPT_EVENT_SQL}) as prompts
         FROM events_raw FINAL
         WHERE user_id = {userId:String}
           AND session_id != ''
@@ -1860,7 +1917,7 @@ export async function getUserPromptLengthStats(userId: string, days?: number): P
       toUInt64(count(*)) as totalPrompts
     FROM events_raw FINAL
     WHERE user_id = {userId:String}
-      AND event_name = 'claude_code.user_prompt'
+      AND ${PROMPT_EVENT_SQL}
       AND prompt_length > 0
       ${dateFilter}
   `;

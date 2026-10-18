@@ -1,6 +1,7 @@
 import { describe, expect, it, spyOn } from 'bun:test';
 import {
   calculateModelCost,
+  getModelDisplayName,
   getModelPricingDetailed,
   splitCacheCreationTokens,
   type TokenUsage,
@@ -59,6 +60,85 @@ describe('getModelPricingDetailed', () => {
     expect(getModelPricingDetailed('claude-fable-5').pricing.cacheRead).toBe(1.0);
   });
 
+  // Prices read off https://platform.claude.com/docs/en/about-claude/pricing
+  // on 2026-10-18. The .5 releases share a prefix with their predecessor, so
+  // these also guard the ordering of the exact/family lookups.
+  it('prices Opus 5.5 below Opus 5, with its 0.05x cache read', () => {
+    const match = getModelPricingDetailed('claude-opus-5-5');
+    expect(match.matchQuality).toBe('exact');
+    expect(match.pricing).toEqual({
+      input: 4,
+      output: 20,
+      cacheRead: 0.2,
+      cacheWrite5m: 5,
+      cacheWrite1h: 8,
+    });
+    expect(getModelPricingDetailed('claude-opus-5').pricing.input).toBe(5);
+  });
+
+  it('prices Sonnet 5.5 like Sonnet 5 but with a 0.05x cache read', () => {
+    const match = getModelPricingDetailed('claude-sonnet-5-5');
+    expect(match.matchQuality).toBe('exact');
+    expect(match.pricing).toEqual({
+      input: 2,
+      output: 10,
+      cacheRead: 0.1,
+      cacheWrite5m: 2.5,
+      cacheWrite1h: 4,
+    });
+    expect(getModelPricingDetailed('claude-sonnet-5').pricing.cacheRead).toBe(0.2);
+  });
+
+  it('prices Haiku 5.5 at its standard (<=100K prompt) tier', () => {
+    const match = getModelPricingDetailed('claude-haiku-5-5');
+    expect(match.matchQuality).toBe('exact');
+    expect(match.pricing).toEqual({
+      input: 0.1,
+      output: 0.5,
+      cacheRead: 0.01,
+      cacheWrite5m: 0.125,
+      cacheWrite1h: 0.2,
+    });
+  });
+
+  it('points each bare family rule at the current generation', () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(getModelPricingDetailed('some-opus-thing').modelId).toBe('claude-opus-5-5');
+      expect(getModelPricingDetailed('some-sonnet-thing').modelId).toBe('claude-sonnet-5-5');
+      expect(getModelPricingDetailed('some-haiku-thing').modelId).toBe('claude-haiku-5-5');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('strips a [1m] context-variant suffix without losing the date snapshot', () => {
+    // Claude Code reports the 1M-context beta this way. It is the same model at
+    // the same price, so it must match exactly-ish — never warn as a family guess.
+    const match = getModelPricingDetailed('claude-sonnet-4-5-20250929[1m]');
+    expect(match.matchQuality).toBe('normalized');
+    expect(match.modelId).toBe('claude-sonnet-4-5-20250929');
+    expect(match.pricing.input).toBe(3);
+  });
+
+  it('strips [1m] from a current-generation id', () => {
+    const match = getModelPricingDetailed('claude-opus-5-5[1m]');
+    expect(match.matchQuality).toBe('normalized');
+    expect(match.modelId).toBe('claude-opus-5-5');
+    expect(match.pricing.input).toBe(4);
+  });
+
+  it('strips a Bedrock prefix and revision together with a context variant', () => {
+    const match = getModelPricingDetailed('us.anthropic.claude-sonnet-5-5-v1:0');
+    expect(match.matchQuality).toBe('normalized');
+    expect(match.modelId).toBe('claude-sonnet-5-5');
+  });
+
+  it('strips a Vertex @date suffix', () => {
+    const match = getModelPricingDetailed('claude-opus-5-5@20260401');
+    expect(match.matchQuality).toBe('normalized');
+    expect(match.modelId).toBe('claude-opus-5-5');
+  });
   it('logs loudly and reports fallback quality for a bogus model id', () => {
     const warn = spyOn(console, 'warn').mockImplementation(() => {});
     try {
@@ -74,6 +154,25 @@ describe('getModelPricingDetailed', () => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+describe('getModelDisplayName', () => {
+  // Order is load-bearing: 'opus-5' also matches 'opus-5-5'.
+  it.each([
+    ['claude-opus-5-5', 'Opus 5.5'],
+    ['claude-opus-5', 'Opus 5'],
+    ['claude-sonnet-5-5', 'Sonnet 5.5'],
+    ['claude-sonnet-5', 'Sonnet 5'],
+    ['claude-haiku-5-5', 'Haiku 5.5'],
+    ['claude-haiku-4-5', 'Haiku 4.5'],
+    ['claude-fable-5-1', 'Fable 5.1'],
+    // decorated spellings collapse onto the same label
+    ['claude-opus-5-5[1m]', 'Opus 5.5'],
+    ['us.anthropic.claude-sonnet-5-5-v1:0', 'Sonnet 5.5'],
+    ['claude-sonnet-4-5-20250929[1m]', 'Sonnet 4.5'],
+  ] as const)('labels %s as %s', (id, label) => {
+    expect(getModelDisplayName(id)).toBe(label);
   });
 });
 

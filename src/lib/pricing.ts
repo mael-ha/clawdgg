@@ -4,16 +4,19 @@
 // price table anywhere else: two tables drift, and drifted tables silently
 // mis-report cost.
 //
-// Last updated: 2026-09-21
-// Source: https://www.anthropic.com/pricing, https://docs.claude.com/en/docs/about-claude/pricing
+// Last updated: 2026-10-18
+// Source: https://platform.claude.com/docs/en/about-claude/pricing
+// Every number below was read off that page's model-pricing table on the date
+// above. Never add a model whose price you have not read there — the family
+// rule guesses and warns, which is honest; an invented number is not.
 
-export const PRICING_VERSION = '2026-09';
-export const PRICING_LAST_UPDATED = '2026-09-21';
+export const PRICING_VERSION = '2026-10';
+export const PRICING_LAST_UPDATED = '2026-10-18';
 
 // Pricing per million tokens (MTok)
 // Cache pricing is normally cache_read = 0.1x base input, 5m cache_write =
 // 1.25x and 1h cache_write = 2x base input. Exceptions are called out inline
-// (Fable 5.1 / Mythos 5.1 read at 0.025x).
+// (Fable 5.1 / Mythos 5.1 read at 0.025x; Opus 5.5 / Sonnet 5.5 at 0.05x).
 //
 // The two cache-write rates are BOTH needed: Claude Code's JSONL reports the
 // split in `usage.cache_creation.{ephemeral_1h,ephemeral_5m}_input_tokens`,
@@ -55,6 +58,15 @@ export const MODEL_PRICING: Record<string, ModelPricing> = {
     cacheWrite5m: 12.50,
     cacheWrite1h: 20,
   },
+  // Claude Opus 5.5 — the current Opus, cheaper than Opus 5. cacheRead is a
+  // special 0.05x, not the usual 0.1x.
+  'claude-opus-5-5': {
+    input: 4,
+    output: 20,
+    cacheRead: 0.20,
+    cacheWrite5m: 5,
+    cacheWrite1h: 8,
+  },
   'claude-opus-5': {
     input: 5,
     output: 25,
@@ -83,6 +95,15 @@ export const MODEL_PRICING: Record<string, ModelPricing> = {
     cacheWrite5m: 6.25,
     cacheWrite1h: 10,
   },
+  // Claude Sonnet 5.5 — same per-token price as Sonnet 5 but cacheRead is a
+  // special 0.05x (Sonnet 5 reads at the usual 0.1x).
+  'claude-sonnet-5-5': {
+    input: 2,
+    output: 10,
+    cacheRead: 0.10,
+    cacheWrite5m: 2.50,
+    cacheWrite1h: 4,
+  },
   'claude-sonnet-5': {
     input: 2,
     output: 10,
@@ -96,6 +117,19 @@ export const MODEL_PRICING: Record<string, ModelPricing> = {
     cacheRead: 0.30,
     cacheWrite5m: 3.75,
     cacheWrite1h: 6,
+  },
+  // Claude Haiku 5.5 is priced by PROMPT LENGTH, not by a long-context flag:
+  // a request whose prompt exceeds 100K tokens pays 5x on every category
+  // ($0.50/$2.50 out, $0.625/$1 writes, $0.05 read). Neither an OTEL token
+  // metric nor a JSONL usage block carries the prompt length that decides it,
+  // so we price the standard (<=100K) tier and under-report cost on any
+  // long-prompt Haiku 5.5 traffic. Same compromise as Sonnet 4.5 below.
+  'claude-haiku-5-5': {
+    input: 0.10,
+    output: 0.50,
+    cacheRead: 0.01,
+    cacheWrite5m: 0.125,
+    cacheWrite1h: 0.20,
   },
   'claude-haiku-4-5': {
     input: 1,
@@ -197,13 +231,15 @@ export const MODEL_PRICING: Record<string, ModelPricing> = {
   },
 };
 
-// Last-resort pricing for a model id that matches nothing at all — current
-// Sonnet tier, i.e. the middle of the live lineup. Only reachable via the
-// 'fallback' match quality, which is logged and stored, never silent.
+// Last-resort pricing for a model id that matches nothing at all — the current
+// Sonnet tier (Sonnet 5.5), i.e. the middle of the live lineup. Only reachable
+// via the 'fallback' match quality, which is logged and stored, never silent.
+// Tracks whichever model `['sonnet']` points at: an unmatched id is most often
+// a model newer than this table, and the newest models read cache at 0.05x.
 export const DEFAULT_PRICING: ModelPricing = {
   input: 2,
   output: 10,
-  cacheRead: 0.20,
+  cacheRead: 0.10,
   cacheWrite5m: 2.50,
   cacheWrite1h: 4,
 };
@@ -289,6 +325,7 @@ const FAMILY_RULES: ReadonlyArray<readonly [readonly string[], string]> = [
   [['fable'], 'claude-fable-5-1'],
   [['mythos'], 'claude-mythos-5-1'],
 
+  [['opus-5-5', 'opus-5.5'], 'claude-opus-5-5'],
   [['opus-5', 'opus5'], 'claude-opus-5'],
   [['opus-4-8', 'opus-4.8'], 'claude-opus-4-8'],
   [['opus-4-7', 'opus-4.7'], 'claude-opus-4-7'],
@@ -297,8 +334,9 @@ const FAMILY_RULES: ReadonlyArray<readonly [readonly string[], string]> = [
   [['opus-4-1', 'opus-4.1'], 'claude-opus-4-1-20250414'],
   [['opus-4', 'opus4'], 'claude-opus-4-8'],
   [['opus-3', '3-opus'], 'claude-3-opus-20240229'],
-  [['opus'], 'claude-opus-5'],
+  [['opus'], 'claude-opus-5-5'],
 
+  [['sonnet-5-5', 'sonnet-5.5'], 'claude-sonnet-5-5'],
   [['sonnet-5', 'sonnet5'], 'claude-sonnet-5'],
   [['sonnet-4-6', 'sonnet-4.6'], 'claude-sonnet-4-6'],
   [['sonnet-4-5', 'sonnet-4.5'], 'claude-sonnet-4-5-20250929'],
@@ -306,12 +344,13 @@ const FAMILY_RULES: ReadonlyArray<readonly [readonly string[], string]> = [
   [['sonnet-3-7', 'sonnet-3.7', '3-7-sonnet'], 'claude-3-7-sonnet-20250219'],
   [['sonnet-3-5', 'sonnet-3.5', '3-5-sonnet'], 'claude-3-5-sonnet-20241022'],
   [['sonnet-3', '3-sonnet'], 'claude-3-sonnet-20240229'],
-  [['sonnet'], 'claude-sonnet-5'],
+  [['sonnet'], 'claude-sonnet-5-5'],
 
+  [['haiku-5-5', 'haiku-5.5'], 'claude-haiku-5-5'],
   [['haiku-4-5', 'haiku-4.5'], 'claude-haiku-4-5'],
   [['haiku-3-5', 'haiku-3.5', '3-5-haiku'], 'claude-3-5-haiku-20241022'],
   [['haiku-3', '3-haiku'], 'claude-3-haiku-20240307'],
-  [['haiku'], 'claude-haiku-4-5'],
+  [['haiku'], 'claude-haiku-5-5'],
 ];
 
 // One warning per distinct model id per process — the backfill walks hundreds
@@ -325,19 +364,33 @@ function warnOncePerModel(modelId: string, message: string): void {
 }
 
 /**
- * Reduce a model id to its first-party bare form: lowercase, without a cloud
- * provider's region/vendor prefix, its `-v1:0` revision suffix, or a
- * `-YYYYMMDD` / `@YYYYMMDD` snapshot suffix. So both
- * `us.anthropic.claude-sonnet-5-v1:0` (Bedrock) and `claude-sonnet-5@20260401`
- * (Vertex) normalize onto the `claude-sonnet-5` table key.
+ * Strip everything that decorates a model id without changing WHICH model it
+ * is: case, a cloud provider's region/vendor prefix, a `-v1:0` revision
+ * suffix, and a bracketed context variant. Claude Code reports the 1M-context
+ * beta as `claude-sonnet-4-5-20250929[1m]`, which is the same model at the
+ * same per-token price — left alone it misses the table, lands on a family
+ * rule, and warns about a model we have priced exactly.
+ *
+ * The date snapshot is deliberately KEPT here: `claude-sonnet-4-5-20250929` is
+ * itself a price-table key, and dropping the date first would lose it.
  */
-function normalizeModelId(modelId: string): string {
+export function stripModelDecorations(modelId: string): string {
   return modelId
     .toLowerCase()
     .replace(/^(?:us|eu|apac|global)\./, '')
     .replace(/^anthropic\./, '')
-    .replace(/-v\d+:\d+$/, '')
-    .replace(/[-@]\d{8}$/, '');
+    .replace(/\[[^\]]*\]$/, '')
+    .replace(/-v\d+:\d+$/, '');
+}
+
+/**
+ * Reduce a model id to its first-party bare form: decorations stripped, plus
+ * any `-YYYYMMDD` / `@YYYYMMDD` snapshot suffix. So both
+ * `us.anthropic.claude-sonnet-5-v1:0` (Bedrock) and `claude-sonnet-5@20260401`
+ * (Vertex) normalize onto the `claude-sonnet-5` table key.
+ */
+function normalizeModelId(modelId: string): string {
+  return stripModelDecorations(modelId).replace(/[-@]\d{8}$/, '');
 }
 
 /**
@@ -349,7 +402,12 @@ export function getModelPricingDetailed(modelId: string): ModelPricingMatch {
   const exact = MODEL_PRICING[modelId];
   if (exact) return { pricing: exact, matchQuality: 'exact', modelId };
 
-  const lower = modelId.toLowerCase();
+  // Decorations only (keeps the date snapshot), then the fully bare form.
+  const strippedId = stripModelDecorations(modelId);
+  const stripped = MODEL_PRICING[strippedId];
+  if (stripped) {
+    return { pricing: stripped, matchQuality: 'normalized', modelId: strippedId };
+  }
 
   const normalizedId = normalizeModelId(modelId);
   const normalized = MODEL_PRICING[normalizedId];
@@ -358,7 +416,7 @@ export function getModelPricingDetailed(modelId: string): ModelPricingMatch {
   }
 
   for (const [needles, key] of FAMILY_RULES) {
-    if (needles.some(n => lower.includes(n))) {
+    if (needles.some(n => strippedId.includes(n))) {
       const pricing = MODEL_PRICING[key];
       if (!pricing) continue;
       // A family match is a guess — the id is not in the table. Surface it so a
@@ -424,13 +482,17 @@ export function formatCost(cost: number): string {
 }
 
 // Get model display name (shorter, friendlier)
+// Order is load-bearing: 'opus-5-5' must be tested before 'opus-5', which also
+// matches it. Decorations are stripped first so `claude-opus-5-5[1m]` and the
+// Bedrock/Vertex spellings land on the same label as the bare id.
 export function getModelDisplayName(modelId: string): string {
-  const lowerModelId = modelId.toLowerCase();
+  const lowerModelId = stripModelDecorations(modelId);
 
   if (lowerModelId.includes('fable-5-1') || lowerModelId.includes('fable-5.1')) return 'Fable 5.1';
   if (lowerModelId.includes('mythos-5-1') || lowerModelId.includes('mythos-5.1')) return 'Mythos 5.1';
   if (lowerModelId.includes('fable')) return 'Fable 5';
   if (lowerModelId.includes('mythos')) return 'Mythos';
+  if (lowerModelId.includes('opus-5-5') || lowerModelId.includes('opus-5.5')) return 'Opus 5.5';
   if (lowerModelId.includes('opus-5')) return 'Opus 5';
   if (lowerModelId.includes('opus-4-8') || lowerModelId.includes('opus-4.8')) return 'Opus 4.8';
   if (lowerModelId.includes('opus-4-7') || lowerModelId.includes('opus-4.7')) return 'Opus 4.7';
@@ -439,6 +501,7 @@ export function getModelDisplayName(modelId: string): string {
   if (lowerModelId.includes('opus-4-1') || lowerModelId.includes('opus-4.1')) return 'Opus 4.1';
   if (lowerModelId.includes('opus-4')) return 'Opus 4';
   if (lowerModelId.includes('opus')) return 'Opus 3';
+  if (lowerModelId.includes('sonnet-5-5') || lowerModelId.includes('sonnet-5.5')) return 'Sonnet 5.5';
   if (lowerModelId.includes('sonnet-5')) return 'Sonnet 5';
   if (lowerModelId.includes('sonnet-4-6') || lowerModelId.includes('sonnet-4.6')) return 'Sonnet 4.6';
   if (lowerModelId.includes('sonnet-4-5') || lowerModelId.includes('sonnet-4.5')) return 'Sonnet 4.5';
@@ -446,6 +509,7 @@ export function getModelDisplayName(modelId: string): string {
   if (lowerModelId.includes('3-7-sonnet') || lowerModelId.includes('sonnet-3-7')) return 'Sonnet 3.7';
   if (lowerModelId.includes('3-5-sonnet') || lowerModelId.includes('sonnet-3.5')) return 'Sonnet 3.5';
   if (lowerModelId.includes('sonnet')) return 'Sonnet 3';
+  if (lowerModelId.includes('haiku-5-5') || lowerModelId.includes('haiku-5.5')) return 'Haiku 5.5';
   if (lowerModelId.includes('haiku-4-5') || lowerModelId.includes('haiku-4.5')) return 'Haiku 4.5';
   if (lowerModelId.includes('3-5-haiku') || lowerModelId.includes('haiku-3.5')) return 'Haiku 3.5';
   if (lowerModelId.includes('haiku')) return 'Haiku 3';
