@@ -29,13 +29,29 @@ CREATE TABLE IF NOT EXISTS metrics_raw (
     token_type String DEFAULT '',
     line_type String DEFAULT '',
     -- code_edit_tool.decision attributes
-    tool String DEFAULT '',       -- Edit, Write, NotebookEdit
+    tool String DEFAULT '',       -- Edit, Write, NotebookEdit (OTEL attr `tool_name`)
     decision String DEFAULT '',   -- accept, reject
     language String DEFAULT '',   -- TypeScript, Python, etc.
-    -- Resource attributes
+    source String DEFAULT '',     -- config, user_permanent, … (code_edit_tool.decision)
+    -- Attribution attributes on cost.usage / token.usage.
+    -- query_source is main vs subagent vs auxiliary: without it a subagent's
+    -- tokens are indistinguishable from main-thread tokens.
+    query_source String DEFAULT '',     -- main | subagent | auxiliary
+    speed String DEFAULT '',            -- fast | normal
+    effort String DEFAULT '',           -- low | medium | high | xhigh | max
+    agent_name String DEFAULT '',       -- OTEL attr `agent.name`
+    skill_name String DEFAULT '',       -- OTEL attr `skill.name`
+    plugin_name String DEFAULT '',      -- OTEL attr `plugin.name`
+    mcp_server_name String DEFAULT '',  -- OTEL attr `mcp_server.name`
+    mcp_tool_name String DEFAULT '',    -- OTEL attr `mcp_tool.name`
+    -- session.count attribute
+    start_type String DEFAULT '',       -- fresh | resume | continue | agents_view
+    -- Standard attributes. Claude Code sends these per-datapoint; older
+    -- exporters put them on the resource block. Both are read (src/routes/otel.ts).
     terminal_type String DEFAULT '',
     app_version String DEFAULT '',
     account_uuid String DEFAULT '',
+    organization_id String DEFAULT '',
     -- Provenance: 'live' for OTLP-received, 'backfill' for JSONL-reconstructed.
     -- Distinct from `source` (which captures the OTEL source attribute meaning).
     provenance String DEFAULT 'live',
@@ -73,10 +89,32 @@ CREATE TABLE IF NOT EXISTS events_raw (
     error_message String DEFAULT '',
     status_code UInt16 DEFAULT 0,
     duration_ms UInt32 DEFAULT 0,
-    -- tool_result / tool_decision attributes
+    -- tool_result / tool_decision attributes. tool_result renamed these to
+    -- `decision_type` / `decision_source`; tool_decision still sends the old
+    -- names. src/routes/otel.ts reads new-then-old into these columns.
     decision String DEFAULT '',        -- accept, reject
     source String DEFAULT '',          -- config, user_permanent, user_temporary, user_abort, user_reject
     tool_parameters String DEFAULT '', -- JSON string with tool-specific params (bash_command, etc.)
+    tool_use_id String DEFAULT '',
+    -- Correlation + attribution. prompt_id (OTEL `prompt.id`) joins a prompt to
+    -- the api_request calls it caused.
+    prompt_id String DEFAULT '',
+    request_id String DEFAULT '',
+    query_source String DEFAULT '',    -- main | subagent | auxiliary
+    speed String DEFAULT '',
+    effort String DEFAULT '',
+    agent_name String DEFAULT '',      -- OTEL attr `agent.name`
+    skill_name String DEFAULT '',      -- OTEL attr `skill.name`
+    -- user_prompt slash-command attribution (Claude Code 2.1.117+).
+    -- command_source = 'builtin' (/clear, /compact, /model, …) is a UI action,
+    -- not a prompt — excluded from prompt counts (see PROMPT_EVENT_SQL).
+    command_name String DEFAULT '',
+    command_source String DEFAULT '',  -- builtin | custom | mcp
+    -- Standard attributes (per-record, resource fallback)
+    terminal_type String DEFAULT '',
+    app_version String DEFAULT '',
+    account_uuid String DEFAULT '',
+    organization_id String DEFAULT '',
     -- Provenance: 'live' for OTLP-received, 'backfill' for JSONL-reconstructed.
     -- Distinct from `source` above (which captures the OTEL source attribute).
     provenance String DEFAULT 'live',

@@ -9,6 +9,7 @@
  */
 
 import { Hono } from 'hono';
+import { gunzipSync } from 'node:zlib';
 import { db } from '../db';
 import { users } from '../db/schema';
 import { eq } from 'drizzle-orm';
@@ -21,6 +22,8 @@ const otel = new Hono();
 // Request Size Limits
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Applied to BOTH the wire body and the gzip-decompressed payload, so
+// Content-Encoding buys bandwidth, never a bigger payload (gzip-bomb guard).
 const MAX_METRICS_BODY_SIZE = 1024 * 1024; // 1MB
 const MAX_LOGS_BODY_SIZE = 5 * 1024 * 1024; // 5MB
 
@@ -45,6 +48,78 @@ function safeNumber(val: any, defaultVal: number = 0, max: number = 1e15): numbe
 function safeString(val: any, maxLen: number = 1000): string {
   const str = String(val ?? '');
   return str.slice(0, maxLen);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OTLP Body Decoding
+// ═══════════════════════════════════════════════════════════════════════════
+
+export type OtlpBodyResult<T> =
+  | { ok: true; body: T }
+  | { ok: false; status: 400 | 413 | 415; error: string };
+
+/**
+ * Decode an OTLP/HTTP JSON request body.
+ *
+ * The OTel SDK exporter sets `Content-Encoding: gzip` whenever
+ * OTEL_EXPORTER_OTLP_COMPRESSION=gzip (and some collectors do it
+ * unconditionally). Before this, a gzipped batch hit JSON.parse as binary,
+ * threw, and was answered with a 500 — which the SDK treats as retryable, so
+ * the same batch came back forever and never landed. Anything we cannot parse
+ * is now a 4xx: permanent for the exporter, visible in the logs, dropped once.
+ *
+ * `rootKey` is the only top-level field OTLP defines for this signal; a payload
+ * that carries it as something other than an array is malformed, not empty.
+ */
+export function decodeOtlpBody<T>(
+  raw: Uint8Array,
+  contentEncoding: string | undefined,
+  contentType: string | undefined,
+  maxBytes: number,
+  rootKey: 'resourceMetrics' | 'resourceLogs'
+): OtlpBodyResult<T> {
+  const type = (contentType ?? '').toLowerCase();
+  if (type && !type.includes('json')) {
+    return { ok: false, status: 415, error: `Unsupported Content-Type "${contentType}" — this receiver speaks OTLP http/json only` };
+  }
+
+  if (raw.byteLength > maxBytes) {
+    return { ok: false, status: 413, error: 'Request body too large' };
+  }
+
+  const encoding = (contentEncoding ?? '').toLowerCase().trim();
+  let bytes = raw;
+  if (encoding && encoding !== 'identity') {
+    if (encoding !== 'gzip') {
+      return { ok: false, status: 415, error: `Unsupported Content-Encoding "${contentEncoding}" — gzip or identity only` };
+    }
+    try {
+      bytes = new Uint8Array(gunzipSync(raw));
+    } catch {
+      return { ok: false, status: 400, error: 'Malformed gzip body' };
+    }
+    if (bytes.byteLength > maxBytes) {
+      return { ok: false, status: 413, error: 'Decompressed body too large' };
+    }
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return { ok: false, status: 400, error: 'Malformed JSON body' };
+  }
+
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, status: 400, error: 'OTLP body must be a JSON object' };
+  }
+
+  const root = (parsed as Record<string, unknown>)[rootKey];
+  if (root !== undefined && !Array.isArray(root)) {
+    return { ok: false, status: 400, error: `OTLP body field "${rootKey}" must be an array` };
+  }
+
+  return { ok: true, body: parsed as T };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -168,6 +243,32 @@ function getAttr(attrs: OtlpAttribute[], key: string): string | number | boolean
   return v.stringValue ?? v.intValue ?? v.doubleValue ?? v.boolValue ?? null;
 }
 
+/**
+ * First non-empty value for `keys`, looking at the datapoint / log-record
+ * attributes before the resource attributes.
+ *
+ * Claude Code documents session.id, app.version, terminal.type,
+ * user.account_uuid and organization.id as STANDARD attributes carried by
+ * every metric datapoint and every log record. The resource block carries
+ * service.name, service.version, os.* and host.*. We used to read the five
+ * standard ones from the resource block only, so they landed empty on any
+ * exporter that puts them where the docs say they are — datapoint-first with a
+ * resource fallback covers both shapes.
+ */
+function pickAttr(
+  own: OtlpAttribute[],
+  resource: OtlpAttribute[],
+  ...keys: string[]
+): string | number | boolean | null {
+  for (const attrs of [own, resource]) {
+    for (const key of keys) {
+      const v = getAttr(attrs, key);
+      if (v !== null && v !== '') return v;
+    }
+  }
+  return null;
+}
+
 function parseTimestamp(timeUnixNano: string | number): string {
   const nanos = typeof timeUnixNano === 'string' ? BigInt(timeUnixNano) : BigInt(timeUnixNano);
   const millis = Number(nanos / BigInt(1_000_000));
@@ -181,7 +282,7 @@ function parseTimestamp(timeUnixNano: string | number): string {
 // Parse OTLP Metrics
 // ═══════════════════════════════════════════════════════════════════════════
 
-interface OtlpMetricsRequest {
+export interface OtlpMetricsRequest {
   resourceMetrics?: {
     resource?: {
       attributes?: OtlpAttribute[];
@@ -211,15 +312,11 @@ interface OtlpMetricsRequest {
   }[];
 }
 
-function parseOtlpMetrics(body: OtlpMetricsRequest, userId: string): MetricRow[] {
+export function parseOtlpMetrics(body: OtlpMetricsRequest, userId: string): MetricRow[] {
   const metrics: MetricRow[] = [];
 
   for (const resourceMetrics of body.resourceMetrics || []) {
     const resourceAttrs = resourceMetrics.resource?.attributes || [];
-    const sessionId = safeString(getAttr(resourceAttrs, 'session.id'), 256);
-    const terminalType = safeString(getAttr(resourceAttrs, 'terminal.type'), 100);
-    const appVersion = safeString(getAttr(resourceAttrs, 'app.version'), 100);
-    const accountUuid = safeString(getAttr(resourceAttrs, 'user.account_uuid'), 256);
 
     for (const scopeMetrics of resourceMetrics.scopeMetrics || []) {
       // Only process claude_code metrics
@@ -240,23 +337,41 @@ function parseOtlpMetrics(body: OtlpMetricsRequest, userId: string): MetricRow[]
 
           // Extract code_edit_tool.decision specific attributes
           const isCodeEditDecision = metricName.includes('code_edit_tool.decision');
+          const isSessionCount = metricName.includes('session.count');
 
           metrics.push({
             timestamp: parseTimestamp(dp.timeUnixNano),
             user_id: userId,
-            session_id: sessionId,
+            session_id: safeString(pickAttr(dpAttrs, resourceAttrs, 'session.id'), 256),
             metric_name: metricName,
             value,
             model: safeString(getAttr(dpAttrs, 'model'), 100),
             token_type: metricName.includes('token') ? typeAttr : '',
             line_type: metricName.includes('lines_of_code') ? typeAttr : '',
-            terminal_type: terminalType,
-            app_version: appVersion,
-            account_uuid: accountUuid,
-            // code_edit_tool.decision attributes
-            tool: isCodeEditDecision ? safeString(getAttr(dpAttrs, 'tool'), 50) : '',
+            terminal_type: safeString(pickAttr(dpAttrs, resourceAttrs, 'terminal.type'), 100),
+            // service.version is the resource-level spelling of the Claude Code version.
+            app_version: safeString(pickAttr(dpAttrs, resourceAttrs, 'app.version', 'service.version'), 100),
+            account_uuid: safeString(pickAttr(dpAttrs, resourceAttrs, 'user.account_uuid', 'user.account_id'), 256),
+            organization_id: safeString(pickAttr(dpAttrs, resourceAttrs, 'organization.id'), 256),
+            // code_edit_tool.decision attributes. `tool` was renamed `tool_name`
+            // (we keep the column name); `source` was never read at all.
+            tool: isCodeEditDecision ? safeString(getAttr(dpAttrs, 'tool_name') ?? getAttr(dpAttrs, 'tool'), 50) : '',
             decision: isCodeEditDecision ? safeString(getAttr(dpAttrs, 'decision'), 20) : '',
             language: isCodeEditDecision ? safeString(getAttr(dpAttrs, 'language'), 50) : '',
+            source: isCodeEditDecision ? safeString(getAttr(dpAttrs, 'source'), 50) : '',
+            // Attribution attributes on cost.usage / token.usage. query_source is
+            // main vs subagent vs auxiliary — without it every subagent token is
+            // indistinguishable from a main-thread one.
+            query_source: safeString(getAttr(dpAttrs, 'query_source'), 20),
+            speed: safeString(getAttr(dpAttrs, 'speed'), 20),
+            effort: safeString(getAttr(dpAttrs, 'effort'), 20),
+            agent_name: safeString(getAttr(dpAttrs, 'agent.name'), 200),
+            skill_name: safeString(getAttr(dpAttrs, 'skill.name'), 200),
+            plugin_name: safeString(getAttr(dpAttrs, 'plugin.name'), 200),
+            mcp_server_name: safeString(getAttr(dpAttrs, 'mcp_server.name'), 200),
+            mcp_tool_name: safeString(getAttr(dpAttrs, 'mcp_tool.name'), 200),
+            // session.count: fresh | resume | continue | agents_view
+            start_type: isSessionCount ? safeString(getAttr(dpAttrs, 'start_type'), 20) : '',
           });
         }
       }
@@ -270,7 +385,7 @@ function parseOtlpMetrics(body: OtlpMetricsRequest, userId: string): MetricRow[]
 // Parse OTLP Logs/Events
 // ═══════════════════════════════════════════════════════════════════════════
 
-interface OtlpLogsRequest {
+export interface OtlpLogsRequest {
   resourceLogs?: {
     resource?: {
       attributes?: OtlpAttribute[];
@@ -288,12 +403,11 @@ interface OtlpLogsRequest {
   }[];
 }
 
-function parseOtlpEvents(body: OtlpLogsRequest, userId: string): EventRow[] {
+export function parseOtlpEvents(body: OtlpLogsRequest, userId: string): EventRow[] {
   const events: EventRow[] = [];
 
   for (const resourceLogs of body.resourceLogs || []) {
     const resourceAttrs = resourceLogs.resource?.attributes || [];
-    const sessionId = safeString(getAttr(resourceAttrs, 'session.id'), 256);
 
     for (const scopeLogs of resourceLogs.scopeLogs || []) {
       for (const logRecord of scopeLogs.logRecords || []) {
@@ -308,10 +422,13 @@ function parseOtlpEvents(body: OtlpLogsRequest, userId: string): EventRow[] {
           ? eventName
           : `claude_code.${eventName}`;
 
+        // NOTE: `prompt` / `prompt_text` (user_prompt) and `response` /
+        // `body` (assistant_response, api_*_body) are deliberately never read.
+        // We store prompt LENGTH, never prompt text — do not add them here.
         events.push({
           timestamp: parseTimestamp(logRecord.timeUnixNano),
           user_id: userId,
-          session_id: sessionId,
+          session_id: safeString(pickAttr(attrs, resourceAttrs, 'session.id'), 256),
           event_name: normalizedEventName,
           prompt_length: safeNumber(getAttr(attrs, 'prompt_length'), 0, 1_000_000), // Max 1M chars
           tool_name: safeString(getAttr(attrs, 'tool_name'), 200),
@@ -326,10 +443,30 @@ function parseOtlpEvents(body: OtlpLogsRequest, userId: string): EventRow[] {
           error_message: safeString(getAttr(attrs, 'error'), 2000), // Longer for error messages
           status_code: safeNumber(getAttr(attrs, 'status_code'), 0, 999),
           duration_ms: safeNumber(getAttr(attrs, 'duration_ms'), 0, 3600000), // Max 1 hour
-          // tool_result / tool_decision attributes
-          decision: safeString(getAttr(attrs, 'decision'), 20),      // accept, reject
-          source: safeString(getAttr(attrs, 'source'), 50),          // config, user_permanent, etc.
+          // tool_result / tool_decision attributes. tool_result renamed these to
+          // `decision_type` / `decision_source`; tool_decision still sends the
+          // old `decision` / `source`, so read new-then-old on both.
+          decision: safeString(getAttr(attrs, 'decision_type') ?? getAttr(attrs, 'decision'), 20),   // accept, reject
+          source: safeString(getAttr(attrs, 'decision_source') ?? getAttr(attrs, 'source'), 50),     // config, user_permanent, etc.
           tool_parameters: safeString(getAttr(attrs, 'tool_parameters'), 5000), // JSON string
+          tool_use_id: safeString(getAttr(attrs, 'tool_use_id'), 100),
+          // Correlation + attribution. prompt.id joins a prompt to the api_request
+          // calls it caused; query_source separates main from subagent traffic.
+          prompt_id: safeString(getAttr(attrs, 'prompt.id'), 100),
+          request_id: safeString(getAttr(attrs, 'request_id'), 100),
+          query_source: safeString(getAttr(attrs, 'query_source'), 20),
+          speed: safeString(getAttr(attrs, 'speed'), 20),
+          effort: safeString(getAttr(attrs, 'effort'), 20),
+          agent_name: safeString(getAttr(attrs, 'agent.name'), 200),
+          skill_name: safeString(getAttr(attrs, 'skill.name'), 200),
+          // user_prompt slash-command attribution (Claude Code 2.1.117+).
+          // command_source: builtin | custom | mcp — see PROMPT_EVENT_SQL.
+          command_name: safeString(getAttr(attrs, 'command_name'), 200),
+          command_source: safeString(getAttr(attrs, 'command_source'), 20),
+          terminal_type: safeString(pickAttr(attrs, resourceAttrs, 'terminal.type'), 100),
+          app_version: safeString(pickAttr(attrs, resourceAttrs, 'app.version', 'service.version'), 100),
+          account_uuid: safeString(pickAttr(attrs, resourceAttrs, 'user.account_uuid', 'user.account_id'), 256),
+          organization_id: safeString(pickAttr(attrs, resourceAttrs, 'organization.id'), 256),
         });
       }
     }
@@ -355,9 +492,19 @@ otel.post('/v1/metrics', requireOtelAuth, async (c) => {
     }
 
     const otelUser = c.get('otelUser') as OtelContext;
-    const body = await c.req.json() as OtlpMetricsRequest;
+    const decoded = decodeOtlpBody<OtlpMetricsRequest>(
+      new Uint8Array(await c.req.arrayBuffer()),
+      c.req.header('Content-Encoding'),
+      c.req.header('Content-Type'),
+      MAX_METRICS_BODY_SIZE,
+      'resourceMetrics'
+    );
+    if (!decoded.ok) {
+      console.warn(`[OTel] Rejected metrics from ${otelUser.username}: ${decoded.error}`);
+      return c.json({ error: decoded.error }, decoded.status);
+    }
 
-    const metrics = parseOtlpMetrics(body, otelUser.userId);
+    const metrics = parseOtlpMetrics(decoded.body, otelUser.userId);
 
     if (metrics.length > 0) {
       await insertMetrics(metrics);
@@ -386,9 +533,19 @@ otel.post('/v1/logs', requireOtelAuth, async (c) => {
     }
 
     const otelUser = c.get('otelUser') as OtelContext;
-    const body = await c.req.json() as OtlpLogsRequest;
+    const decoded = decodeOtlpBody<OtlpLogsRequest>(
+      new Uint8Array(await c.req.arrayBuffer()),
+      c.req.header('Content-Encoding'),
+      c.req.header('Content-Type'),
+      MAX_LOGS_BODY_SIZE,
+      'resourceLogs'
+    );
+    if (!decoded.ok) {
+      console.warn(`[OTel] Rejected logs from ${otelUser.username}: ${decoded.error}`);
+      return c.json({ error: decoded.error }, decoded.status);
+    }
 
-    const events = parseOtlpEvents(body, otelUser.userId);
+    const events = parseOtlpEvents(decoded.body, otelUser.userId);
 
     if (events.length > 0) {
       await insertEvents(events);

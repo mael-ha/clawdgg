@@ -129,6 +129,13 @@ export async function healthCheck(): Promise<boolean> {
 // Metric Types
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * Where a raw row came from.
+ *   live     — received over OTLP from a running Claude Code (default)
+ *   backfill — reconstructed from local Claude Code JSONL transcripts
+ */
+export type RowProvenance = 'live' | 'backfill';
+
 export interface MetricRow {
   timestamp: string;
   user_id: string;
@@ -141,12 +148,23 @@ export interface MetricRow {
   terminal_type?: string;
   app_version?: string;
   account_uuid?: string;
+  organization_id?: string;
   // code_edit_tool.decision attributes
-  tool?: string;       // Edit, Write, NotebookEdit
+  tool?: string;       // Edit, Write, NotebookEdit (OTEL attribute `tool_name`)
   decision?: string;   // accept, reject
   language?: string;   // TypeScript, Python, etc.
-  // Provenance: 'live' (OTLP-received, default) or 'backfill' (JSONL-reconstructed).
-  provenance?: 'live' | 'backfill';
+  source?: string;     // config, user_permanent, … (code_edit_tool.decision)
+  // Attribution attributes on cost.usage / token.usage
+  query_source?: string;     // main | subagent | auxiliary
+  speed?: string;            // fast | normal
+  effort?: string;           // low | medium | high | xhigh | max
+  agent_name?: string;
+  skill_name?: string;
+  plugin_name?: string;
+  mcp_server_name?: string;
+  mcp_tool_name?: string;
+  start_type?: string;       // session.count: fresh | resume | continue | agents_view
+  provenance?: RowProvenance;
 }
 
 export interface EventRow {
@@ -168,11 +186,26 @@ export interface EventRow {
   status_code?: number;
   duration_ms?: number;
   // tool_result / tool_decision attributes
-  decision?: string;        // accept, reject
-  source?: string;          // config, user_permanent, user_temporary, user_abort, user_reject
+  decision?: string;        // accept, reject (OTEL `decision_type` on tool_result)
+  source?: string;          // config, user_permanent, … (OTEL `decision_source` on tool_result)
   tool_parameters?: string; // JSON string with tool-specific params
-  // Provenance: 'live' (OTLP-received, default) or 'backfill' (JSONL-reconstructed).
-  provenance?: 'live' | 'backfill';
+  tool_use_id?: string;
+  // Correlation + attribution
+  prompt_id?: string;       // OTEL `prompt.id` — joins a prompt to its api_request calls
+  request_id?: string;
+  query_source?: string;    // main | subagent | auxiliary
+  speed?: string;
+  effort?: string;
+  agent_name?: string;
+  skill_name?: string;
+  // user_prompt slash-command attribution (Claude Code 2.1.117+)
+  command_name?: string;
+  command_source?: string;  // builtin | custom | mcp
+  terminal_type?: string;
+  app_version?: string;
+  account_uuid?: string;
+  organization_id?: string;
+  provenance?: RowProvenance;
 }
 
 export interface DailyMetrics {
