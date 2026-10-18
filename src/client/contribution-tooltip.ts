@@ -1,65 +1,85 @@
 /**
- * Hover tooltip for the 365-day contribution graph.
+ * Hover tooltip for 📅 the year.
  *
- * Numbers and the date go through src/lib/format, the same module the server
- * rendered the page with — the inline version had its own formatNum and its
- * own month table, and read the UTC date key with local getters.
+ * Reads the figures the SERVER chose to publish and nothing else: a day's
+ * value, lines and 🌈 count are each in the DOM only while the section they
+ * belong to is public (see Cell in src/components/profile/Year.tsx), so this
+ * module shows whatever attributes it finds and never asks for a figure that
+ * was deliberately withheld.
+ *
+ * Numbers go through the same formatters the page was rendered with, so a
+ * tooltip can never print a value one way and the card above it another.
  */
 
-import { formatCost, formatDateLong, formatTokens } from '../lib/format';
+import { compact, dayLabel, group, money } from '../components/profile/format';
 
-const container = document.getElementById('contribution-graph-container');
-const tooltip = document.getElementById('contrib-tooltip');
+const grid = document.getElementById('fp-year');
+const tooltip = document.getElementById('fp-year-tooltip');
 
-if (container && tooltip) {
-  const num = (value: string | undefined): number | undefined =>
-    value === undefined ? undefined : Number.parseInt(value, 10) || 0;
+if (grid && tooltip) {
+  const num = (value: string | undefined): number | null =>
+    value === undefined ? null : Number.parseFloat(value) || 0;
 
-  container.addEventListener('mouseover', (event) => {
-    const cell = (event.target as HTMLElement).closest<HTMLElement>('.contrib-cell');
-    if (!cell?.dataset.date) return;
-
-    const { date, tokens, linesAdded, linesRemoved, cost } = cell.dataset;
-    const count = num(cell.dataset.count) ?? 0;
+  const show = (cell: HTMLElement) => {
+    const { date, prompts, value, lines, ultrathinks, estimated } = cell.dataset;
+    if (!date) return;
 
     const rows: string[] = [];
-    if (count > 0) {
-      rows.push(`<div class="text-white">${count} prompts</div>`);
-    } else if (tokens !== undefined && (num(tokens) ?? 0) > 0) {
-      rows.push('<div class="text-gray-500 text-xs italic">backfilled — prompt count unavailable</div>');
+    const promptCount = num(prompts) ?? 0;
+
+    rows.push(
+      promptCount > 0
+        ? `<div class="text-fp-text">${group(promptCount)} prompt${promptCount === 1 ? '' : 's'}</div>`
+        : '<div class="text-fp-faint">nothing recorded</div>'
+    );
+
+    const valueUsd = num(value);
+    if (valueUsd !== null && valueUsd > 0) {
+      rows.push(`<div class="text-magenta-400">${money(valueUsd)}</div>`);
     }
 
-    if (tokens !== undefined) {
-      rows.push(`<div class="text-cyan-400">${formatTokens(num(tokens) ?? 0)} tokens</div>`);
+    const lineCount = num(lines);
+    if (lineCount !== null && lineCount > 0) {
+      rows.push(`<div class="text-cyan-400">+${compact(lineCount)} lines</div>`);
     }
 
-    if (linesAdded !== undefined || linesRemoved !== undefined) {
-      const added = formatTokens(num(linesAdded) ?? 0);
-      // OTEL days track removals, legacy days don't — only then is +/- honest.
-      rows.push(
-        linesRemoved !== undefined
-          ? `<div><span class="text-green-400">+${added}</span> / <span class="text-red-400">-${formatTokens(num(linesRemoved) ?? 0)}</span> lines</div>`
-          : `<div><span class="text-green-400">+${added} lines</span></div>`,
-      );
+    const thinks = num(ultrathinks);
+    if (thinks !== null && thinks > 0) {
+      rows.push(`<div class="fp-rainbow font-bold">🌈 ${group(thinks)}</div>`);
     }
 
-    if (cost !== undefined) {
-      rows.push(`<div class="text-amber-400">${formatCost(Math.round((Number.parseFloat(cost) || 0) * 100))}</div>`);
+    if (estimated === '1') {
+      rows.push('<div class="text-fp-faint italic">recovered, not measured live</div>');
     }
 
     tooltip.innerHTML =
-      `<div class="text-gray-300 mb-1">${formatDateLong(date)}</div>` +
-      `<div class="border-t border-gray-700 pt-1 mt-1 space-y-0.5">${rows.join('')}</div>`;
+      `<div class="text-fp-dim">${dayLabel(date)}</div>` +
+      `<div class="mt-1 space-y-0.5 border-t border-fp-edge pt-1">${rows.join('')}</div>`;
     tooltip.classList.remove('hidden');
 
-    const cellRect = cell.getBoundingClientRect();
-    const containerRect = container.getBoundingClientRect();
-    tooltip.style.left = `${cellRect.left - containerRect.left + cellRect.width / 2}px`;
-    tooltip.style.top = `${cellRect.top - containerRect.top - tooltip.offsetHeight - 8}px`;
+    const cellBox = cell.getBoundingClientRect();
+    const gridBox = grid.getBoundingClientRect();
+    tooltip.style.left = `${cellBox.left - gridBox.left + cellBox.width / 2}px`;
+    tooltip.style.top = `${cellBox.top - gridBox.top - tooltip.offsetHeight - 8}px`;
+  };
+
+  grid.addEventListener('mouseover', (event) => {
+    const cell = (event.target as HTMLElement).closest<HTMLElement>('.fp-day');
+    if (cell) show(cell);
   });
 
-  container.addEventListener('mouseout', (event) => {
-    if (!(event.target as HTMLElement).closest('.contrib-cell')) return;
-    tooltip.classList.add('hidden');
+  grid.addEventListener('mouseout', (event) => {
+    if ((event.target as HTMLElement).closest('.fp-day')) tooltip.classList.add('hidden');
   });
+
+  // Touch: a tap is the only hover a phone has, and the grid is the one place
+  // on the page where the figures live nowhere else.
+  grid.addEventListener(
+    'touchstart',
+    (event) => {
+      const cell = (event.target as HTMLElement).closest<HTMLElement>('.fp-day');
+      if (cell) show(cell);
+    },
+    { passive: true }
+  );
 }

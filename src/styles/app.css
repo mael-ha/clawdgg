@@ -61,6 +61,28 @@
   --color-blue-600: #2563eb;
   --color-purple-400: #c084fc;
   --color-purple-500: #a855f7;
+
+  /* ── The fingerprint ────────────────────────────────────────────────── */
+  /* The profile's own greys. The site's `gray-*` scale is Tailwind's, which
+     is neutral; these are the cool, slightly blue ones the fingerprint is
+     drawn on, and they are named apart so a profile restyle can never drag
+     the leaderboard with it. The same values exist as hex in
+     src/components/profile/palette.ts, for SVG fills and the share card,
+     which has no stylesheet at all. */
+  --color-fp-ground: #050508;  /* the page */
+  --color-fp-card: #0b0d12;    /* a card on it */
+  --color-fp-raise: #11151c;   /* a contribution square with nothing in it */
+  --color-fp-line: #161a23;    /* a hairline inside a card */
+  --color-fp-border: #1a1f2b;  /* a card's edge */
+  --color-fp-edge: #262b38;    /* an edge meant to be seen */
+  --color-fp-mute: #3a4050;    /* the arrows between the anatomy figures */
+  --color-fp-text: #e6e8ee;    /* body */
+  --color-fp-dim: #8a91a0;     /* a label */
+  --color-fp-faint: #6f7686;   /* a caption */
+  --color-fp-ghost: #4b5263;   /* a footnote */
+  --color-fp-rose: #ff4d6d;    /* ↓ Claude's side of the conversation */
+  --color-fp-pink: #ff4d8d;
+  --color-fp-weekend: #2f6f7a; /* the week ring's Saturday and Sunday */
 }
 
 /* ── v3 compatibility ─────────────────────────────────────────────────────
@@ -620,6 +642,110 @@ html {
 .stagger-item:nth-child(2) { animation-delay: 0.2s; }
 .stagger-item:nth-child(3) { animation-delay: 0.3s; }
 .stagger-item:nth-child(4) { animation-delay: 0.4s; }
+
+/* ============================================
+   THE FINGERPRINT (the profile page)
+
+   Everything here is what Tailwind utilities cannot say: text painted with a
+   gradient, a hatch for a recovered day, and the two places the rings have to
+   be told to shrink. Layout, colour and spacing stay in the markup.
+   ============================================ */
+
+/* The 🌈 chip and the ultrathink milestone. background-clip: text needs the
+   -webkit- prefix to survive Safari, and a transparent colour to show through;
+   `color` is kept as the fallback for anything that ignores the clip, so the
+   text is never invisible. */
+.fp-rainbow {
+  background: linear-gradient(90deg, #ff00ff, #ff4d8d, #fbbf24, #00ff9f, #67e8f9, #c084fc);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+@supports not ((background-clip: text) or (-webkit-background-clip: text)) {
+  .fp-rainbow {
+    background: none;
+    color: #fbbf24;
+  }
+}
+
+/* A day whose numbers were RECOVERED rather than measured live. Hatched, not
+   a different colour: a colour would read as a level on the ramp. */
+.fp-hatch {
+  background-image: repeating-linear-gradient(
+    45deg,
+    rgb(9, 126, 87) 0 2px,
+    #11151c 2px 4px
+  );
+}
+
+.fp-hatch-swatch {
+  background-image: repeating-linear-gradient(
+    45deg,
+    rgb(9, 126, 87) 0 2px,
+    #11151c 2px 4px
+  );
+}
+
+/* The contribution grid: 53 flex columns of 7 squares. The height is fixed and
+   the width is shared, so the squares are near-square at any container size
+   without a media query per breakpoint. */
+.fp-year-cell {
+  height: 14px;
+  border-radius: 2px;
+}
+
+/* A phone shows the last 26 weeks, newest on the right — by HIDING the oldest
+   27 columns of the one grid the server rendered, not by being served a second
+   shorter one. 53 − 26 = 27, and the month labels have to drop the same 27 or
+   they would slide out from under their months. Both numbers live here and
+   nowhere else; Year.tsx renders 53 columns and says so. */
+@media (max-width: 639px) {
+  .fp-year-cell {
+    height: 10px;
+  }
+
+  .fp-year-col:nth-child(-n + 27),
+  .fp-year-month:nth-child(-n + 27) {
+    display: none;
+  }
+}
+
+/* The hover target is bigger than the square: 14px is under every pointer
+   guideline, and a ring on hover says which day is being read. */
+.fp-day {
+  cursor: pointer;
+}
+
+.fp-day:hover {
+  box-shadow: 0 0 0 1px #4b5263;
+}
+
+/* The rings carry their ticks, hour labels and centre type inside one SVG and
+   one 240-unit viewBox, so a phone gets the same geometry at 150px rather than
+   a second set of paths. At that size the ticks and the 3-hourly labels are
+   sub-pixel noise, and the centre figure has to grow to stay readable. */
+@media (max-width: 639px) {
+  .fp-ring-ticks,
+  .fp-ring-labels {
+    display: none;
+  }
+
+  .fp-ring-big {
+    font-size: 36px;
+  }
+
+  .fp-ring-small {
+    font-size: 13px;
+  }
+}
+
+/* A 1200×630 card, rendered into an iframe-free page for the rasteriser and
+   for anyone who opens the PNG's source URL directly. */
+.fp-card {
+  width: 1200px;
+  height: 630px;
+}
 
 /* ============================================
    PRINT STYLES

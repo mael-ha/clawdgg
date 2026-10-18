@@ -14,12 +14,13 @@ try {
 }
 
 export type Island =
-  | 'analytics-chart'
   | 'contribution-tooltip'
   | 'copy-share'
   | 'device-code-input'
   | 'home-copy'
-  | 'leaderboard-more';
+  | 'leaderboard-more'
+  | 'profile-curve'
+  | 'profile-visibility';
 
 function url(name: string): string {
   const file = manifest[name];

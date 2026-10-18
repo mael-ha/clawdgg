@@ -1,45 +1,57 @@
 import { Hono } from 'hono';
-import type { FC } from 'hono/jsx';
+import { eq } from 'drizzle-orm';
 import { Layout } from '../components/Layout';
-import type { Island } from '../lib/assets';
-import { TtlCache } from '../lib/ttl-cache';
 import { db } from '../db';
-import { users } from '../db/schema';
-import { eq, sql } from 'drizzle-orm';
-import { getBadges, BADGES } from '../lib/badges';
-import { formatCost, formatHours, formatTokens } from '../lib/format';
-import { getTokenComparison } from '../lib/comparisons';
-import {
-  calculateArchetypes,
-  formatArchetypeDisplay,
-  getArchetypeDescription,
-  calculateDerivedMetrics,
-  getPeakHour,
-  type ArchetypeInput,
-  type ArchetypeScore,
-  type DerivedMetrics,
-  type PeakHourInfo
-} from '../lib/archetypes';
-import { TokenBar } from '../components/TokenBar';
-import { ActivityRadar } from '../components/ActivityRadar';
-import { AnalyticsChart } from '../components/AnalyticsChart';
-import { LanguageChart } from '../components/LanguageChart';
-import { ToolkitChart } from '../components/ToolkitChart';
-import { TrustStyleComponent } from '../components/TrustStyle';
-import { EfficiencyMetrics } from '../components/EfficiencyMetrics';
+import { profileSettings } from '../db/schema';
+import { getFingerprint, type FingerprintData } from '../lib/fingerprint';
+import { visibilityOf } from '../lib/profile-settings';
+import { TtlCache } from '../lib/ttl-cache';
+import type { Island } from '../lib/assets';
 import type { SessionUser } from '../types';
 import {
-  clickhouse,
-  type DailyMetrics,
-  type TodayMetrics,
-  type CacheStats,
-  type LanguageStats,
-  type ToolStats,
-  type TrustStyle,
-  type AgenticStats,
-  type TerminalStats,
-  type TodayMetricsEnhanced,
-} from '../db/clickhouse';
+  fetchCurve,
+  fetchPipeline,
+  fetchPlan,
+  fetchProfileUser,
+  fetchToday,
+  fetchYearSeries,
+  localToday,
+  parseCurveGroupBy,
+  parseCurveMetric,
+  parseCurvePeriod,
+  type ProfileUser,
+} from '../lib/profile-data';
+import { DEFAULT_TIMEZONE } from '../lib/timezone';
+import { ProfileNotFound, ProfilePage } from '../components/profile/ProfilePage';
+import { className } from '../components/profile/palette';
+import { group, money } from '../components/profile/format';
+import type { CurveView } from '../components/profile/curve';
+import type { PlanData, Visibility, YearData } from '../components/profile/types';
+import type { ContributionDay } from '../components/profile/geometry';
+
+/**
+ * /u/:username — the fingerprint.
+ *
+ * Three routes, and the division between them is what a reader notices going
+ * stale:
+ *
+ *   GET /u/:username         the page. Cached for a minute, because the
+ *                            fingerprint, the year and the plan are rollups
+ *                            and a minute of a 365-day aggregate is invisible.
+ *                            The owner's today and pipeline panels are fetched
+ *                            OUTSIDE that cache on every request — the whole
+ *                            point of "today" is that it just moved.
+ *   GET /u/:username/curve   the activity chart's data, per interaction.
+ *                            PUBLIC, and it honours the owner's toggle.
+ *   GET /u/:username/card.png  mounted separately — see src/routes/og.ts.
+ *
+ * The chart endpoint lives here rather than in src/routes/api.ts because the
+ * one in api.ts (`/api/me/chart`) is `requireAuth` by construction: it answers
+ * for whoever is logged in and has no username in its path, so it cannot
+ * answer for a profile being viewed by somebody else. This one takes the
+ * username, checks that profile's own visibility, and never reads the session
+ * for anything but deciding whether the viewer is the owner.
+ */
 
 type Variables = {
   user: SessionUser | null;
@@ -48,1107 +60,281 @@ type Variables = {
 const app = new Hono<{ Variables: Variables }>();
 
 // ═══════════════════════════════════════════════════════════════════════════
-// COMPONENTS
+// The page's payload
 // ═══════════════════════════════════════════════════════════════════════════
-
-// Contribution graph (GitHub-style, 365 days)
-interface ContributionDay {
-  date: string;
-  count: number;
-  level: 0 | 1 | 2 | 3 | 4;
-  // Rich data for enhanced tooltips (OTEL users)
-  tokens?: number;
-  linesAdded?: number;
-  linesRemoved?: number;
-  costUsd?: number;
-}
-
-const ContributionGraph: FC<{ days: ContributionDay[] }> = ({ days }) => {
-  const dayMap = new Map(days.map(d => [d.date, d]));
-  const allDays: ContributionDay[] = [];
-  const today = new Date();
-
-  for (let i = 364; i >= 0; i--) {
-    const date = new Date(today);
-    date.setDate(date.getDate() - i);
-    const dateStr = date.toISOString().split('T')[0] as string;
-    const existing = dayMap.get(dateStr);
-    allDays.push(existing || { date: dateStr, count: 0, level: 0 as const });
-  }
-
-  const weeks: ContributionDay[][] = [];
-  let currentWeek: ContributionDay[] = [];
-  const firstDay = allDays[0];
-  const firstDayOfWeek = firstDay ? new Date(firstDay.date).getDay() : 0;
-
-  for (let i = 0; i < firstDayOfWeek; i++) {
-    currentWeek.push({ date: '', count: 0, level: 0 });
-  }
-
-  for (const day of allDays) {
-    currentWeek.push(day);
-    if (currentWeek.length === 7) {
-      weeks.push(currentWeek);
-      currentWeek = [];
-    }
-  }
-  if (currentWeek.length > 0) weeks.push(currentWeek);
-
-  const levelColors = [
-    'bg-gray-800',
-    'bg-cyan-900',
-    'bg-cyan-700',
-    'bg-cyan-500',
-    'bg-cyan-300',
-  ];
-
-  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
-  // Build data attributes for rich tooltip
-  const buildDataAttrs = (day: ContributionDay) => {
-    if (!day.date) return {};
-    const attrs: Record<string, string> = {
-      'data-date': day.date,
-      'data-count': String(day.count),
-    };
-    // Always include rich data when available (for both OTEL and legacy days)
-    if (day.tokens !== undefined) attrs['data-tokens'] = String(day.tokens);
-    if (day.linesAdded !== undefined) attrs['data-lines-added'] = String(day.linesAdded);
-    if (day.linesRemoved !== undefined) attrs['data-lines-removed'] = String(day.linesRemoved);
-    if (day.costUsd !== undefined) attrs['data-cost'] = String(day.costUsd);
-    return attrs;
-  };
-
-  return (
-    <div class="overflow-x-auto relative" id="contribution-graph-container">
-      {/* Custom tooltip */}
-      <div
-        id="contrib-tooltip"
-        class="absolute z-50 hidden px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg shadow-xl text-xs font-mono pointer-events-none"
-        style="transform: translateX(-50%);"
-      />
-
-      <div class="inline-block min-w-max">
-        <div class="flex mb-1 ml-8">
-          {weeks.map((week, i) => {
-            if (i === 0 || i % 4 === 0) {
-              const firstValidDay = week.find(d => d.date);
-              if (firstValidDay) {
-                const month = new Date(firstValidDay.date).getMonth();
-                return <span class="text-xs text-gray-500 w-12">{months[month]}</span>;
-              }
-            }
-            return null;
-          })}
-        </div>
-        <div class="flex gap-[2px]">
-          <div class="flex flex-col gap-[2px] mr-2 text-xs text-gray-500">
-            <span class="h-[10px]"></span>
-            <span class="h-[10px]">Mon</span>
-            <span class="h-[10px]"></span>
-            <span class="h-[10px]">Wed</span>
-            <span class="h-[10px]"></span>
-            <span class="h-[10px]">Fri</span>
-            <span class="h-[10px]"></span>
-          </div>
-          {weeks.map((week, weekIdx) => (
-            <div key={weekIdx} class="flex flex-col gap-[2px]">
-              {week.map((day, dayIdx) => (
-                <div
-                  key={dayIdx}
-                  class={`contrib-cell w-[10px] h-[10px] rounded-xs ${day.date ? levelColors[day.level] : 'bg-transparent'} ${day.date ? 'cursor-pointer hover:ring-1 hover:ring-gray-600 transition-all' : ''}`}
-                  {...buildDataAttrs(day)}
-                />
-              ))}
-            </div>
-          ))}
-        </div>
-        <div class="flex items-center gap-1 mt-2 justify-end text-xs text-gray-500">
-          <span>Less</span>
-          {levelColors.map((color, i) => (
-            <div key={i} class={`w-[10px] h-[10px] rounded-xs ${color}`} />
-          ))}
-          <span>More</span>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-// Stat row for the two-column grid
-interface StatRowProps {
-  label: string;
-  value: string;
-  percentile?: string;
-  detail?: string;
-}
-
-const StatRow: FC<StatRowProps> = ({ label, value, percentile, detail }) => (
-  <div class="flex items-center justify-between py-3 border-b border-gray-800/50 last:border-0">
-    <div class="flex flex-col">
-      <span class="text-gray-400 text-sm">{label}</span>
-      {detail && <span class="text-gray-600 text-xs">{detail}</span>}
-    </div>
-    <div class="flex items-center gap-3">
-      <span class="text-gray-100 font-mono text-lg">{value}</span>
-      {percentile && (
-        <span class="text-xs px-2 py-0.5 bg-cyan-500/10 text-cyan-400 rounded-full border border-cyan-500/20">
-          {percentile}
-        </span>
-      )}
-    </div>
-  </div>
-);
-
-// Style row for "Your Style" section
-interface StyleRowProps {
-  label: string;
-  value: string;
-  subvalue?: string;
-  icon?: string;
-}
-
-const StyleRow: FC<StyleRowProps> = ({ label, value, subvalue, icon }) => (
-  <div class="flex items-center justify-between py-3 border-b border-gray-800/50 last:border-0">
-    <span class="text-gray-400 text-sm">{label}</span>
-    <div class="flex items-center gap-2">
-      {icon && <span>{icon}</span>}
-      <div class="text-right">
-        <div class="text-gray-100 font-mono">{value}</div>
-        {subvalue && <div class="text-gray-500 text-xs">{subvalue}</div>}
-      </div>
-    </div>
-  </div>
-);
-
-// Today's Activity Widget (OTEL users only)
-interface TodayWidgetProps {
-  today: TodayMetrics;
-  cacheStats: CacheStats | null;
-}
-
-const TodayWidget: FC<TodayWidgetProps> = ({ today, cacheStats }) => {
-  const costFormatted = today.costUsd >= 1
-    ? `$${today.costUsd.toFixed(0)}`
-    : `$${today.costUsd.toFixed(2)}`;
-
-  return (
-    <div class="relative mb-8 p-6 bg-gradient-to-br from-green-500/5 via-transparent to-cyan-500/5 border border-green-500/20 rounded-2xl overflow-hidden">
-      {/* Live indicator */}
-      <div class="absolute top-4 right-4 flex items-center gap-2">
-        <span class="relative flex h-2 w-2">
-          <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-          <span class="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
-        </span>
-        <span class="text-green-400 text-xs font-mono">LIVE</span>
-      </div>
-
-      <h2 class="text-gray-400 text-xs uppercase tracking-[0.3em] mb-4 font-mono">Today's Activity</h2>
-
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div>
-          <div class="text-2xl font-bold text-white font-mono">{today.prompts}</div>
-          <div class="text-gray-600 text-xs font-mono">prompts</div>
-        </div>
-        <div>
-          <div class="text-2xl font-bold text-green-400 font-mono">{costFormatted}</div>
-          <div class="text-gray-600 text-xs font-mono">spent</div>
-        </div>
-        <div>
-          <div class="text-2xl font-bold text-cyan-400 font-mono">{formatTokens(today.linesAdded)}</div>
-          <div class="text-gray-600 text-xs font-mono">lines</div>
-        </div>
-        <div>
-          <div class="text-2xl font-bold text-purple-400 font-mono">{today.commits}</div>
-          <div class="text-gray-600 text-xs font-mono">commits</div>
-        </div>
-      </div>
-
-      {/* Cache savings callout */}
-      {cacheStats && cacheStats.estimatedSavingsUsd > 1 && (
-        <div class="mt-4 pt-4 border-t border-gray-800/50">
-          <div class="flex items-center gap-2">
-            <span class="text-amber-400">$</span>
-            <span class="text-amber-300 font-mono font-bold">{cacheStats.estimatedSavingsUsd.toFixed(0)}</span>
-            <span class="text-gray-500 text-sm">saved by caching</span>
-            <span class="text-gray-600 text-xs">({cacheStats.cacheHitRate.toFixed(0)}% cache hit rate)</span>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-// ═══════════════════════════════════════════════════════════════════════════
-// PROFILE PAGE
-// ═══════════════════════════════════════════════════════════════════════════
-
-interface ProfileData {
-  username: string;
-  avatarUrl: string | null;
-  firstSessionDate: string | null;
-  badges: string[];
-  currentStreak: number;
-  longestStreak: number;
-
-  // Core metrics
-  totalPrompts: number;
-  totalTokens: number;
-  totalInputTokens: number;
-  totalOutputTokens: number;
-  totalCacheReadTokens: number;
-  totalCacheCreationTokens: number;
-  totalCostCents: number;
-  totalLinesWritten: number;
-  totalCommits: number;
-  totalActiveSeconds: number;
-
-  // Legacy (backward compat)
-  totalMessages: number;
-  totalToolCalls: number;
-
-  // Ranking
-  rank: number;
-  totalUsers: number;
-
-  // Activity patterns
-  hourCounts: Record<string, number> | null;
-}
-
-interface ProfileProps {
-  profile: ProfileData;
-  archetypes: ArchetypeScore[];
-  derivedMetrics: DerivedMetrics;
-  peakHour: PeakHourInfo | null;
-  contributions: ContributionDay[];
-  currentUser: SessionUser | null;
-  // OTEL-specific data (only for own profile)
-  todayMetrics: TodayMetrics | null;
-  cacheStats: CacheStats | null;
-  isOtelEnabled: boolean;
-  // NEW: Profile Signature data
-  languageStats: LanguageStats[];
-  toolStats: ToolStats[];
-  trustStyle: TrustStyle | null;
-  agenticStats: AgenticStats | null;
-  terminalStats: TerminalStats[];
-  todayEnhanced: TodayMetricsEnhanced | null;
-}
-
-const Profile: FC<ProfileProps> = ({
-  profile,
-  archetypes,
-  derivedMetrics,
-  peakHour,
-  contributions,
-  currentUser,
-  todayMetrics,
-  cacheStats,
-  isOtelEnabled,
-  languageStats,
-  toolStats,
-  trustStyle,
-  agenticStats,
-  terminalStats,
-  todayEnhanced,
-}) => {
-  const isOwnProfile = currentUser?.githubUsername === profile.username;
-  const memberSince = profile.firstSessionDate
-    ? new Date(profile.firstSessionDate).toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
-    : null;
-  const totalDaysSinceStart = profile.firstSessionDate
-    ? Math.floor((Date.now() - new Date(profile.firstSessionDate).getTime()) / (1000 * 60 * 60 * 24)) + 1
-    : null;
-
-  // Calculate percentile
-  const percentile = profile.totalUsers > 0
-    ? Math.max(0.1, Math.ceil((profile.rank / profile.totalUsers) * 1000) / 10)
-    : 100;
-  const percentileDisplay = percentile < 1 ? `Top ${percentile}%` : `Top ${Math.round(percentile)}%`;
-
-  // Archetype display
-  const archetypeDisplay = formatArchetypeDisplay(archetypes);
-  const archetypeDescription = getArchetypeDescription(archetypes);
-
-  // Fun comparison for share text
-  const funComparison = getTokenComparison(profile.totalTokens);
-
-  // Share text
-  const shareText = `${archetypeDisplay}
-
-${formatCost(profile.totalCostCents)} invested in Claude
-#${profile.rank} • ${percentileDisplay} of users
-
-${funComparison}
-
-clawd.gg/u/${profile.username}`;
-
-  // Check if we have token data for the orbit visualization
-  const hasTokenData = profile.totalInputTokens > 0 || profile.totalOutputTokens > 0 || profile.totalCacheReadTokens > 0;
-  const hasHourData = profile.hourCounts && Object.keys(profile.hourCounts).length > 0;
-
-  return (
-    <div class="min-h-screen bg-black">
-      {/* Header */}
-      <header class="border-b border-gray-800/50 py-4 px-4">
-        <div class="max-w-5xl mx-auto flex justify-between items-center">
-          <a href="/" class="text-gray-600 hover:text-cyan-400 font-mono text-sm transition-colors">
-            ← back
-          </a>
-          {isOwnProfile && (
-            <button
-              data-share-text={shareText}
-              class="px-3 py-1.5 bg-transparent hover:bg-gray-900 border border-gray-800 hover:border-gray-700 rounded text-gray-500 hover:text-gray-300 font-mono text-xs transition-all"
-            >
-              copy stats
-            </button>
-          )}
-        </div>
-      </header>
-
-      <main class="max-w-5xl mx-auto px-4 py-8">
-        {/* ════════════════════════════════════════════════════════════════════
-            LIVE TODAY WIDGET (OTEL users viewing own profile only)
-            ════════════════════════════════════════════════════════════════════ */}
-        {isOwnProfile && isOtelEnabled && todayMetrics && (
-          <TodayWidget today={todayMetrics} cacheStats={cacheStats} />
-        )}
-
-        {/* ════════════════════════════════════════════════════════════════════
-            COMMAND CENTER HERO
-            Dramatic centered layout with glowing accents
-            ════════════════════════════════════════════════════════════════════ */}
-        <div class="relative mb-16 text-center">
-          {/* Background glow effects */}
-          <div class="absolute inset-0 flex items-center justify-center pointer-events-none overflow-hidden">
-            <div class="w-[600px] h-[600px] bg-cyan-500/5 rounded-full blur-3xl" />
-          </div>
-          <div class="absolute top-0 left-1/2 -translate-x-1/2 w-px h-20 bg-gradient-to-b from-transparent via-cyan-500/30 to-transparent" />
-
-          {/* User identity */}
-          <div class="relative inline-flex flex-col items-center mb-8">
-            {profile.rank === 1 && (
-              <div class="absolute -top-6 text-3xl animate-pulse">👑</div>
-            )}
-            <div class="relative">
-              {profile.avatarUrl ? (
-                <img
-                  src={profile.avatarUrl}
-                  alt={profile.username}
-                  class="w-20 h-20 rounded-full ring-2 ring-cyan-500/30 ring-offset-4 ring-offset-black"
-                />
-              ) : (
-                <div class="w-20 h-20 rounded-full bg-gray-900 ring-2 ring-cyan-500/30 ring-offset-4 ring-offset-black flex items-center justify-center text-2xl font-bold text-gray-500">
-                  {profile.username.slice(0, 2).toUpperCase()}
-                </div>
-              )}
-              {/* Status indicator */}
-              <div class="absolute -bottom-1 -right-1 w-5 h-5 bg-green-500 rounded-full border-4 border-black" />
-            </div>
-            <div class="mt-4">
-              <div class="text-white font-mono text-lg">@{profile.username}</div>
-              <div class="flex items-center justify-center gap-2 mt-1">
-                {memberSince && (
-                  <span class="text-gray-600 text-xs font-mono">since {memberSince}</span>
-                )}
-                {terminalStats[0] && (
-                  <>
-                    <span class="text-gray-700">•</span>
-                    <span class="text-gray-500 text-xs font-mono flex items-center gap-1">
-                      <span>⌨️</span>
-                      <span>{terminalStats[0].terminalType}</span>
-                    </span>
-                  </>
-                )}
-              </div>
-            </div>
-          </div>
-
-          {/* Archetype - The star of the show */}
-          <div class="relative mb-8">
-            <h1 class="text-3xl md:text-4xl lg:text-5xl font-bold tracking-[0.2em] uppercase"
-                style="background: linear-gradient(135deg, #22d3ee 0%, #a855f7 50%, #22d3ee 100%); background-size: 200% auto; -webkit-background-clip: text; -webkit-text-fill-color: transparent; animation: gradient-shift 8s ease infinite;">
-              {archetypeDisplay.replace(/^The\s+/i, '')}
-            </h1>
-            <p class="text-gray-500 text-sm font-mono mt-3 tracking-wider">
-              {archetypeDescription}
-            </p>
-          </div>
-
-          {/* Hero stat: Cost - massive and glowing */}
-          <div class="relative inline-block mb-6">
-            <div class="text-6xl md:text-7xl lg:text-8xl font-bold text-white"
-                 style="text-shadow: 0 0 60px rgba(34, 211, 238, 0.4), 0 0 120px rgba(34, 211, 238, 0.2);">
-              {formatCost(profile.totalCostCents)}
-            </div>
-            <div class="text-gray-600 text-sm font-mono mt-2 tracking-widest uppercase">invested in claude</div>
-          </div>
-
-          {/* Rank, active hours, and percentile */}
-          <div class="flex items-center justify-center gap-4 sm:gap-6 text-sm flex-wrap">
-            {profile.totalActiveSeconds > 0 && (
-              <>
-                <div class="flex items-center gap-2">
-                  <span class="text-gray-600 font-mono">active</span>
-                  <span class="text-white font-mono font-bold">{formatHours(profile.totalActiveSeconds)}</span>
-                </div>
-                <div class="w-px h-4 bg-gray-800 hidden sm:block" />
-              </>
-            )}
-            <div class="flex items-center gap-2">
-              <span class="text-gray-600 font-mono">rank</span>
-              <span class="text-white font-mono font-bold">#{profile.rank.toLocaleString()}</span>
-              <span class="text-gray-700">of {profile.totalUsers.toLocaleString()}</span>
-            </div>
-            <div class="w-px h-4 bg-gray-800" />
-            <div class="px-3 py-1 bg-cyan-500/10 border border-cyan-500/30 rounded-full">
-              <span class="text-cyan-400 font-mono text-sm">{percentileDisplay}</span>
-            </div>
-          </div>
-
-          {/* Fun comparison */}
-          <div class="mt-8 text-gray-600 text-xs font-mono">
-            {funComparison}
-          </div>
-        </div>
-
-        {/* ════════════════════════════════════════════════════════════════════
-            ANALYTICS CHART - Flexible metrics explorer
-            Shown to all users viewing their own profile (supports OTEL + legacy data)
-            ════════════════════════════════════════════════════════════════════ */}
-        {isOwnProfile && (
-          <section class="mb-16">
-            <h2 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-6 font-mono flex items-center gap-2">
-              <span class="w-2 h-2 bg-cyan-500 rounded-full animate-pulse" />
-              Analytics
-            </h2>
-            <div class="p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
-              <AnalyticsChart userId={profile.username} />
-            </div>
-          </section>
-        )}
-
-        {/* ════════════════════════════════════════════════════════════════════
-            YOUR SIGNATURE - Identity-revealing insights (OTEL users only)
-            ════════════════════════════════════════════════════════════════════ */}
-        {isOwnProfile && isOtelEnabled && (languageStats.length > 0 || toolStats.length > 0 || trustStyle) && (
-          <section class="mb-16">
-            <h2 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-6 font-mono flex items-center gap-2">
-              <span class="w-2 h-2 rounded-full" style="background: linear-gradient(135deg, #22d3ee, #a855f7);" />
-              Your Signature
-            </h2>
-
-            {/* Languages - Full width card */}
-            {languageStats.length > 0 && (
-              <div class="mb-8 p-4 sm:p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
-                <h3 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-4 sm:mb-6 font-mono flex items-center gap-2">
-                  <span class="w-2 h-2 bg-blue-500 rounded-full" />
-                  Languages You Build With
-                </h3>
-                <LanguageChart languages={languageStats} />
-              </div>
-            )}
-
-            {/* Toolkit + Trust - Two columns */}
-            <div class="grid md:grid-cols-2 gap-8">
-              {toolStats.length > 0 && (
-                <div class="p-4 sm:p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
-                  <h3 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-4 sm:mb-6 font-mono flex items-center gap-2">
-                    <span class="w-2 h-2 bg-amber-500 rounded-full" />
-                    Your Toolkit
-                  </h3>
-                  <ToolkitChart tools={toolStats} />
-                </div>
-              )}
-              {trustStyle && (
-                <div class="p-4 sm:p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
-                  <h3 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-4 sm:mb-6 font-mono flex items-center gap-2">
-                    <span class="w-2 h-2 bg-green-500 rounded-full" />
-                    Your Trust Style
-                  </h3>
-                  <TrustStyleComponent trustStyle={trustStyle} />
-                </div>
-              )}
-            </div>
-          </section>
-        )}
-
-        {/* ════════════════════════════════════════════════════════════════════
-            RADAR DISPLAYS - The cockpit instruments
-            ════════════════════════════════════════════════════════════════════ */}
-        {(hasTokenData || hasHourData) && (
-          <div class="grid md:grid-cols-2 gap-8 mb-16">
-            {/* Activity Radar */}
-            {hasHourData && profile.hourCounts && (
-              <div class="p-4 sm:p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
-                <h2 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-4 sm:mb-6 font-mono flex items-center gap-2">
-                  <span class="w-2 h-2 bg-purple-500 rounded-full animate-pulse" />
-                  Activity Patterns
-                </h2>
-                <ActivityRadar hourCounts={profile.hourCounts} />
-              </div>
-            )}
-
-            {/* Efficiency Metrics (OTEL) or Token Orbit (legacy) */}
-            {isOtelEnabled && agenticStats ? (
-              <div class="p-4 sm:p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
-                <h2 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-4 sm:mb-6 font-mono flex items-center gap-2">
-                  <span class="w-2 h-2 bg-cyan-500 rounded-full animate-pulse" />
-                  Efficiency
-                </h2>
-                <EfficiencyMetrics
-                  agenticStats={agenticStats}
-                  cacheStats={cacheStats}
-                  totalOutputTokens={profile.totalOutputTokens}
-                  totalInputTokens={profile.totalInputTokens}
-                  totalLinesAdded={profile.totalLinesWritten}
-                  totalCostUsd={profile.totalCostCents / 100}
-                />
-              </div>
-            ) : hasTokenData && (
-              <div class="p-4 sm:p-6 bg-gray-950/50 border border-gray-800/50 rounded-2xl backdrop-blur">
-                <h2 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-4 sm:mb-6 font-mono flex items-center gap-2">
-                  <span class="w-2 h-2 bg-cyan-500 rounded-full animate-pulse" />
-                  Token Flow
-                </h2>
-                <TokenBar
-                  inputTokens={profile.totalInputTokens}
-                  outputTokens={profile.totalOutputTokens}
-                  cacheReadTokens={profile.totalCacheReadTokens}
-                  cacheCreationTokens={profile.totalCacheCreationTokens}
-                />
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* ════════════════════════════════════════════════════════════════════
-            METRICS GRID - Quick stats with terminal aesthetic
-            ════════════════════════════════════════════════════════════════════ */}
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-16">
-          <div class="p-4 bg-gray-950/30 border border-gray-800/30 rounded-xl text-center group relative">
-            <div class="text-2xl font-bold text-white font-mono">{formatTokens(profile.totalTokens)}</div>
-            <div class="text-gray-600 text-xs font-mono mt-1">I/O tokens</div>
-            <div class="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 bg-gray-900 border border-gray-700 rounded text-xs text-gray-400 whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
-              Input + Output (excludes cache)
-            </div>
-          </div>
-          <div class="p-4 bg-gray-950/30 border border-gray-800/30 rounded-xl text-center">
-            <div class="text-2xl font-bold text-white font-mono">{formatTokens(profile.totalLinesWritten)}</div>
-            <div class="text-gray-600 text-xs font-mono mt-1">lines</div>
-          </div>
-          <div class="p-4 bg-gray-950/30 border border-gray-800/30 rounded-xl text-center">
-            <div class="text-2xl font-bold text-white font-mono">{profile.totalCommits.toLocaleString()}</div>
-            <div class="text-gray-600 text-xs font-mono mt-1">commits</div>
-          </div>
-          <div class="p-4 bg-gray-950/30 border border-gray-800/30 rounded-xl text-center">
-            <div class="text-2xl font-bold text-white font-mono">{profile.totalPrompts.toLocaleString()}</div>
-            <div class="text-gray-600 text-xs font-mono mt-1">prompts</div>
-          </div>
-        </div>
-
-        {/* ════════════════════════════════════════════════════════════════════
-            DERIVED METRICS - The efficiency story
-            ════════════════════════════════════════════════════════════════════ */}
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-16">
-          {derivedMetrics.outputLeverage > 0 && (
-            <div class="p-4 bg-gradient-to-br from-cyan-500/5 to-transparent border border-cyan-500/10 rounded-xl">
-              <div class="text-3xl font-bold text-cyan-400 font-mono">{Math.round(derivedMetrics.outputLeverage)}×</div>
-              <div class="text-gray-500 text-xs font-mono mt-1">output leverage</div>
-            </div>
-          )}
-          {derivedMetrics.cacheEfficiency > 0 && (
-            <div class="p-4 bg-gradient-to-br from-amber-500/5 to-transparent border border-amber-500/10 rounded-xl">
-              <div class="text-3xl font-bold text-amber-400 font-mono">{Math.round(derivedMetrics.cacheEfficiency)}%</div>
-              <div class="text-gray-500 text-xs font-mono mt-1">cache efficiency</div>
-            </div>
-          )}
-          {derivedMetrics.costPerLine !== null && derivedMetrics.costPerLine > 0 && (
-            <div class="p-4 bg-gradient-to-br from-green-500/5 to-transparent border border-green-500/10 rounded-xl">
-              <div class="text-3xl font-bold text-green-400 font-mono">${derivedMetrics.costPerLine.toFixed(2)}</div>
-              <div class="text-gray-500 text-xs font-mono mt-1">per line</div>
-            </div>
-          )}
-          {derivedMetrics.costPerCommit !== null && derivedMetrics.costPerCommit > 0 && (
-            <div class="p-4 bg-gradient-to-br from-purple-500/5 to-transparent border border-purple-500/10 rounded-xl">
-              <div class="text-3xl font-bold text-purple-400 font-mono">${derivedMetrics.costPerCommit.toFixed(0)}</div>
-              <div class="text-gray-500 text-xs font-mono mt-1">per commit</div>
-            </div>
-          )}
-        </div>
-
-        {/* ════════════════════════════════════════════════════════════════════
-            ACTIVITY TIMELINE
-            ════════════════════════════════════════════════════════════════════ */}
-        <section class="mb-16">
-          <h2 class="text-gray-600 text-xs uppercase tracking-[0.3em] mb-6 font-mono flex items-center gap-2">
-            <span class="w-2 h-2 bg-green-500 rounded-full" />
-            Activity Timeline
-          </h2>
-          <div class="p-6 bg-gray-950/30 border border-gray-800/30 rounded-2xl">
-            <ContributionGraph days={contributions} />
-
-            {/* Streak stats */}
-            <div class="mt-6 pt-6 border-t border-gray-800/50 grid grid-cols-2 md:grid-cols-4 gap-4">
-              <div class="text-center">
-                <div class="text-2xl font-bold text-orange-400 font-mono">{profile.currentStreak}</div>
-                <div class="text-gray-600 text-xs font-mono">streak</div>
-              </div>
-              <div class="text-center">
-                <div class="text-2xl font-bold text-amber-400 font-mono">{profile.longestStreak}</div>
-                <div class="text-gray-600 text-xs font-mono">best</div>
-              </div>
-              <div class="text-center">
-                <div class="text-2xl font-bold text-gray-300 font-mono">
-                  {contributions.filter(d => d.level > 0).length}
-                  <span class="text-gray-600 text-lg">/365</span>
-                </div>
-                <div class="text-gray-600 text-xs font-mono">active days</div>
-              </div>
-              <div class="text-center">
-                <div class="text-2xl font-bold text-gray-300 font-mono">{profile.totalToolCalls || '—'}</div>
-                <div class="text-gray-600 text-xs font-mono">tool calls</div>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        {/* ════════════════════════════════════════════════════════════════════
-            BADGES (if any)
-            ════════════════════════════════════════════════════════════════════ */}
-        {profile.badges.length > 0 && (
-          <section>
-            <h2 class="text-gray-500 text-xs uppercase tracking-wider mb-4 font-mono">
-              // badges <span class="text-gray-600">({profile.badges.length}/{Object.keys(BADGES).length})</span>
-            </h2>
-            <div class="p-6 bg-gray-950 border border-gray-800 rounded-xl">
-              <div class="flex flex-wrap gap-3">
-                {getBadges(profile.badges).map((badge) => (
-                  <div
-                    key={badge.id}
-                    class="flex items-center gap-2 px-3 py-2 bg-gray-900/50 border border-gray-800 rounded-lg"
-                    title={badge.description}
-                  >
-                    <span class="text-xl">{badge.emoji}</span>
-                    <span class="text-gray-300 text-sm">{badge.name}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </section>
-        )}
-
-        {/* GitHub link */}
-        <div class="mt-12 text-center">
-          <a
-            href={`https://github.com/${profile.username}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            class="inline-flex items-center gap-2 px-4 py-2 border border-gray-800 hover:border-gray-700 rounded-lg text-gray-500 hover:text-gray-400 transition-colors text-sm"
-          >
-            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-              <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
-            </svg>
-            View on GitHub
-          </a>
-        </div>
-      </main>
-    </div>
-  );
-};
-
-// 404 component
-const NotFound: FC<{ username: string }> = ({ username }) => (
-  <div class="min-h-screen bg-black flex items-center justify-center px-4">
-    <div class="text-center">
-      <div class="text-6xl mb-4">🤔</div>
-      <h1 class="text-2xl font-bold text-gray-100 mb-2">User not found</h1>
-      <p class="text-gray-500 font-mono text-sm mb-6">
-        @{username} hasn't joined clawd.gg yet
-      </p>
-      <a
-        href="/"
-        class="inline-flex items-center gap-2 text-cyan-400 hover:text-cyan-300 font-mono transition-colors"
-      >
-        &larr; Back to Leaderboard
-      </a>
-    </div>
-  </div>
-);
-
-// ═══════════════════════════════════════════════════════════════════════════
-// DATA
-// ═══════════════════════════════════════════════════════════════════════════
-
-type UserRow = typeof users.$inferSelect;
-
-/**
- * The OTEL panels that are a 30/90-day rollup. Safe to cache: a minute of
- * staleness is invisible in a 90-day aggregate.
- */
-interface OtelRollups {
-  cacheStats: CacheStats | null;
-  languageStats: LanguageStats[];
-  toolStats: ToolStats[];
-  trustStyle: TrustStyle | null;
-  agenticStats: AgenticStats | null;
-  terminalStats: TerminalStats[];
-}
-
-/** The owner's live panels. NEVER cached — see fetchOtelToday. */
-interface OtelToday {
-  todayMetrics: TodayMetrics | null;
-  todayEnhanced: TodayMetricsEnhanced | null;
-}
-
-type OtelProfileData = OtelRollups & OtelToday;
-
-const NO_ROLLUPS: OtelRollups = {
-  cacheStats: null,
-  languageStats: [],
-  toolStats: [],
-  trustStyle: null,
-  agenticStats: null,
-  terminalStats: [],
-};
-
-const NO_TODAY: OtelToday = { todayMetrics: null, todayEnhanced: null };
 
 interface ProfilePayload {
-  profile: ProfileData;
-  archetypes: ArchetypeScore[];
-  derivedMetrics: DerivedMetrics;
-  peakHour: PeakHourInfo | null;
-  contributions: ContributionDay[];
-  rollups: OtelRollups;
-  summary: string;
+  fingerprint: FingerprintData;
+  /** What a VISITOR may see. The owner's own page shows everything. */
+  visibility: Visibility;
+  year: YearData | null;
+  curve: CurveView | null;
+  plan: PlanData | null;
   /**
-   * False when a query behind this payload failed. The cache refuses to keep
-   * a payload built during an outage, so the next request retries instead of
-   * serving an empty page for the rest of the TTL.
+   * False when a query behind this payload failed. The cache refuses to keep a
+   * payload built during an outage, so the next request retries instead of
+   * serving a half-empty page for the rest of the minute.
    */
   complete: boolean;
 }
 
 /**
- * The cacheable part of the page, for a minute at a time.
+ * A minute of the page, keyed by username AND by whether the viewer owns it.
  *
- * SQLite totals are refreshed by the 5-minute ClickHouse sync and the panels
- * below are 30/90-day rollups, so a minute of staleness costs a viewer nothing
- * and saves the fan-out — about a dozen queries, half of them ClickHouse round
- * trips — on every reload, every crawler hit, and every person who opens the
- * same popular profile.
- *
- * Keyed by username AND whether the viewer owns the profile, because owners
- * get panels (languages, toolkit, trust) nobody else is shown.
- *
- * What is NOT in here: the owner's "today" panels. Those are the one place a
- * viewer would notice staleness — you run Claude Code, reload your own
- * profile, and today's number has to have moved.
+ * The owner's payload is a DIFFERENT payload — it contains the sections they
+ * have hidden — so it cannot share a key with the public one. That was the
+ * same decision the fingerprint endpoint made, for the same reason.
  */
-const profileCache = new TtlCache<ProfilePayload>(60_000);
+const pageCache = new TtlCache<ProfilePayload>(60_000);
 
-/** Everyone ClickHouse has usage for — users.total_* is that answer, synced. */
-async function fetchTotalUsers(): Promise<number> {
-  const rows = (await db.all(sql`
-    SELECT COUNT(*) as count
-    FROM users u
-    WHERE COALESCE(u.total_prompts, 0) > 0 OR COALESCE(u.total_tokens, 0) > 0
-  `)) as any[];
-  return rows[0]?.count ?? 1;
-}
+/** The default view of ⚡ activity: value, by week, over the last year. */
+const DEFAULT_CURVE = { metric: 'value', period: '1y', groupBy: 'week' } as const;
 
-/**
- * Rank = how many users are ahead on prompts, +1.
- *
- * One column for everyone. This used to branch on `otel_enabled`, comparing
- * OTEL users' synced totals against non-OTEL users' summed daily_stats — two
- * different measurements in one ORDER BY, which is how a user could be ranked
- * above someone who had done more.
- */
-async function fetchRank(totalPrompts: number): Promise<number> {
-  const rows = (await db.all(sql`
-    SELECT COUNT(*) + 1 as rank
-    FROM users u
-    WHERE COALESCE(u.total_prompts, 0) > ${totalPrompts}
-  `)) as any[];
-  return rows[0]?.rank ?? 1;
-}
+async function buildPayload(user: ProfileUser, isOwner: boolean): Promise<ProfilePayload> {
+  const settings = await db
+    .select()
+    .from(profileSettings)
+    .where(eq(profileSettings.userId, user.id))
+    .get();
+  const visibility = visibilityOf(settings);
+  const hiddenFromOthers = (Object.keys(visibility) as (keyof Visibility)[]).filter(
+    (section) => !visibility[section]
+  );
 
-/**
- * The owner-only OTEL rollups. Isolated in its own try/catch on purpose: if
- * ClickHouse is unreachable the profile still renders from SQLite, just
- * without the live sections — and `ok: false` stops that degraded page being
- * cached for the next minute.
- */
-async function fetchOtelRollups(userId: string): Promise<{ data: OtelRollups; ok: boolean }> {
-  try {
-    const [cacheStats, languageStats, toolStats, trustStyle, agenticStats, terminalStats] =
-      await Promise.all([
-        clickhouse.getUserCacheStats(userId),
-        clickhouse.getUserLanguageStats(userId),
-        clickhouse.getUserToolBreakdown(userId),
-        clickhouse.getUserTrustStyle(userId),
-        clickhouse.getUserAgenticStats(userId),
-        clickhouse.getUserTerminalStats(userId),
-      ]);
-    return {
-      data: { cacheStats, languageStats, toolStats, trustStyle, agenticStats, terminalStats },
-      ok: true,
-    };
-  } catch (error) {
-    console.error('Error fetching OTEL rollups:', error);
-    return { data: NO_ROLLUPS, ok: false };
-  }
-}
+  // Failures are collected per BUILD, not in a module-level flag: two requests
+  // for two profiles are in flight at the same time, and a shared flag would
+  // let one profile's dead query stop the other's page being cached.
+  const failures: string[] = [];
+  const failed = <T,>(what: string, fallback: T) => (error: unknown) => {
+    console.error(`[profile] ${what}:`, error);
+    failures.push(what);
+    return fallback;
+  };
 
-/**
- * The owner's live panels, fetched on EVERY request and never cached.
- *
- * "Today" is the one number on the page whose whole point is that it just
- * moved: the owner runs Claude Code, reloads, and expects to see it. Behind a
- * 60s cache it reads as broken. Two cheap today-scoped queries are worth not
- * being wrong about that.
- */
-async function fetchOtelToday(userId: string): Promise<OtelToday> {
-  try {
-    const [todayMetrics, todayEnhanced] = await Promise.all([
-      clickhouse.getUserTodayMetrics(userId),
-      clickhouse.getUserTodayMetricsEnhanced(userId),
-    ]);
-    return { todayMetrics, todayEnhanced };
-  } catch (error) {
-    console.error('Error fetching today metrics:', error);
-    return NO_TODAY;
-  }
-}
-
-/**
- * Everything the page shows, from ClickHouse via users.total_* and the daily
- * metrics query.
- *
- * There is no `isOtelUser` branch left. This function used to read totals and
- * the whole contribution graph from SQLite daily_stats for non-OTEL users and
- * from ClickHouse for OTEL ones, then merge the two activity maps — which is
- * exactly where the same user's prompt count could differ between this page
- * and the leaderboard. The pre-OTEL days are ClickHouse rows now, and
- * src/jobs/sync-clickhouse.ts syncs every user, so one path serves everyone.
- */
-async function buildProfilePayload(userData: UserRow, isOwnProfile: boolean): Promise<ProfilePayload> {
-  const totalPrompts = userData.totalPrompts ?? 0;
-
-  // One wave. These queries don't depend on each other.
-  const [toolCalls, dailyMetrics, totalUsers, rollups, rank] = await Promise.all([
-    clickhouse.getUserTotalToolCalls(userData.id).catch((error) => {
-      console.error('Error fetching tool calls:', error);
-      return null;
+  // One wave: none of these depend on each other, and the fan-out is the whole
+  // cost of the page. Each failure is isolated so one dead query costs its own
+  // section rather than the profile. getFingerprint is the exception — it
+  // THROWS, and the route lets it, because a profile with no fingerprint is
+  // not a degraded profile, it is a page that should say "try again".
+  const [fingerprint, year, curve, plan] = await Promise.all([
+    getFingerprint(user.id, {
+      username: user.githubUsername,
+      timezone: user.timezone,
+      // The owner always sees everything, including what they have hidden.
+      hidden: isOwner ? [] : hiddenFromOthers,
     }),
-    clickhouse.getUserDailyMetrics(userData.id, 365).catch((error) => {
-      console.error('Error fetching daily metrics:', error);
-      return null;
-    }),
-    fetchTotalUsers(),
-    isOwnProfile ? fetchOtelRollups(userData.id) : { data: NO_ROLLUPS, ok: true },
-    fetchRank(totalPrompts),
+    isOwner || visibility.year
+      ? fetchYearSeries(user.id, user.timezone).catch(failed('year', null as ContributionDay[] | null))
+      : Promise.resolve(null),
+    isOwner || visibility.curve
+      ? fetchCurve(
+          user.id,
+          DEFAULT_CURVE.metric,
+          DEFAULT_CURVE.period,
+          DEFAULT_CURVE.groupBy
+        ).catch(failed('curve', null as CurveView | null))
+      : Promise.resolve(null),
+    isOwner || visibility.plan
+      ? fetchPlan(user.id).catch(failed('plan', null as PlanData | null))
+      : Promise.resolve(null),
   ]);
 
-  const contributions = buildContributions(dailyMetrics ?? []);
-
-  // Parse badges and hourCounts
-  let badges: string[] = [];
-  let hourCounts: Record<string, number> | null = null;
-  try {
-    badges = userData.badges ? JSON.parse(userData.badges) : [];
-    hourCounts = userData.hourCounts ? JSON.parse(userData.hourCounts) : null;
-  } catch {
-    badges = [];
-  }
-
-  const totalInputTokens = userData.totalInputTokens ?? 0;
-  const totalOutputTokens = userData.totalOutputTokens ?? 0;
-  const totalCacheReadTokens = userData.totalCacheReadTokens ?? 0;
-  const totalCacheCreationTokens = userData.totalCacheCreationTokens ?? 0;
-  const totalLinesWritten = userData.totalLinesAdded ?? 0;
-  const totalCommits = userData.totalCommits ?? 0;
-  const totalCostCents = userData.totalCostCents ?? 0;
-
-  const archetypeInput: ArchetypeInput = {
-    totalInputTokens,
-    totalOutputTokens,
-    totalCacheReadTokens,
-    totalCacheCreationTokens,
-    hourCounts,
-    totalPrompts,
-    totalLinesWritten,
-    totalCommits,
-    firstSessionDate: userData.firstSessionDate || undefined,
-  };
-  const archetypes = calculateArchetypes(archetypeInput);
-
-  const profile: ProfileData = {
-    username: userData.githubUsername,
-    avatarUrl: userData.avatarUrl,
-    firstSessionDate: userData.firstSessionDate,
-    badges,
-    currentStreak: userData.currentStreak ?? 0,
-    longestStreak: userData.longestStreak ?? 0,
-    totalPrompts,
-    totalTokens: userData.totalTokens ?? 0,
-    totalInputTokens,
-    totalOutputTokens,
-    totalCacheReadTokens,
-    totalCacheCreationTokens,
-    totalCostCents,
-    totalLinesWritten,
-    totalCommits,
-    totalActiveSeconds: userData.totalActiveSeconds ?? 0,
-    // `messages` was the pre-OTEL CLI's own metric; prompts is what we measure.
-    totalMessages: totalPrompts,
-    totalToolCalls: toolCalls ?? 0,
-    rank,
-    totalUsers,
-    hourCounts,
-  };
-
   return {
-    profile,
-    archetypes,
-    derivedMetrics: calculateDerivedMetrics(archetypeInput, totalCostCents),
-    peakHour: getPeakHour(hourCounts),
-    contributions,
-    rollups: rollups.data,
-    summary: `${formatArchetypeDisplay(archetypes)} · ${formatCost(totalCostCents)} invested in Claude · rank #${rank} of ${totalUsers}`,
-    complete: rollups.ok && dailyMetrics !== null && toolCalls !== null,
+    fingerprint,
+    visibility,
+    year:
+      year === null || year.length === 0
+        ? null
+        : {
+            days: year,
+            today: localToday(user.timezone),
+            currentStreak: user.currentStreak,
+            longestStreak: user.longestStreak,
+          },
+    curve,
+    plan,
+    complete: failures.length === 0,
   };
-}
-
-/**
- * Daily metrics -> contribution squares.
- *
- * The level is the LOUDER of the count-ratio and the tokens-ratio, each
- * normalized against its own max, so a day with token activity but no
- * recovered prompts (a backfilled window whose prompt source had rotated away)
- * still lights up in proportion to its volume.
- */
-function buildContributions(dailyMetrics: DailyMetrics[]): ContributionDay[] {
-  const days = dailyMetrics
-    .map((day) => ({
-      date: day.date,
-      count: day.prompts || 0,
-      tokens: (day.input_tokens || 0) + (day.output_tokens || 0),
-      linesAdded: day.lines_added || 0,
-      linesRemoved: day.lines_removed || 0,
-      costUsd: day.cost_usd || 0,
-    }))
-    .filter((day) => day.count > 0 || day.tokens > 0)
-    .sort((a, b) => a.date.localeCompare(b.date));
-
-  const maxCount = Math.max(...days.map((d) => d.count), 1);
-  const maxTokens = Math.max(...days.map((d) => d.tokens), 1);
-
-  return days.map((d) => {
-    const ratio = Math.max(d.count / maxCount, d.tokens / maxTokens);
-    let level: 0 | 1 | 2 | 3 | 4 = 0;
-    if (ratio > 0) {
-      if (ratio >= 0.75) level = 4;
-      else if (ratio >= 0.5) level = 3;
-      else if (ratio >= 0.25) level = 2;
-      else level = 1;
-    }
-    return {
-      date: d.date,
-      count: d.count,
-      level,
-      tokens: d.tokens || undefined,
-      linesAdded: d.linesAdded || undefined,
-      linesRemoved: d.linesRemoved || undefined,
-      costUsd: d.costUsd || undefined,
-    };
-  });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ROUTE HANDLER
+// GET /u/:username/curve — the activity chart's data
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// PUBLIC, like the profile it is drawn on, and it answers 404 for a profile
+// whose owner has hidden ⚡ activity rather than returning an empty series: an
+// empty series is a claim about the person, and a 404 is a claim about what
+// this endpoint will say.
+app.get('/:username/curve', async (c) => {
+  const user = await fetchProfileUser(c.req.param('username'));
+  if (!user) return c.json({ error: 'No such user' }, 404);
+
+  const isOwner = c.get('user')?.githubUsername === user.githubUsername;
+  if (!isOwner) {
+    const settings = await db
+      .select()
+      .from(profileSettings)
+      .where(eq(profileSettings.userId, user.id))
+      .get();
+    if (!visibilityOf(settings).curve) return c.json({ error: 'Not public' }, 404);
+  }
+
+  try {
+    return c.json(
+      await fetchCurve(
+        user.id,
+        parseCurveMetric(c.req.query('metric')),
+        parseCurvePeriod(c.req.query('period')),
+        parseCurveGroupBy(c.req.query('groupBy'))
+      )
+    );
+  } catch (error) {
+    console.error(`[profile/curve] ${user.githubUsername}:`, error);
+    return c.json({ error: 'Failed to build the curve' }, 503);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET /u/:username — the page
 // ═══════════════════════════════════════════════════════════════════════════
 
 app.get('/:username', async (c) => {
   const username = c.req.param('username');
   const currentUser = c.get('user');
 
-  // Deliberately outside the cache: a 404 is one indexed lookup, and a new
-  // signup shouldn't have to wait out a TTL to exist.
-  const user = await db
-    .select()
-    .from(users)
-    .where(eq(users.githubUsername, username))
-    .limit(1);
+  // Outside the cache on purpose: a 404 is one indexed lookup, and a new
+  // signup should not have to wait out a TTL to exist.
+  const user = await fetchProfileUser(username);
 
-  if (user.length === 0) {
+  if (!user) {
     return c.html(
       <Layout
         title={`@${username} - Not Found - clawd.gg`}
         description={`@${username} hasn't joined clawd.gg yet.`}
         user={currentUser}
       >
-        <NotFound username={username} />
+        <ProfileNotFound username={username} />
       </Layout>,
       404
     );
   }
 
-  const userData = user[0]!;
-  const isOtelUser = userData.otelEnabled === true;
-  const isOwnProfile = currentUser?.githubUsername === userData.githubUsername;
+  // `?as=visitor` lets the owner read their own page as everyone else does.
+  // It is a view, not a permission: the payload for it is the public one, so
+  // the preview cannot accidentally show something the toggles have hidden.
+  const asVisitor = c.req.query('as') === 'visitor';
+  const isOwner = currentUser?.githubUsername === user.githubUsername && !asVisitor;
 
-  // The cached part, plus the owner's today panels fetched fresh alongside it.
-  // `complete` keeps a payload built during a ClickHouse outage out of the
-  // cache, so the next reload retries instead of showing an empty page for the
-  // rest of the minute.
-  const [{ profile, archetypes, derivedMetrics, peakHour, contributions, rollups, summary }, today] =
-    await Promise.all([
-      profileCache.remember(
-        `${userData.githubUsername}|${isOwnProfile ? 'own' : 'public'}`,
-        () => buildProfilePayload(userData, isOwnProfile),
-        (payload) => payload.complete,
-      ),
-      isOwnProfile ? fetchOtelToday(userData.id) : Promise.resolve(NO_TODAY),
-    ]);
+  let payload: ProfilePayload;
+  try {
+    payload = await pageCache.remember(
+      `${user.githubUsername}|${isOwner ? 'own' : 'public'}`,
+      () => buildPayload(user, isOwner),
+      (built) => built.complete
+    );
+  } catch (error) {
+    console.error(`[profile] ${username}:`, error);
+    return c.html(
+      <Layout title={`@${username} - clawd.gg`} user={currentUser}>
+        <ProfileNotFound username={username} />
+      </Layout>,
+      503
+    );
+  }
 
-  const islands: Island[] = ['contribution-tooltip'];
-  if (isOwnProfile) islands.push('analytics-chart', 'copy-share');
+  // The owner's live panels, never cached — see fetchToday.
+  const [today, pipeline] = isOwner
+    ? await Promise.all([
+        fetchToday(user.id, user.timezone).catch(() => null),
+        fetchPipeline(user.id).catch(() => null),
+      ])
+    : [null, null];
+
+  const islands: Island[] = ['copy-share'];
+  if (payload.year) islands.push('contribution-tooltip');
+  if (payload.curve) islands.push('profile-curve');
+  if (isOwner) islands.push('profile-visibility');
+
+  const appUrl = process.env.APP_URL || 'https://clawd.gg';
+  const shareUrl = `${appUrl}/u/${user.githubUsername}`;
+  // Always the PUBLIC summary, even on the owner's own page: a <meta> tag is
+  // read by crawlers and link unfurlers, and whoever the browser belongs to is
+  // not who sees it next.
+  const summary = summarise(payload.fingerprint, payload.visibility);
 
   return c.html(
     <Layout
-      title={`@${username} - clawd.gg`}
+      title={`@${user.githubUsername} - clawd.gg`}
       description={summary}
       user={currentUser}
       islands={islands}
       og={{
-        title: `@${username} on clawd.gg`,
+        title: `@${user.githubUsername} on clawd.gg`,
         description: summary,
-        image: userData.avatarUrl ?? undefined,
-        url: `${process.env.APP_URL || 'https://clawd.gg'}/u/${username}`,
+        image: `${appUrl}/u/${user.githubUsername}/card.png`,
+        url: shareUrl,
       }}
     >
-      <Profile
-        profile={profile}
-        archetypes={archetypes}
-        derivedMetrics={derivedMetrics}
-        peakHour={peakHour}
-        contributions={contributions}
-        currentUser={currentUser}
-        todayMetrics={today.todayMetrics}
-        cacheStats={rollups.cacheStats}
-        isOtelEnabled={isOtelUser}
-        languageStats={rollups.languageStats}
-        toolStats={rollups.toolStats}
-        trustStyle={rollups.trustStyle}
-        agenticStats={rollups.agenticStats}
-        terminalStats={rollups.terminalStats}
-        todayEnhanced={today.todayEnhanced}
+      <ProfilePage
+        fingerprint={payload.fingerprint}
+        identity={{
+          username: user.githubUsername,
+          avatarUrl: user.avatarUrl,
+          joinedOn: user.firstSessionDate,
+          // Owner only: a zone name is location data. ?as=visitor drops it too,
+          // which is what makes the preview an honest preview.
+          timezone: isOwner ? user.timezone : null,
+          timezoneAssumed: user.timezone === DEFAULT_TIMEZONE,
+        }}
+        year={payload.year}
+        curve={payload.curve}
+        owner={
+          isOwner
+            ? { visibility: payload.visibility, plan: payload.plan, today, pipeline }
+            : null
+        }
+        publicPlan={isOwner ? null : payload.plan}
+        shareUrl={shareUrl}
       />
     </Layout>
   );
 });
+
+/**
+ * The one sentence a crawler, a link preview and the share card get.
+ *
+ * Takes `visibility` and not just the payload, and that is the whole point.
+ * The OWNER's payload is deliberately unfiltered — they see their own hidden
+ * sections — so a summary built from the payload alone would put a hidden
+ * figure into a <meta> tag on the owner's page, and from there into whatever
+ * they paste the link into. Every section here has to clear BOTH tests: it is
+ * in this payload, and its owner has left it public.
+ *
+ * The old version of this page did not: it put "$X invested · rank #N of M"
+ * into og:description unconditionally.
+ */
+export function summarise(data: FingerprintData, visibility: Visibility): string {
+  const parts: string[] = [];
+  const show = (section: keyof Visibility) => visibility[section];
+
+  const name = show('class')
+    ? className(data.class?.rhythm ?? null, data.class?.style ?? null)
+    : null;
+  if (name) parts.push(`${name.emoji} ${name.rhythm} ${name.style}`.replace(/\s+/g, ' ').trim());
+
+  if (show('value') && data.value) {
+    parts.push(`${money(data.value.allTime)} of API-equivalent value`);
+  }
+  if (show('anatomy') && data.anatomy && data.anatomy.allTime.prompts > 0) {
+    parts.push(`${group(data.anatomy.allTime.prompts)} prompts`);
+  }
+  if (show('ultrathink') && data.ultrathink && data.ultrathink.count > 0) {
+    parts.push(`🌈 ${group(data.ultrathink.count)} ultrathinks`);
+  }
+
+  return parts.length > 0
+    ? `@${data.username} on clawd.gg · ${parts.join(' · ')}`
+    : `@${data.username} on clawd.gg`;
+}
 
 export default app;
