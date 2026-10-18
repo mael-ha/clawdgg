@@ -16,12 +16,14 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import {
   API_BASE_URL,
+  API_URL_RESOLUTION,
   CLAUDE_HISTORY_PATH,
   CLAUDE_PROJECTS_DIR,
   CLAUDE_SETTINGS_PATH,
   CONFIG_DIR,
   CONFIG_FILE,
   INSTALLED_BINARY,
+  selfArgv,
   selfCommand,
 } from "./paths";
 import {
@@ -34,20 +36,25 @@ import {
 } from "../src/lib/session-import";
 import {
   applyOtelSettings,
-  backupSettingsOnce,
+  backupSettings,
   buildHelperCommand,
+  buildStatusLineCommand,
   desiredOtelEnv,
+  detectManagedSettings,
+  isOurHelperCommand,
   loadSettings,
   planOtelSettings,
   restoreOtelSettings,
   SettingsParseError,
   settingsDir,
+  SIGNAL_SPECIFIC_KEYS,
   writeSettingsAtomic,
   type OtelOriginals,
 } from "./settings";
 import {
   applyStatusLineSetting,
   cmdStatusline,
+  cmdStatuslineReport,
   removeStatusLineSetting,
   type StatusLineMergeResult,
 } from "./statusline";
@@ -372,14 +379,14 @@ interface SettingsWriteResult {
 
 /**
  * Point Claude Code at clawd.gg. Aborts rather than overwrite a settings.json
- * we can't parse, backs it up before the first change, and asks before
- * replacing OTEL values the user set themselves.
+ * we can't parse, backs it up before writing, and asks before touching any
+ * OTEL value it does not recognise as ours.
  */
 async function writeOtelSettings(
-  binaryCommand: string,
+  argv: string[],
   assumeYes: boolean
 ): Promise<SettingsWriteResult | null> {
-  const helperCommand = buildHelperCommand(binaryCommand);
+  const helperCommand = buildHelperCommand(argv);
   const desired = desiredOtelEnv(API_BASE_URL);
 
   let loaded: Awaited<ReturnType<typeof loadSettings>>;
@@ -393,19 +400,43 @@ async function writeOtelSettings(
     throw error;
   }
 
-  const plan = planOtelSettings(loaded.settings, desired, helperCommand);
+  const plan = planOtelSettings(loaded.settings, desired, helperCommand, API_BASE_URL);
 
   if (plan.unmanaged.length > 0) {
     log.dim(`Leaving your other OTEL settings alone: ${plan.unmanaged.join(", ")}`);
   }
 
-  // Only a value we'd overwrite needs consent. Keys we don't manage are never
-  // touched, so listing them is a note, not a question.
+  // An admin-pinned OTEL key wins over anything we write, so say so before the
+  // user spends a consent on a change that will have no effect.
+  const managed = await detectManagedSettings();
+  if (managed.length > 0) {
+    log.warn("Your machine has enterprise managed settings that pin OpenTelemetry:");
+    for (const entry of managed) {
+      console.log(`    ${colors.dim}${entry.key}${colors.reset} = ${entry.value}`);
+      log.dim(`      from ${entry.path}`);
+    }
+    console.log();
+    log.dim("Those override ~/.claude/settings.json, so our block may be ignored.");
+    if (!(await confirm("Configure settings.json anyway?", assumeYes))) {
+      log.info("Left your settings.json alone.");
+      return null;
+    }
+    console.log();
+  }
+
+  // Only a value that is NOT ours needs consent. Keys we don't manage are
+  // never touched, so listing them is a note, not a question.
   if (plan.conflicts.length > 0) {
     log.warn("Your settings.json already points OpenTelemetry somewhere else:");
     for (const c of plan.conflicts) {
       console.log(`    ${colors.dim}${c.key}${colors.reset} = ${c.current}`);
       console.log(`      ${colors.dim}→ would become${colors.reset} ${c.next}`);
+      if (c.kind === "signal-specific") {
+        log.dim("      (a per-signal override beats the generic endpoint, so it has to go)");
+      }
+      if (c.kind === "static-header") {
+        log.dim("      (we won't send our Authorization header to someone else's collector)");
+      }
     }
     console.log();
     log.dim("Claude Code can only export to one endpoint, so this replaces yours.");
@@ -417,12 +448,15 @@ async function writeOtelSettings(
     }
   }
 
-  const backup = await backupSettingsOnce(CLAUDE_SETTINGS_PATH);
-  const originals = applyOtelSettings(loaded.settings, desired, helperCommand);
-  const statusLine = applyStatusLineSetting(loaded.settings, `${binaryCommand} statusline`);
+  const backup = await backupSettings(CLAUDE_SETTINGS_PATH);
+  const originals = applyOtelSettings(loaded.settings, desired, helperCommand, {
+    apiBaseUrl: API_BASE_URL,
+    replaceForeign: plan.conflicts.length > 0,
+  });
+  const statusLine = applyStatusLineSetting(loaded.settings, buildStatusLineCommand(argv));
 
-  await mkdir(settingsDir(CLAUDE_SETTINGS_PATH), { recursive: true });
-  await writeSettingsAtomic(CLAUDE_SETTINGS_PATH, loaded.settings);
+  await mkdir(settingsDir(loaded.path), { recursive: true });
+  await writeSettingsAtomic(loaded.path, loaded.settings);
 
   return {
     originals,
@@ -431,6 +465,37 @@ async function writeOtelSettings(
     removedStaticHeaders: plan.staticHeaders,
     unchanged: plan.unchanged,
   };
+}
+
+/**
+ * Take our block back out of settings.json. Shared by `disable` and `logout`,
+ * because leaving a block that authenticates with a revoked token in place
+ * would make Claude Code warn on every start.
+ *
+ * Backs up first — every write does — and reports what it chose to leave.
+ */
+async function removeOtelSettings(
+  originals: OtelOriginals | undefined
+): Promise<{ existed: boolean; outcome: ReturnType<typeof restoreOtelSettings>; statusLine: ReturnType<typeof removeStatusLineSetting> } | null> {
+  const loaded = await loadSettings(CLAUDE_SETTINGS_PATH);
+  if (!loaded.exists) return { existed: false, outcome: { removed: [], restored: [], leftAlone: [] }, statusLine: "absent" };
+
+  const statusLine = removeStatusLineSetting(loaded.settings);
+  const outcome = restoreOtelSettings(loaded.settings, originals, {
+    apiBaseUrl: API_BASE_URL,
+    desired: desiredOtelEnv(API_BASE_URL),
+  });
+
+  // Nothing of ours in there: do not rewrite the file at all. `clawdgg logout`
+  // on a machine we never set up must leave the user's own collector untouched,
+  // down to the file's mtime.
+  if (outcome.removed.length === 0 && outcome.restored.length === 0 && statusLine !== "removed") {
+    return { existed: true, outcome, statusLine };
+  }
+
+  await backupSettings(CLAUDE_SETTINGS_PATH);
+  await writeSettingsAtomic(loaded.path, loaded.settings);
+  return { existed: true, outcome, statusLine };
 }
 
 // Report what happened to the user's statusLine. We never replace one we
@@ -484,8 +549,9 @@ async function cmdSetup(flags: SetupFlags): Promise<void> {
   console.log();
 
   // 3. settings.json
+  const argv = selfArgv();
   const binaryCommand = selfCommand();
-  const written = await writeOtelSettings(binaryCommand, flags.assumeYes);
+  const written = await writeOtelSettings(argv, flags.assumeYes);
   if (!written) process.exit(1);
 
   // First-recorded wins: a second `setup` would otherwise "remember" the
@@ -507,7 +573,7 @@ async function cmdSetup(flags: SetupFlags): Promise<void> {
   log.success(`Exporter configured → ${API_BASE_URL}/otel`);
   reportStatusLineMerge(written.statusLine, binaryCommand);
 
-  if (binaryCommand !== INSTALLED_BINARY && !binaryCommand.startsWith("/")) {
+  if (argv[0] !== INSTALLED_BINARY && !argv[0]?.startsWith("/")) {
     log.warn(`settings.json now calls \`${binaryCommand}\`, which only resolves here.`);
     log.dim("    Install the binary (curl -fsSL https://clawd.gg/install | sh) and re-run setup.");
   }
@@ -533,26 +599,39 @@ async function cmdSetup(flags: SetupFlags): Promise<void> {
   console.log();
 }
 
+/** Say what `restoreOtelSettings` decided — especially what it refused to touch. */
+function reportRestore(outcome: ReturnType<typeof restoreOtelSettings>): void {
+  if (outcome.removed.length > 0) {
+    log.success("Removed our OTEL block from ~/.claude/settings.json.");
+  }
+  if (outcome.restored.length > 0) {
+    log.success(`Restored the OTEL values you had before: ${outcome.restored.join(", ")}`);
+  }
+  if (outcome.leftAlone.length > 0) {
+    log.dim(`Left alone (not ours, or changed since): ${outcome.leftAlone.join(", ")}`);
+  }
+  if (
+    outcome.removed.length === 0 &&
+    outcome.restored.length === 0 &&
+    outcome.leftAlone.length === 0
+  ) {
+    log.info("Nothing of ours was in ~/.claude/settings.json.");
+  }
+}
+
 async function cmdDisable(purge: boolean): Promise<void> {
   log.title("Turning off streaming");
 
   const config = await loadConfig();
 
   try {
-    const loaded = await loadSettings(CLAUDE_SETTINGS_PATH);
-    if (loaded.exists) {
-      const statusLineRemoval = removeStatusLineSetting(loaded.settings);
-      restoreOtelSettings(loaded.settings, config.otelOriginals);
-      await writeSettingsAtomic(CLAUDE_SETTINGS_PATH, loaded.settings);
-
-      log.success("Removed our OTEL block from ~/.claude/settings.json.");
-      if (config.otelOriginals && Object.values(config.otelOriginals).some((v) => v !== null)) {
-        log.success("Restored the OTEL values you had before.");
-      }
-      if (statusLineRemoval === "removed") log.success("Status line hook removed.");
-      if (statusLineRemoval === "not-ours") log.dim("Left your own status line alone.");
-    } else {
+    const result = await removeOtelSettings(config.otelOriginals);
+    if (!result?.existed) {
       log.info("No ~/.claude/settings.json — nothing to undo there.");
+    } else {
+      reportRestore(result.outcome);
+      if (result.statusLine === "removed") log.success("Status line hook removed.");
+      if (result.statusLine === "not-ours") log.dim("Left your own status line alone.");
     }
   } catch (error) {
     if (error instanceof SettingsParseError) {
@@ -621,15 +700,12 @@ async function cmdLogout(): Promise<void> {
   }
 
   // Our settings.json block authenticates with the token we just revoked, so
-  // leaving it in place would make Claude Code warn on every start.
+  // leaving it in place would make Claude Code warn on every start. Anything
+  // that isn't ours stays — including on a machine we never set up, where this
+  // must not touch the user's own collector at all.
   try {
-    const loaded = await loadSettings(CLAUDE_SETTINGS_PATH);
-    if (loaded.exists) {
-      removeStatusLineSetting(loaded.settings);
-      restoreOtelSettings(loaded.settings, config.otelOriginals);
-      await writeSettingsAtomic(CLAUDE_SETTINGS_PATH, loaded.settings);
-      log.success("Cleared our telemetry config from ~/.claude/settings.json.");
-    }
+    const result = await removeOtelSettings(config.otelOriginals);
+    if (result?.existed) reportRestore(result.outcome);
   } catch (error) {
     if (error instanceof SettingsParseError) {
       log.warn(`Left ~/.claude/settings.json alone: ${error.message}`);
@@ -991,15 +1067,32 @@ function renderChecks(checks: Check[]): CheckStatus {
   return worst;
 }
 
-/** Run the configured helper command exactly as Claude Code would. */
+/**
+ * Run the configured helper command exactly as Claude Code would.
+ *
+ * Hard timeout: the command comes out of settings.json, so it is whatever is in
+ * that file — possibly an interactive prompt, or something that waits on a
+ * network it cannot reach. `doctor` must always finish and report.
+ */
+const PROBE_TIMEOUT_MS = 5_000;
+
 async function probeHelper(command: string): Promise<{ ok: boolean; detail: string }> {
   try {
     const proc = Bun.spawn(["/bin/sh", "-c", command], { stdout: "pipe", stderr: "pipe" });
+    const timer = setTimeout(() => proc.kill("SIGKILL"), PROBE_TIMEOUT_MS);
+    let timedOut = false;
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
+      proc.exited.then((code) => {
+        timedOut = proc.signalCode === "SIGKILL";
+        return code;
+      }),
+    ]).finally(() => clearTimeout(timer));
+
+    if (timedOut) {
+      return { ok: false, detail: `no output after ${PROBE_TIMEOUT_MS / 1000}s — killed it` };
+    }
     if (exitCode !== 0) {
       return { ok: false, detail: `exit ${exitCode}: ${stderr.trim() || "(no output)"}` };
     }
@@ -1035,12 +1128,23 @@ async function cmdDoctor(): Promise<void> {
 
   const checks: Check[] = [];
   const config = await loadConfig();
+  const argv = selfArgv();
   const binaryCommand = selfCommand();
 
+  // 0. An ignored CLAWDGG_API_URL is worth saying out loud — otherwise "I set
+  // the env var and it still talks to clawd.gg" looks like a bug.
+  if (API_URL_RESOLUTION.rejected) {
+    checks.push({
+      status: "warn",
+      label: `Ignoring CLAWDGG_API_URL=${API_URL_RESOLUTION.rejected.value}`,
+      detail: API_URL_RESOLUTION.rejected.reason,
+    });
+  }
+
   // 1. Where we're running from.
-  if (binaryCommand === INSTALLED_BINARY) {
+  if (argv[0] === INSTALLED_BINARY && argv.length === 1) {
     checks.push({ status: "ok", label: `Binary: ${binaryCommand}` });
-  } else if (binaryCommand.startsWith("/") && !binaryCommand.includes(" ")) {
+  } else if (argv.length === 1 && argv[0]?.startsWith("/")) {
     checks.push({ status: "ok", label: `Binary: ${binaryCommand}`, detail: "not the standard install path, but absolute" });
   } else {
     checks.push({
@@ -1133,16 +1237,34 @@ async function cmdDoctor(): Promise<void> {
       });
     }
 
-    const helper = settings.otelHeadersHelper;
-    if (typeof helper !== "string" || !helper.includes("otel-headers")) {
+    // A per-signal override beats the generic endpoint, so one of these means
+    // that signal is not reaching us no matter what else looks right.
+    const signalOverrides = SIGNAL_SPECIFIC_KEYS.filter((key) => env[key] !== undefined);
+    if (signalOverrides.length > 0) {
       checks.push({
-        status: "fail",
-        label: "otelHeadersHelper is not configured",
-        detail: "without it Claude Code sends no Authorization header at all",
+        status: "warn",
+        label: "Per-signal OTEL overrides take precedence over our endpoint",
+        detail: signalOverrides.map((key) => `${key}=${env[key]}`).join("\n    "),
+        fix: "clawdgg setup",
+      });
+    }
+
+    const helper = settings.otelHeadersHelper;
+    if (typeof helper !== "string" || !isOurHelperCommand(helper)) {
+      checks.push({
+        status: typeof helper === "string" ? "warn" : "fail",
+        label:
+          typeof helper === "string"
+            ? "otelHeadersHelper is someone else's"
+            : "otelHeadersHelper is not configured",
+        detail:
+          typeof helper === "string"
+            ? helper
+            : "without it Claude Code sends no Authorization header at all",
         fix: "clawdgg setup",
       });
     } else {
-      const expected = buildHelperCommand(binaryCommand);
+      const expected = buildHelperCommand(argv);
       const probe = await probeHelper(helper);
       checks.push({
         status: probe.ok ? "ok" : "fail",
@@ -1157,6 +1279,18 @@ async function cmdDoctor(): Promise<void> {
           detail: `settings.json: ${helper}\n    this run: ${expected}`,
         });
       }
+    }
+
+    // An enterprise-managed OTEL key silently wins over everything above.
+    const managed = await detectManagedSettings();
+    if (managed.length > 0) {
+      checks.push({
+        status: "warn",
+        label: "Enterprise managed settings pin OpenTelemetry",
+        detail: managed
+          .map((entry) => `${entry.key}=${entry.value}  (${entry.path})`)
+          .join("\n    "),
+      });
     }
 
     const statusLineProbe = applyStatusLineSetting({ statusLine: settings.statusLine });
@@ -1565,6 +1699,10 @@ async function main() {
     // Run by Claude Code, not by hand.
     case "statusline":
       await cmdStatusline();
+      break;
+    // Run by `statusline` itself, detached, so the prompt never waits on a POST.
+    case "statusline-report":
+      await cmdStatuslineReport();
       break;
     case "otel-headers":
       await cmdOtelHeaders();

@@ -45,6 +45,28 @@ describe('applyStatusLineSetting', () => {
     expect(settings.statusLine).toEqual({ type: 'command', command: '~/bin/my-prompt.sh' });
   });
 
+  it('does not claim a status line that merely mentions us', () => {
+    // The old substring test claimed these, and claiming someone else's status
+    // line means deleting it on `clawdgg disable`.
+    for (const command of [
+      '~/bin/prompt.sh --theme clawdgg --no-statusline',
+      'starship prompt # clawdgg statusline',
+      '/opt/bin/statusline',
+      'clawdgg status',
+    ]) {
+      const settings: Record<string, any> = { statusLine: { type: 'command', command } };
+      expect(applyStatusLineSetting(settings)).toEqual({ action: 'conflict', existing: command });
+      expect(settings.statusLine.command).toBe(command);
+    }
+  });
+
+  it('claims a shell-quoted path to our binary', () => {
+    const command = `'/Users/Mael O'\\''Hara/.clawdgg/bin/clawdgg' statusline`;
+    expect(applyStatusLineSetting({ statusLine: { type: 'command', command } })).toEqual({
+      action: 'already-ours',
+    });
+  });
+
   it('treats a bare string status line as configured', () => {
     const foreign: Record<string, any> = { statusLine: 'starship prompt' };
     expect(applyStatusLineSetting(foreign)).toEqual({

@@ -45,9 +45,25 @@
 -- new key is the old key plus row_id, so it is strictly finer — nothing that
 -- survives in the old table can collapse in the new one.
 --
--- RUN ORDER: this migration must be applied BEFORE deploying the app code that
--- writes row_id, or every insert fails on an unknown column. Full ordered
--- runbook, including the backup step: docker/clickhouse/migrations/README-2026-10.md
+-- NO TTL ON THE NEW TABLES
+-- The old tables carry `TTL toDateTime(timestamp) + INTERVAL 365 DAY`, which
+-- silently deletes a user's first year the moment it turns 366 days old. The
+-- v2 tables have no TTL at all: this is a usage history, and the whole point
+-- of the daily_stats import is to make it reach further back, not less far.
+-- Step 0 of the runbook removes the TTL from the OLD tables too, so nothing
+-- expires in the window between the copy and the swap.
+--
+-- RUN ORDER: step 1 of README-2026-10.md adds `row_id` and every new identity
+-- column to the CURRENT tables first, so the new app can write to them while
+-- this copy runs. This file is step 3. Full ordered runbook, with the backups
+-- and the catch-up: docker/clickhouse/migrations/README-2026-10.md
+--
+-- THE COPY IS RESUMABLE AND RE-RUNNABLE. `if(row_id != '', row_id, <expr>)`
+-- keeps the hash the app already computed for a row and only computes one for
+-- the rows written before the new app was deployed. Re-running it re-copies
+-- rows that are already there, and they collapse under FINAL because they
+-- carry the same row_id — so the step-4 catch-up is just this file again with
+-- a timestamp filter.
 -- ═══════════════════════════════════════════════════════════════════════════
 
 USE clawd;
@@ -90,7 +106,6 @@ CREATE TABLE IF NOT EXISTS metrics_raw_v2 (
 ) ENGINE = ReplacingMergeTree()
 ORDER BY (user_id, metric_name, token_type, line_type, timestamp, row_id)
 PARTITION BY toYYYYMM(timestamp)
-TTL toDateTime(timestamp) + INTERVAL 365 DAY
 SETTINGS index_granularity = 8192;
 
 INSERT INTO metrics_raw_v2
@@ -124,7 +139,7 @@ SELECT
     organization_id,
     provenance,
     pricing_source,
-    substring(lower(hex(SHA256(arrayStringConcat([toString(timestamp), toString(user_id), toString(session_id), toString(metric_name), toString(model), toString(token_type), toString(line_type), toString(time_type), toString(tool), toString(decision), toString(language), toString(source), toString(query_source), toString(speed), toString(effort), toString(agent_name), toString(skill_name), toString(plugin_name), toString(marketplace_name), toString(mcp_server_name), toString(mcp_tool_name), toString(start_type), toString(terminal_type), toString(app_version), toString(account_uuid), toString(organization_id), toString(provenance)], char(31))))), 1, 32) AS row_id
+    if(row_id != '', row_id, substring(lower(hex(SHA256(arrayStringConcat([toString(timestamp), toString(user_id), toString(session_id), toString(metric_name), toString(model), toString(token_type), toString(line_type), toString(time_type), toString(tool), toString(decision), toString(language), toString(source), toString(query_source), toString(speed), toString(effort), toString(agent_name), toString(skill_name), toString(plugin_name), toString(marketplace_name), toString(mcp_server_name), toString(mcp_tool_name), toString(start_type), toString(terminal_type), toString(app_version), toString(account_uuid), toString(organization_id), toString(provenance)], char(31))))), 1, 32)) AS row_id
 FROM metrics_raw;
 
 -- ───────────────────────────────────────────────────────────────────────────
@@ -177,7 +192,6 @@ CREATE TABLE IF NOT EXISTS events_raw_v2 (
 ) ENGINE = ReplacingMergeTree()
 ORDER BY (user_id, session_id, event_name, timestamp, tool_name, row_id)
 PARTITION BY toYYYYMM(timestamp)
-TTL toDateTime(timestamp) + INTERVAL 365 DAY
 SETTINGS index_granularity = 8192;
 
 INSERT INTO events_raw_v2
@@ -223,13 +237,14 @@ SELECT
     organization_id,
     provenance,
     pricing_source,
-    substring(lower(hex(SHA256(arrayStringConcat([toString(timestamp), toString(user_id), toString(session_id), toString(event_name), toString(event_sequence), toString(tool_name), toString(tool_use_id), toString(tool_source), toString(model), toString(decision), toString(source), toString(request_id), toString(client_request_id), toString(prompt_id), toString(message_uuid), toString(command_name), toString(command_source), toString(query_source), toString(speed), toString(effort), toString(agent_name), toString(skill_name), toString(marketplace_name), toString(status_code), toString(error_type), toString(error_message), toString(provenance)], char(31))))), 1, 32) AS row_id
+    if(row_id != '', row_id, substring(lower(hex(SHA256(arrayStringConcat([toString(timestamp), toString(user_id), toString(session_id), toString(event_name), toString(event_sequence), toString(tool_name), toString(tool_use_id), toString(tool_source), toString(model), toString(decision), toString(source), toString(request_id), toString(client_request_id), toString(prompt_id), toString(message_uuid), toString(command_name), toString(command_source), toString(query_source), toString(speed), toString(effort), toString(agent_name), toString(skill_name), toString(marketplace_name), toString(status_code), toString(error_type), toString(error_message), toString(provenance)], char(31))))), 1, 32)) AS row_id
 FROM events_raw;
 
 -- ───────────────────────────────────────────────────────────────────────────
--- 3. VERIFY BEFORE STEP 4 — step 4 is the point of no easy return.
+-- 3. VERIFY BEFORE THE SWAP — see README-2026-10.md step 3 for the full set.
 --
---    Raw row counts must match exactly (the copy is 1:1, no FINAL anywhere):
+--    Raw row counts: v2 >= old (the copy is 1:1, and the app keeps inserting
+--    into the old tables while it runs, so v2 can only be behind, never ahead):
 --      SELECT count() FROM metrics_raw;     SELECT count() FROM metrics_raw_v2;
 --      SELECT count() FROM events_raw;      SELECT count() FROM events_raw_v2;
 --
@@ -242,30 +257,96 @@ FROM events_raw;
 --      SELECT count() FROM metrics_raw FINAL;   SELECT count() FROM metrics_raw_v2 FINAL;
 --      SELECT count() FROM events_raw FINAL;    SELECT count() FROM events_raw_v2 FINAL;
 --
---    Headline totals must not move (the rows that survive keep their values):
+--    Headline totals must not FALL (they may rise, as collapsed rows come back):
 --      SELECT sum(value) FROM metrics_raw FINAL WHERE metric_name = 'claude_code.token.usage';
 --      SELECT sum(value) FROM metrics_raw_v2 FINAL WHERE metric_name = 'claude_code.token.usage';
---      SELECT count() FROM events_raw FINAL WHERE event_name = 'claude_code.user_prompt';
---      SELECT count() FROM events_raw_v2 FINAL WHERE event_name = 'claude_code.user_prompt';
---    Both token sums and prompt counts may RISE if previously-collapsed rows
---    came back. They must never FALL.
--- ───────────────────────────────────────────────────────────────────────────
+--      SELECT count() FROM events_raw FINAL WHERE event_name = 'claude_code.user_prompt' AND command_source != 'builtin';
+--      SELECT count() FROM events_raw_v2 FINAL WHERE event_name = 'claude_code.user_prompt' AND command_source != 'builtin';
 
 -- ───────────────────────────────────────────────────────────────────────────
--- 4. ATOMIC SWAP. A multi-table RENAME inside one database is atomic, so no
---    query ever sees a missing table. The old tables are KEPT as
---    *_old_2026_10 for rollback — drop them only after the new shape has run
---    in prod for a while (the runbook says when).
+-- 4. SWAP, WITHOUT STOPPING THE APP.
 --
---    Run these two statements only after step 3 passes. They are commented out
---    on purpose: `clickhouse-client --multiquery < thisfile` applies steps 1-2
---    and stops, so the copy can be inspected before the swap.
+-- EXCHANGE TABLES swaps two names atomically, in one statement, per pair. No
+-- query and no insert ever sees a missing table, so the app stays up and no
+-- OTLP batch is refused. That matters more than it sounds: the OTel exporter
+-- DROPS a batch it cannot deliver, and metrics are delta temporality, so a
+-- batch refused during a maintenance window is gone — not resent. Stopping
+-- the app to swap would lose exactly the data this migration exists to protect.
+--
+-- RENAME would need the old name free and would leave a gap between the two
+-- statements. EXCHANGE has neither problem.
 -- ───────────────────────────────────────────────────────────────────────────
 
--- RENAME TABLE metrics_raw TO metrics_raw_old_2026_10, metrics_raw_v2 TO metrics_raw;
--- RENAME TABLE events_raw  TO events_raw_old_2026_10,  events_raw_v2  TO events_raw;
+-- EXCHANGE TABLES metrics_raw AND metrics_raw_v2;
+-- EXCHANGE TABLES events_raw  AND events_raw_v2;
 
--- ROLLBACK (reverses step 4 exactly; the old tables are untouched by it):
--- RENAME TABLE metrics_raw TO metrics_raw_v2, metrics_raw_old_2026_10 TO metrics_raw;
--- RENAME TABLE events_raw  TO events_raw_v2,  events_raw_old_2026_10  TO events_raw;
--- ...then redeploy the previous app image, which does not write row_id.
+-- After the exchange the names have traded places: `metrics_raw` is the v2
+-- shape the app now writes to, and `metrics_raw_v2` holds the OLD rows —
+-- including everything inserted into the old table between the copy and the
+-- exchange. Catch those up. Same expression, so it is idempotent: a row
+-- already present carries the same row_id and collapses under FINAL.
+--
+-- The column lists are explicit because the two tables no longer have the same
+-- shape (the old one still has tool_parameters, which is deliberately not
+-- copied — see 2026-10-18_add_otel_attributes.sql).
+
+-- INSERT INTO metrics_raw (timestamp, user_id, session_id, metric_name, value, model,
+--     token_type, line_type, time_type, tool, decision, language, source, query_source,
+--     speed, effort, agent_name, skill_name, plugin_name, marketplace_name,
+--     mcp_server_name, mcp_tool_name, start_type, terminal_type, app_version,
+--     account_uuid, organization_id, provenance, pricing_source, row_id)
+-- SELECT timestamp, user_id, session_id, metric_name, value, model,
+--     token_type, line_type, time_type, tool, decision, language, source, query_source,
+--     speed, effort, agent_name, skill_name, plugin_name, marketplace_name,
+--     mcp_server_name, mcp_tool_name, start_type, terminal_type, app_version,
+--     account_uuid, organization_id, provenance, pricing_source,
+--     if(row_id != '', row_id, substring(lower(hex(SHA256(arrayStringConcat([toString(timestamp), toString(user_id), toString(session_id), toString(metric_name), toString(model), toString(token_type), toString(line_type), toString(time_type), toString(tool), toString(decision), toString(language), toString(source), toString(query_source), toString(speed), toString(effort), toString(agent_name), toString(skill_name), toString(plugin_name), toString(marketplace_name), toString(mcp_server_name), toString(mcp_tool_name), toString(start_type), toString(terminal_type), toString(app_version), toString(account_uuid), toString(organization_id), toString(provenance)], char(31))))), 1, 32))
+-- FROM metrics_raw_v2
+-- WHERE timestamp >= toDateTime64({watermark:String}, 3);
+
+-- INSERT INTO events_raw (timestamp, user_id, session_id, event_name, prompt_length,
+--     tool_name, tool_success, tool_duration_ms, model, cost_usd, input_tokens,
+--     output_tokens, cache_read_tokens, cache_write_tokens, error_message, error_type,
+--     status_code, duration_ms, decision, source, tool_use_id, tool_source, prompt_id,
+--     request_id, client_request_id, message_uuid, event_sequence, query_source, speed,
+--     effort, agent_name, skill_name, marketplace_name, command_name, command_source,
+--     terminal_type, app_version, account_uuid, organization_id, provenance,
+--     pricing_source, row_id)
+-- SELECT timestamp, user_id, session_id, event_name, prompt_length,
+--     tool_name, tool_success, tool_duration_ms, model, cost_usd, input_tokens,
+--     output_tokens, cache_read_tokens, cache_write_tokens, error_message, error_type,
+--     status_code, duration_ms, decision, source, tool_use_id, tool_source, prompt_id,
+--     request_id, client_request_id, message_uuid, event_sequence, query_source, speed,
+--     effort, agent_name, skill_name, marketplace_name, command_name, command_source,
+--     terminal_type, app_version, account_uuid, organization_id, provenance,
+--     pricing_source,
+--     if(row_id != '', row_id, substring(lower(hex(SHA256(arrayStringConcat([toString(timestamp), toString(user_id), toString(session_id), toString(event_name), toString(event_sequence), toString(tool_name), toString(tool_use_id), toString(tool_source), toString(model), toString(decision), toString(source), toString(request_id), toString(client_request_id), toString(prompt_id), toString(message_uuid), toString(command_name), toString(command_source), toString(query_source), toString(speed), toString(effort), toString(agent_name), toString(skill_name), toString(marketplace_name), toString(status_code), toString(error_type), toString(error_message), toString(provenance)], char(31))))), 1, 32))
+-- FROM events_raw_v2
+-- WHERE timestamp >= toDateTime64({watermark:String}, 3);
+
+-- ROLLBACK: exchange back, then catch up the other way. The old tables are
+-- never modified by the forward path, so this is a true reversal.
+--
+-- EXCHANGE TABLES metrics_raw AND metrics_raw_v2;
+-- EXCHANGE TABLES events_raw  AND events_raw_v2;
+--
+-- ...then copy the rows the new app wrote while the v2 shape was live back into
+-- the old tables (they now answer to *_v2 again). Only the columns the OLD
+-- shape has — row_id included, since step 1 added it there:
+--
+-- INSERT INTO metrics_raw (timestamp, user_id, session_id, metric_name, value, model,
+--     token_type, line_type, time_type, tool, decision, language, source, query_source,
+--     speed, effort, agent_name, skill_name, plugin_name, marketplace_name,
+--     mcp_server_name, mcp_tool_name, start_type, terminal_type, app_version,
+--     account_uuid, organization_id, provenance, pricing_source, row_id)
+-- SELECT timestamp, user_id, session_id, metric_name, value, model,
+--     token_type, line_type, time_type, tool, decision, language, source, query_source,
+--     speed, effort, agent_name, skill_name, plugin_name, marketplace_name,
+--     mcp_server_name, mcp_tool_name, start_type, terminal_type, app_version,
+--     account_uuid, organization_id, provenance, pricing_source, row_id
+-- FROM metrics_raw_v2 WHERE timestamp >= toDateTime64({watermark:String}, 3);
+--
+-- (and the same for events_raw / events_raw_v2)
+--
+-- Then redeploy the previous app image. It does not write the new columns, and
+-- the old tables tolerate that: every one of them has a DEFAULT.

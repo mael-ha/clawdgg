@@ -1,19 +1,29 @@
 // Safe reads and writes of ~/.claude/settings.json.
 //
-// That file is the user's, not ours. Three rules follow from it:
-//   1. Unparseable JSON ABORTS. The old code caught the parse error and wrote a
-//      fresh object over the top, destroying whatever was in there.
-//   2. Every write goes through a temp file + rename, so a crash mid-write
-//      can't leave a truncated settings.json behind.
-//   3. We back it up once before our first modification, and we remember the
-//      values we overwrote so `disable` can put them back.
+// That file is the user's, not ours. The rules that follow from it:
+//   1. Unparseable JSON ABORTS. An older version caught the parse error and
+//      wrote a fresh object over the top, destroying whatever was in there.
+//   2. Every write goes through a temp file + fsync + rename, so neither a
+//      crash nor a power cut can leave a truncated settings.json behind.
+//   3. Every write is preceded by a timestamped backup (the last few are kept),
+//      not just the first one — `disable` and `logout` write too.
+//   4. We only ever modify or remove a value that is RECOGNIZABLY OURS. A
+//      foreign collector's endpoint, protocol or Authorization header is left
+//      exactly as it is unless the user says otherwise to our face.
+//   5. A value that is ours is remembered as `null`, never as an "original".
+//      Restoring one would re-point the exporter at clawd.gg on `disable` —
+//      which is what happened to anyone set up by the pre-2.0 CLI, whose static
+//      bearer and clawd.gg endpoint looked exactly like "what they had before".
 //
 // Every function here takes its paths explicitly — nothing reads homedir() —
 // so the tests run against a fixture directory instead of the real ~/.claude.
 
-import { readFile, writeFile, chmod, rename, readdir, unlink } from "node:fs/promises";
+import { open, readFile, writeFile, chmod, rename, readdir, realpath, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { basename, dirname, join } from "node:path";
+import { isOurStaticAuthHeader } from "./otel-headers";
+import { shellJoin, shellSplit } from "./shell";
 
 /** Thrown when settings.json exists but isn't valid JSON. Never swallowed. */
 export class SettingsParseError extends Error {
@@ -29,6 +39,30 @@ export class SettingsParseError extends Error {
 export interface LoadedSettings {
   exists: boolean;
   settings: Record<string, any>;
+  /**
+   * The path after symlink resolution — the file we must actually read, back up
+   * and write. `~/.claude/settings.json` is commonly a symlink into a dotfiles
+   * repo, and writing a temp file beside the LINK and renaming over it would
+   * replace the link with a regular file, silently detaching it.
+   */
+  path: string;
+}
+
+/**
+ * Resolve symlinks on the settings path, including a symlinked parent. A file
+ * that doesn't exist yet still gets its directory resolved, so the first write
+ * lands in the right place.
+ */
+export async function resolveSettingsPath(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch {
+    try {
+      return join(await realpath(dirname(path)), basename(path));
+    } catch {
+      return path;
+    }
+  }
 }
 
 /**
@@ -36,60 +70,109 @@ export interface LoadedSettings {
  * one throws SettingsParseError.
  */
 export async function loadSettings(path: string): Promise<LoadedSettings> {
-  if (!existsSync(path)) return { exists: false, settings: {} };
+  const resolved = await resolveSettingsPath(path);
+  if (!existsSync(resolved)) return { exists: false, settings: {}, path: resolved };
 
-  const raw = await readFile(path, "utf-8");
-  if (!raw.trim()) return { exists: true, settings: {} };
+  const raw = await readFile(resolved, "utf-8");
+  if (!raw.trim()) return { exists: true, settings: {}, path: resolved };
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch (error) {
-    throw new SettingsParseError(path, error);
+    throw new SettingsParseError(resolved, error);
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new SettingsParseError(path, new Error("top-level value is not an object"));
+    throw new SettingsParseError(resolved, new Error("top-level value is not an object"));
   }
-  return { exists: true, settings: parsed as Record<string, any> };
+  return { exists: true, settings: parsed as Record<string, any>, path: resolved };
 }
 
 const BACKUP_SUFFIX = ".clawdgg-backup-";
 
-/**
- * Copy settings.json aside before our first modification. Returns the backup
- * path, or null when there's nothing to back up or we already made one.
- */
-export async function backupSettingsOnce(path: string): Promise<string | null> {
-  if (!existsSync(path)) return null;
+/** How many timestamped backups to keep per settings.json. */
+export const BACKUPS_KEPT = 5;
 
-  const dir = dirname(path);
-  const base = path.slice(dir.length + 1);
+/**
+ * Copy settings.json aside. Called before EVERY write of ours, not just the
+ * first: `setup`, `disable` and `logout` all rewrite the file, and the copy
+ * that matters when something goes wrong is the one from just before.
+ *
+ * Returns the backup path, or null when there was nothing to back up.
+ */
+export async function backupSettings(
+  path: string,
+  keep: number = BACKUPS_KEPT
+): Promise<string | null> {
+  const resolved = await resolveSettingsPath(path);
+  if (!existsSync(resolved)) return null;
+
+  const dir = dirname(resolved);
+  const base = basename(resolved);
+  // The ISO stamp sorts lexicographically, which is what makes pruning simple.
+  // The suffix keeps two writes in the same millisecond from colliding.
+  const stamp = `${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`;
+  const target = join(dir, `${base}${BACKUP_SUFFIX}${stamp}`);
+
+  await writeFile(target, await readFile(resolved, "utf-8"), { mode: 0o600 });
+  await chmod(target, 0o600);
+
+  // Prune oldest first, so a long-lived install doesn't accumulate one backup
+  // per `clawdgg setup` forever.
   try {
-    const entries = await readdir(dir);
-    if (entries.some((e) => e.startsWith(`${base}${BACKUP_SUFFIX}`))) return null;
+    const prefix = `${base}${BACKUP_SUFFIX}`;
+    const backups = (await readdir(dir)).filter((name) => name.startsWith(prefix)).sort();
+    for (const stale of backups.slice(0, Math.max(0, backups.length - keep))) {
+      await unlink(join(dir, stale)).catch(() => {});
+    }
   } catch {
-    // Unreadable directory: fall through and try the copy anyway.
+    // An unreadable directory costs us the pruning, not the backup.
   }
 
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const target = `${path}${BACKUP_SUFFIX}${stamp}`;
-  await writeFile(target, await readFile(path, "utf-8"), { mode: 0o600 });
   return target;
 }
 
-/** Write settings.json via temp file + rename, 0600. */
+/**
+ * Write settings.json via temp file + fsync + rename, 0600.
+ *
+ * The temp file goes NEXT TO the resolved target: rename() is only atomic
+ * within one filesystem, and a symlinked settings.json often points at another
+ * volume. fsync before the rename is what makes "atomic" true after a crash
+ * rather than only after a clean exit.
+ */
 export async function writeSettingsAtomic(
   path: string,
   settings: Record<string, any>
 ): Promise<void> {
-  const tmp = `${path}.clawdgg-tmp-${process.pid}`;
-  await writeFile(tmp, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
+  const resolved = await resolveSettingsPath(path);
+  const tmp = `${resolved}.clawdgg-tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
+
+  const handle = await open(tmp, "w", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(settings, null, 2)}\n`, "utf-8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+
   try {
     await chmod(tmp, 0o600);
-    await rename(tmp, path);
+    await rename(tmp, resolved);
   } catch (error) {
     await unlink(tmp).catch(() => {});
     throw error;
+  }
+
+  // Durability of the rename itself. Not supported everywhere, never fatal.
+  try {
+    const dirHandle = await open(dirname(resolved), "r");
+    try {
+      await dirHandle.sync();
+    } finally {
+      await dirHandle.close();
+    }
+  } catch {
+    // Best effort.
   }
 }
 
@@ -106,13 +189,36 @@ export const MANAGED_OTEL_KEYS = [
 
 /**
  * A static bearer token in settings.json was how we did auth until the token
- * cliff of 2026-05. `setup` removes it and switches to otelHeadersHelper.
+ * cliff of 2026-05. `setup` removes ours and switches to otelHeadersHelper.
  */
 export const STATIC_HEADER_KEYS = [
   "OTEL_EXPORTER_OTLP_HEADERS",
   "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
   "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
 ] as const;
+
+/**
+ * Per-signal overrides. These WIN over the generic OTEL_EXPORTER_OTLP_* keys,
+ * so leaving one in place means our generic endpoint is quietly ignored for
+ * that signal and the data goes to whoever set it — or, worse for them, our
+ * helper's Authorization header does.
+ *
+ * Every one of these is a conflict that needs the user's answer. We never write
+ * them ourselves.
+ */
+export const SIGNAL_SPECIFIC_KEYS = [
+  "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+  "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+  "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+  "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+  "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+  "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+] as const;
+
+/** Every key in settings.json that any clawdgg version has ever touched. */
+export const ALL_TOUCHED_KEYS = [
+  ...new Set<string>([...MANAGED_OTEL_KEYS, ...STATIC_HEADER_KEYS, ...SIGNAL_SPECIFIC_KEYS]),
+];
 
 /** Dynamic headers only work on http/protobuf and http/json — not grpc. */
 export function desiredOtelEnv(apiBaseUrl: string): Record<string, string> {
@@ -125,60 +231,233 @@ export function desiredOtelEnv(apiBaseUrl: string): Record<string, string> {
   };
 }
 
-export interface OtelConflict {
-  key: string;
-  current: string;
-  next: string;
+/**
+ * The `otelHeadersHelper` value: our own argv plus the subcommand, every
+ * element shell-quoted (Claude Code runs this string through a shell, and our
+ * path comes from homedir()).
+ */
+export function buildHelperCommand(argv: readonly string[]): string {
+  return shellJoin([...argv, "otel-headers"]);
 }
 
-export interface OtelPlan {
-  /** Managed keys that already hold a different value — someone else's exporter. */
-  conflicts: OtelConflict[];
-  /** OTEL_* keys we don't manage. Their presence means a foreign collector. */
-  unmanaged: string[];
-  /** A static Authorization header is present and will be removed. */
-  staticHeaders: string[];
-  /** Nothing to do: the block is already exactly what we want. */
-  unchanged: boolean;
+/** The `statusLine.command` value. Same quoting rules. */
+export function buildStatusLineCommand(argv: readonly string[]): string {
+  return shellJoin([...argv, "statusline"]);
 }
 
 /**
+ * Does this command string invoke OUR `otel-headers`?
+ *
+ * Checked on the argv, not with a substring match: the last word has to be the
+ * subcommand, and some earlier word has to name us. `my-wrapper --log
+ * otel-headers.log` does not qualify.
+ */
+function isOurSubcommand(command: unknown, subcommand: string): boolean {
+  if (typeof command !== "string") return false;
+  const argv = shellSplit(command);
+  if (argv.length < 2 || argv[argv.length - 1] !== subcommand) return false;
+  return argv
+    .slice(0, -1)
+    .some((word) => word === "clawdgg" || /(^|[\/\\])clawdgg([.\-]|$)/.test(word) || word.includes("clawdgg"));
+}
+
+export function isOurHelperCommand(command: unknown): boolean {
+  return isOurSubcommand(command, "otel-headers");
+}
+
+export function isOurStatusLineCommand(command: unknown): boolean {
+  return isOurSubcommand(command, "statusline");
+}
+
+/** Is this endpoint value pointed at us? */
+export function isOurEndpoint(value: unknown, apiBaseUrl: string): boolean {
+  if (typeof value !== "string" || !value.trim()) return false;
+  const origin = apiBaseUrl.replace(/\/+$/, "");
+  if (!origin) return false;
+  const trimmed = value.trim();
+  return trimmed === origin || trimmed.startsWith(`${origin}/`);
+}
+
+export type Ownership = "ours" | "theirs" | "absent";
+
+export interface OtelOwnership {
+  /** Verdict per key we might touch, plus `otelHeadersHelper`. */
+  keys: Record<string, Ownership>;
+  /**
+   * The OTEL block in this file was written by clawdgg. Decided by the keys
+   * that can only be ours — the endpoint, our static bearer, our helper — and
+   * it is what lets us claim the keys that carry no fingerprint of their own
+   * (`CLAUDE_CODE_ENABLE_TELEMETRY: "1"` is just as plausibly the user's).
+   */
+  blockIsOurs: boolean;
+}
+
+/**
+ * Decide, key by key, what in this settings.json is ours.
+ *
+ * This is the function the whole file turns on: "ours" may be overwritten,
+ * removed and forgotten, "theirs" may not be touched without consent and must
+ * be restored afterwards.
+ */
+export function classifyOtelSettings(
+  settings: Record<string, any>,
+  desired: Record<string, string>,
+  apiBaseUrl: string
+): OtelOwnership {
+  const env: Record<string, any> = settings?.env ?? {};
+  const present = (key: string): boolean => {
+    const source = key === "otelHeadersHelper" ? settings : env;
+    const value = source?.[key];
+    return value !== undefined && value !== null;
+  };
+  const valueOf = (key: string): unknown =>
+    key === "otelHeadersHelper" ? settings?.[key] : env?.[key];
+
+  // Fingerprinted keys first: these alone decide whether the block is ours.
+  const endpointOurs =
+    present("OTEL_EXPORTER_OTLP_ENDPOINT") &&
+    isOurEndpoint(valueOf("OTEL_EXPORTER_OTLP_ENDPOINT"), apiBaseUrl);
+  const helperOurs = present("otelHeadersHelper") && isOurHelperCommand(valueOf("otelHeadersHelper"));
+  const headerOurs = STATIC_HEADER_KEYS.some(
+    (key) => present(key) && isOurStaticAuthHeader(valueOf(key))
+  );
+  const blockIsOurs = endpointOurs || helperOurs || headerOurs;
+
+  const keys: Record<string, Ownership> = {};
+  const verdict = (key: string, ours: boolean): void => {
+    keys[key] = !present(key) ? "absent" : ours ? "ours" : "theirs";
+  };
+
+  verdict("OTEL_EXPORTER_OTLP_ENDPOINT", endpointOurs);
+  verdict("otelHeadersHelper", helperOurs);
+  for (const key of STATIC_HEADER_KEYS) {
+    verdict(key, isOurStaticAuthHeader(valueOf(key)));
+  }
+  for (const key of SIGNAL_SPECIFIC_KEYS) {
+    if (keys[key] !== undefined) continue; // the *_HEADERS ones are judged above
+    const value = valueOf(key);
+    const ours = key.endsWith("_ENDPOINT")
+      ? isOurEndpoint(value, apiBaseUrl)
+      : // A protocol is not identifiable on its own, so it only counts as ours
+        // inside a block that already is, and only at the value we write.
+        blockIsOurs && String(value) === desired.OTEL_EXPORTER_OTLP_PROTOCOL;
+    verdict(key, ours);
+  }
+  // Everything left carries no fingerprint: "1", "otlp", "http/json".
+  for (const key of MANAGED_OTEL_KEYS) {
+    if (keys[key] !== undefined) continue;
+    verdict(key, blockIsOurs && String(valueOf(key)) === desired[key]);
+  }
+
+  return { keys, blockIsOurs };
+}
+
+export type ConflictKind = "value" | "static-header" | "signal-specific" | "managed-settings";
+
+export interface OtelConflict {
+  key: string;
+  current: string;
+  /** What it becomes if the user agrees. */
+  next: string;
+  kind: ConflictKind;
+  /** Where it lives, for a managed-settings conflict. */
+  source?: string;
+}
+
+export interface OtelPlan {
+  /** Values that are NOT ours and that `setup` would displace. Needs consent. */
+  conflicts: OtelConflict[];
+  /** OTEL_* keys we neither manage nor conflict with. Left alone, always. */
+  unmanaged: string[];
+  /** Static Authorization headers we recognise as ours; removed silently. */
+  staticHeaders: string[];
+  /** Nothing to do: the block is already exactly what we want. */
+  unchanged: boolean;
+  /** The per-key verdicts behind all of the above. */
+  ownership: OtelOwnership;
+}
+
+const REMOVED = "(removed)";
+
+/**
  * What `applyOtelSettings` would change, without changing it. Lets `setup`
- * warn and ask before it replaces a collector the user configured themselves.
+ * warn and ask before it touches anything the user configured themselves.
  */
 export function planOtelSettings(
   settings: Record<string, any>,
   desired: Record<string, string>,
-  helperCommand: string
+  helperCommand: string,
+  apiBaseUrl: string
 ): OtelPlan {
   const env: Record<string, any> = settings?.env ?? {};
+  const ownership = classifyOtelSettings(settings, desired, apiBaseUrl);
   const conflicts: OtelConflict[] = [];
 
   for (const [key, next] of Object.entries(desired)) {
-    const current = env[key];
-    if (current === undefined || current === null) continue;
-    if (String(current) !== next) conflicts.push({ key, current: String(current), next });
+    if (ownership.keys[key] !== "theirs") continue;
+    if (String(env[key]) === next) continue;
+    conflicts.push({ key, current: String(env[key]), next, kind: "value" });
   }
 
-  const managed = new Set<string>([...MANAGED_OTEL_KEYS, ...STATIC_HEADER_KEYS]);
+  // A foreign static bearer. Not deleted without an answer: it is a credential
+  // for somebody's collector, and our helper's Authorization would go there.
+  for (const key of STATIC_HEADER_KEYS) {
+    if (ownership.keys[key] !== "theirs") continue;
+    conflicts.push({ key, current: "(an Authorization header we did not write)", next: REMOVED, kind: "static-header" });
+  }
+
+  // Per-signal overrides beat our generic endpoint, so they are conflicts even
+  // when nothing else in the file is.
+  for (const key of SIGNAL_SPECIFIC_KEYS) {
+    if (ownership.keys[key] !== "theirs") continue;
+    if (conflicts.some((c) => c.key === key)) continue;
+    const shown = key.endsWith("_HEADERS") ? "(an Authorization header we did not write)" : String(env[key]);
+    conflicts.push({ key, current: shown, next: REMOVED, kind: "signal-specific" });
+  }
+
+  if (ownership.keys.otelHeadersHelper === "theirs") {
+    conflicts.push({
+      key: "otelHeadersHelper",
+      current: String(settings.otelHeadersHelper),
+      next: helperCommand,
+      kind: "value",
+    });
+  }
+
+  const managed = new Set<string>(ALL_TOUCHED_KEYS);
   const unmanaged = Object.keys(env)
-    .filter((k) => k.startsWith("OTEL_") && !managed.has(k))
+    .filter((key) => key.startsWith("OTEL_") && !managed.has(key))
     .sort();
 
-  const staticHeaders = STATIC_HEADER_KEYS.filter((k) => env[k] !== undefined && env[k] !== null);
+  const staticHeaders = STATIC_HEADER_KEYS.filter((key) => ownership.keys[key] === "ours");
 
-  const envAlreadyRight = Object.entries(desired).every(([k, v]) => String(env[k]) === v);
+  const envAlreadyRight = Object.entries(desired).every(([key, value]) => String(env[key]) === value);
+  const nothingToRemove =
+    staticHeaders.length === 0 &&
+    SIGNAL_SPECIFIC_KEYS.every((key) => ownership.keys[key] === "absent");
   const unchanged =
-    envAlreadyRight && staticHeaders.length === 0 && settings?.otelHeadersHelper === helperCommand;
+    envAlreadyRight && nothingToRemove && settings?.otelHeadersHelper === helperCommand;
 
-  return { conflicts, unmanaged, staticHeaders: [...staticHeaders], unchanged };
+  return { conflicts, unmanaged, staticHeaders: [...staticHeaders], unchanged, ownership };
 }
 
 /**
- * Previous values of everything we touched. `null` means "wasn't there", which
- * `restoreOtelSettings` turns back into a deletion rather than a literal null.
+ * Previous values of everything we touched. `null` means "wasn't there, or was
+ * ours" — `restoreOtelSettings` turns that back into a deletion rather than a
+ * literal null, and it is the whole reason a legacy install doesn't get
+ * clawd.gg's own exporter "restored" on `disable`.
  */
 export type OtelOriginals = Record<string, string | null>;
+
+export interface ApplyOptions {
+  apiBaseUrl: string;
+  /**
+   * The user agreed to displace values that are not ours. Without it,
+   * `applyOtelSettings` leaves every foreign value alone — a setup that half
+   * applies is better than one that silently breaks somebody's collector.
+   */
+  replaceForeign?: boolean;
+}
 
 /**
  * Point Claude Code's exporter at us, in place. Returns the values we
@@ -187,68 +466,181 @@ export type OtelOriginals = Record<string, string | null>;
 export function applyOtelSettings(
   settings: Record<string, any>,
   desired: Record<string, string>,
-  helperCommand: string
+  helperCommand: string,
+  options: ApplyOptions
 ): OtelOriginals {
+  const { apiBaseUrl, replaceForeign = false } = options;
+  const ownership = classifyOtelSettings(settings, desired, apiBaseUrl);
   const originals: OtelOriginals = {};
   const env: Record<string, any> = (settings.env ??= {});
 
-  const remember = (key: string, value: unknown) => {
-    originals[key] = value === undefined || value === null ? null : String(value);
+  /**
+   * Ours (or absent) is remembered as null — it is not an original, and
+   * "restoring" it would put our own exporter back on `disable`.
+   */
+  const remember = (key: string, value: unknown): void => {
+    const theirs = ownership.keys[key] === "theirs" && value !== undefined && value !== null;
+    originals[key] = theirs ? String(value) : null;
   };
 
   for (const [key, value] of Object.entries(desired)) {
+    if (ownership.keys[key] === "theirs" && !replaceForeign) continue;
     remember(key, env[key]);
     env[key] = value;
   }
 
-  // The static bearer token goes away entirely — that's the whole point of the
-  // helper. Remembered so `disable` can restore a header that wasn't ours.
-  for (const key of STATIC_HEADER_KEYS) {
-    if (env[key] === undefined || env[key] === null) continue;
+  // The static bearer goes away entirely — that's the whole point of the
+  // helper. A foreign one only goes with consent. Deduped: the per-signal
+  // *_HEADERS keys are in both lists, and visiting one twice would "remember"
+  // the value we had already deleted.
+  for (const key of new Set<string>([...STATIC_HEADER_KEYS, ...SIGNAL_SPECIFIC_KEYS])) {
+    const verdict = ownership.keys[key];
+    if (verdict === "absent") continue;
+    if (verdict === "theirs" && !replaceForeign) continue;
     remember(key, env[key]);
     delete env[key];
   }
 
-  remember("otelHeadersHelper", settings.otelHeadersHelper);
-  settings.otelHeadersHelper = helperCommand;
+  if (ownership.keys.otelHeadersHelper !== "theirs" || replaceForeign) {
+    remember("otelHeadersHelper", settings.otelHeadersHelper);
+    settings.otelHeadersHelper = helperCommand;
+  }
 
   return originals;
 }
 
-/**
- * Undo `applyOtelSettings`. Keys the user had before come back with their old
- * values; keys that only we added are deleted. With no remembered originals
- * (config lost, or set up by an older CLI) we fall back to deleting our keys.
- */
-export function restoreOtelSettings(
-  settings: Record<string, any>,
-  originals: OtelOriginals | undefined
-): void {
-  const env: Record<string, any> = settings?.env ?? {};
-  const keys = originals
-    ? Object.keys(originals)
-    : [...MANAGED_OTEL_KEYS, ...STATIC_HEADER_KEYS, "otelHeadersHelper"];
+export interface RestoreOutcome {
+  /** Keys we deleted (they were ours). */
+  removed: string[];
+  /** Keys we put a remembered value back into. */
+  restored: string[];
+  /** Keys we found changed since we wrote them, and did not touch. */
+  leftAlone: string[];
+}
 
-  for (const key of keys) {
-    const previous = originals ? originals[key] : null;
-    const target = key === "otelHeadersHelper" ? settings : env;
-    if (previous === null || previous === undefined) {
-      delete target[key];
-    } else {
-      target[key] = previous;
-    }
-  }
-
-  if (settings?.env && Object.keys(settings.env).length === 0) delete settings.env;
+export interface RestoreOptions {
+  apiBaseUrl: string;
+  desired: Record<string, string>;
 }
 
 /**
- * The `otelHeadersHelper` value: our own absolute path plus the subcommand.
- * Claude Code runs this at startup and every 29 minutes thereafter, so the
- * path has to survive shell-independent invocation — hence absolute.
+ * Undo `applyOtelSettings`.
+ *
+ * Two safety rules, both learned the hard way:
+ *   - a key is only removed or restored when its CURRENT value is still the one
+ *     we wrote. If the user has since pointed it somewhere else, it is theirs
+ *     now and we leave it.
+ *   - with no remembered originals (config lost, or an older CLI set this up)
+ *     we delete only what we recognise as ours, and touch nothing else. Running
+ *     `clawdgg logout` on a machine we never set up must not disturb the
+ *     collector that machine was already exporting to.
  */
-export function buildHelperCommand(binaryCommand: string): string {
-  return `${binaryCommand} otel-headers`;
+export function restoreOtelSettings(
+  settings: Record<string, any>,
+  originals: OtelOriginals | undefined,
+  options: RestoreOptions
+): RestoreOutcome {
+  const outcome: RestoreOutcome = { removed: [], restored: [], leftAlone: [] };
+  if (!settings || typeof settings !== "object") return outcome;
+
+  const ownership = classifyOtelSettings(settings, options.desired, options.apiBaseUrl);
+  const keys = originals
+    ? Object.keys(originals)
+    : [...ALL_TOUCHED_KEYS, "otelHeadersHelper"];
+
+  const targetFor = (key: string): Record<string, any> =>
+    key === "otelHeadersHelper" ? settings : (settings.env ??= {});
+
+  for (const key of keys) {
+    const verdict = ownership.keys[key] ?? "absent";
+    const previous = originals ? originals[key] : null;
+    const hasPrevious = previous !== null && previous !== undefined;
+
+    if (verdict === "absent") {
+      // Not in the file. If we remembered a value for it, that is BECAUSE we
+      // deleted theirs (a static bearer, a per-signal override) — so putting
+      // it back is the whole job. Nothing remembered means nothing to do.
+      if (hasPrevious) {
+        targetFor(key)[key] = previous;
+        outcome.restored.push(key);
+      }
+      continue;
+    }
+
+    if (verdict === "theirs") {
+      // Either we never wrote it, or the user changed it after we did. Both
+      // mean hands off.
+      outcome.leftAlone.push(key);
+      continue;
+    }
+
+    if (hasPrevious) {
+      targetFor(key)[key] = previous;
+      outcome.restored.push(key);
+    } else {
+      delete targetFor(key)[key];
+      outcome.removed.push(key);
+    }
+  }
+
+  if (settings.env && Object.keys(settings.env).length === 0) delete settings.env;
+  return outcome;
+}
+
+// ============= MANAGED SETTINGS =============
+
+/**
+ * Enterprise managed settings override ~/.claude/settings.json, so an OTEL key
+ * in one of these files means our write is silently ignored. Detecting it turns
+ * "setup said it worked but nothing arrives" into something `setup` and
+ * `doctor` can say out loud.
+ *
+ * CLAWDGG_MANAGED_SETTINGS overrides the search path (used by the tests).
+ */
+export function managedSettingsPaths(platform: string = process.platform): string[] {
+  const override = process.env.CLAWDGG_MANAGED_SETTINGS;
+  if (override) return override.split(":").filter(Boolean);
+  if (platform === "darwin") return ["/Library/Application Support/ClaudeCode/managed-settings.json"];
+  if (platform === "win32") return ["C:\\ProgramData\\ClaudeCode\\managed-settings.json"];
+  return ["/etc/claude-code/managed-settings.json"];
+}
+
+const MANAGED_SETTINGS_WATCHED = [
+  "CLAUDE_CODE_ENABLE_TELEMETRY",
+  ...MANAGED_OTEL_KEYS,
+  ...SIGNAL_SPECIFIC_KEYS,
+];
+
+export interface ManagedSettingsConflict {
+  path: string;
+  key: string;
+  value: string;
+}
+
+/** OTEL keys pinned by a managed-settings file, if any is readable. */
+export async function detectManagedSettings(
+  paths: string[] = managedSettingsPaths()
+): Promise<ManagedSettingsConflict[]> {
+  const found: ManagedSettingsConflict[] = [];
+
+  for (const path of paths) {
+    let parsed: any;
+    try {
+      if (!existsSync(path)) continue;
+      parsed = JSON.parse(await readFile(path, "utf-8"));
+    } catch {
+      // Unreadable or malformed: not ours to fix, and not worth an error.
+      continue;
+    }
+    const env = parsed?.env;
+    if (!env || typeof env !== "object") continue;
+    for (const key of MANAGED_SETTINGS_WATCHED) {
+      if (env[key] === undefined || env[key] === null) continue;
+      found.push({ path, key, value: String(env[key]) });
+    }
+  }
+
+  return found;
 }
 
 /** Where the backup files land, for the "we backed it up" notice. */

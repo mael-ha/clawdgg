@@ -10,13 +10,15 @@
 //   1. Nothing but the status line goes to stdout. That's why this file does
 //      not reuse index.ts's loadConfig(), which migrates legacy config dirs and
 //      prints notices — those would land inside the user's prompt.
-//   2. Nothing blocks the prompt. The POST is best-effort: short timeout, all
-//      errors swallowed, skipped entirely when there's no token or no payload.
+//   2. Nothing blocks the prompt. The report is handed to a DETACHED child
+//      process and this one exits immediately — Claude Code waits for us, so
+//      even a 1.5s timeout is 1.5s of the user staring at a half-drawn prompt.
 
 import { readFile, appendFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { API_BASE_URL, CONFIG_DIR, CONFIG_FILE } from "./paths";
+import { API_BASE_URL, CONFIG_DIR, CONFIG_FILE, selfArgv } from "./paths";
+import { isOurStatusLineCommand } from "./settings";
 import { markTokenRevoked, mergeState, readState } from "./token-state";
 import { parseRateLimits } from "../src/lib/plan-usage";
 
@@ -59,10 +61,17 @@ function statusLineCommandOf(settings: Record<string, any>): string | null {
   return null;
 }
 
-// Loose on purpose: `npx clawdgg statusline`, an absolute path to the binary and
-// `bun ~/src/clawdgg/cli/index.ts statusline` all count as ours.
+/**
+ * Ours iff the command's LAST argv word is the `statusline` subcommand and an
+ * earlier word names us. `npx clawdgg statusline`, a quoted absolute path to
+ * the binary and `bun ~/src/clawdgg/cli/index.ts statusline` all qualify.
+ *
+ * The old substring test (`includes("clawdgg") && includes("statusline")`) also
+ * claimed things like `~/bin/prompt.sh --theme clawdgg --no-statusline`, and
+ * claiming someone else's status line means deleting it on `disable`.
+ */
 function isOurStatusLine(command: string): boolean {
-  return command.includes("clawdgg") && command.includes("statusline");
+  return isOurStatusLineCommand(command);
 }
 
 /**
@@ -157,30 +166,9 @@ async function readTokenQuietly(): Promise<string | null> {
   return null;
 }
 
-async function reportPlanUsage(input: StatusLineInput): Promise<void> {
+/** The POST itself. Only ever runs in the detached child (or as its fallback). */
+async function postPlanUsage(input: StatusLineInput, token: string): Promise<void> {
   try {
-    const rateLimits = input?.rate_limits;
-    if (!rateLimits || typeof rateLimits !== "object") return;
-    if (parseRateLimits(rateLimits).windows.length === 0) return;
-
-    const token = await readTokenQuietly();
-    if (!token) return;
-
-    const nowSeconds = Math.floor(Date.now() / 1000);
-    const fingerprint = JSON.stringify(rateLimits);
-    const state = await readState();
-    if (
-      state.fingerprint === fingerprint &&
-      typeof state.lastPostAt === "number" &&
-      nowSeconds - state.lastPostAt < POST_THROTTLE_SECONDS
-    ) {
-      return;
-    }
-
-    // Record the attempt before it happens: a server that's down shouldn't get
-    // hammered on every prompt either.
-    await mergeState({ lastPostAt: nowSeconds, fingerprint });
-
     const response = await fetch(`${API_BASE_URL}/api/plan-usage`, {
       method: "POST",
       headers: {
@@ -188,9 +176,9 @@ async function reportPlanUsage(input: StatusLineInput): Promise<void> {
         Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify({
-        rate_limits: rateLimits,
+        rate_limits: input?.rate_limits,
         sessionId: input?.session_id,
-        capturedAt: nowSeconds,
+        capturedAt: Math.floor(Date.now() / 1000),
       }),
       signal: AbortSignal.timeout(POST_TIMEOUT_MS),
     });
@@ -206,6 +194,62 @@ async function reportPlanUsage(input: StatusLineInput): Promise<void> {
   }
 }
 
+/**
+ * Worth sending? Decided in the parent, because the throttle is what keeps us
+ * from spawning a process per prompt re-render.
+ */
+async function planUsageIsDue(input: StatusLineInput): Promise<string | null> {
+  try {
+    const rateLimits = input?.rate_limits;
+    if (!rateLimits || typeof rateLimits !== "object") return null;
+    if (parseRateLimits(rateLimits).windows.length === 0) return null;
+
+    const token = await readTokenQuietly();
+    if (!token) return null;
+
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const fingerprint = JSON.stringify(rateLimits);
+    const state = await readState();
+    if (
+      state.fingerprint === fingerprint &&
+      typeof state.lastPostAt === "number" &&
+      nowSeconds - state.lastPostAt < POST_THROTTLE_SECONDS
+    ) {
+      return null;
+    }
+
+    // Record the attempt before it happens: a server that's down shouldn't get
+    // hammered on every prompt either.
+    await mergeState({ lastPostAt: nowSeconds, fingerprint });
+    return token;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Hand the report to a detached copy of ourselves.
+ *
+ * Claude Code waits for the statusLine process to exit before it draws the
+ * prompt, so anything this process awaits is latency the user feels on every
+ * render. The child inherits nothing but the payload on stdin, and this
+ * process returns without waiting for it.
+ */
+function spawnReporter(raw: string): boolean {
+  try {
+    const child = Bun.spawn([...selfArgv(), "statusline-report"], {
+      stdin: new TextEncoder().encode(raw),
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    // Let this process exit while the child keeps going.
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function cmdStatusline(): Promise<void> {
   const raw = await readStdinSafely();
   await appendDebugCapture(raw);
@@ -217,8 +261,32 @@ export async function cmdStatusline(): Promise<void> {
     // Unparseable stdin still gets a status line.
   }
 
-  // Print first: the prompt gets its line even if the POST below drags.
+  // Print first, always: the prompt gets its line whatever happens below.
   process.stdout.write(`${formatStatusLine(input)}\n`);
 
-  await reportPlanUsage(input);
+  const token = await planUsageIsDue(input);
+  if (!token) return;
+
+  // If we can't spawn (a platform or a sandbox that refuses), fall back to the
+  // in-process POST rather than dropping plan usage altogether — that is the
+  // pre-2.0 behaviour, bounded by POST_TIMEOUT_MS.
+  if (!spawnReporter(raw)) await postPlanUsage(input, token);
+}
+
+/**
+ * `clawdgg statusline-report` — the detached half of the above. Not in the
+ * help: Claude Code never calls it, we do.
+ */
+export async function cmdStatuslineReport(): Promise<void> {
+  const raw = await readStdinSafely();
+  let input: StatusLineInput = {};
+  try {
+    if (raw.trim()) input = JSON.parse(raw);
+  } catch {
+    return;
+  }
+
+  const token = await readTokenQuietly();
+  if (!token) return;
+  await postPlanUsage(input, token);
 }

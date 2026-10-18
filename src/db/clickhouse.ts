@@ -87,6 +87,43 @@ export async function query<T = any>(sql: string, params?: Record<string, any>):
 }
 
 /**
+ * A UTF-16 code unit with no partner: half of a surrogate pair.
+ *
+ * Truncating a string by code units — which is what every `safeString(v, n)`
+ * at the OTLP boundary does — can cut an emoji in half and leave one behind.
+ * `JSON.stringify` then emits it as a bare `\ud83d`, and ClickHouse REJECTS
+ * THE WHOLE BATCH with CANNOT_PARSE_ESCAPE_SEQUENCE. One truncated emoji in
+ * one agent name therefore used to cost every datapoint in the export: the
+ * insert threw, the route answered 500, and a 500 is retryable to the OTel
+ * SDK, so the same doomed batch came back forever.
+ *
+ * Replacing with U+FFFD is not a lossy choice: Node already encodes a lone
+ * surrogate as U+FFFD when it converts the string to UTF-8, so this is exactly
+ * what the bytes were going to be — including the bytes the identity hash is
+ * computed over. The hash is byte-identical before and after, which is why
+ * this can live at the insert boundary without disturbing row_id.
+ */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+const ANY_SURROGATE = /[\uD800-\uDFFF]/;
+
+export function sanitizeForJson(value: string): string {
+  // Almost every value is ASCII; the cheap test keeps the regex off the hot path.
+  return ANY_SURROGATE.test(value) ? value.replace(LONE_SURROGATE, '�') : value;
+}
+
+function sanitizeRow(row: Record<string, any>): Record<string, any> {
+  let copy: Record<string, any> | null = null;
+  for (const [key, value] of Object.entries(row)) {
+    if (typeof value !== 'string') continue;
+    const clean = sanitizeForJson(value);
+    if (clean === value) continue;
+    copy ??= { ...row };
+    copy[key] = clean;
+  }
+  return copy ?? row;
+}
+
+/**
  * Insert rows into a ClickHouse table
  */
 export async function insert(table: string, rows: Record<string, any>[]): Promise<void> {
@@ -96,7 +133,7 @@ export async function insert(table: string, rows: Record<string, any>[]): Promis
   url.searchParams.set('database', CLICKHOUSE_DATABASE);
   url.searchParams.set('query', `INSERT INTO ${table} FORMAT JSONEachRow`);
 
-  const body = rows.map(row => JSON.stringify(row)).join('\n');
+  const body = rows.map(row => JSON.stringify(sanitizeRow(row))).join('\n');
 
   const response = await fetch(url.toString(), {
     method: 'POST',

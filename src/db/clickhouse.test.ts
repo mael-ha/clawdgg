@@ -9,6 +9,7 @@ import {
   eventRowId,
   identitySqlExpr,
   metricRowId,
+  sanitizeForJson,
   type EventRow,
   type MetricRow,
 } from './clickhouse';
@@ -235,6 +236,44 @@ describe('identity hash golden values', () => {
   });
 });
 
+// Found by docker/clickhouse/migrations/identity-parity.test.ts against a real
+// ClickHouse: a bare `\ud83d` in the JSON body makes ClickHouse reject the
+// ENTIRE batch (CANNOT_PARSE_ESCAPE_SEQUENCE), so one emoji truncated by
+// safeString() used to cost every datapoint in the export — and, because the
+// route answered 500 and a 500 is retryable, the same doomed batch forever.
+describe('sanitizeForJson', () => {
+  const ROCKET = '\u{1F680}';
+
+  it('replaces the half-pair a code-unit truncation leaves behind', () => {
+    const split = `abc${ROCKET}`.slice(0, 4); // what safeString(…, 4) produces
+    expect(split).toHaveLength(4);
+    expect(JSON.stringify(split)).toContain('\\ud83d');
+    expect(JSON.stringify(sanitizeForJson(split))).not.toContain('\\ud83d');
+    expect(sanitizeForJson(split)).toBe('abc�');
+  });
+
+  it('replaces a lone low surrogate too', () => {
+    expect(sanitizeForJson('\uDE80x')).toBe('�x');
+  });
+
+  it('leaves a complete pair, plain unicode and ASCII untouched', () => {
+    expect(sanitizeForJson(`a${ROCKET}b`)).toBe(`a${ROCKET}b`);
+    expect(sanitizeForJson('ユーザー')).toBe('ユーザー');
+    expect(sanitizeForJson('claude_code.token.usage')).toBe('claude_code.token.usage');
+    expect(sanitizeForJson('')).toBe('');
+  });
+
+  // The hash is computed over the JS string, which Node encodes to UTF-8 —
+  // turning a lone surrogate into U+FFFD anyway. So sanitising cannot move a
+  // row_id, which is why it is safe to do at the insert boundary.
+  it('does not change the identity hash', () => {
+    const split = `sess${ROCKET}`.slice(0, 5);
+    expect(eventRowId({ ...EVENT, session_id: split })).toBe(
+      eventRowId({ ...EVENT, session_id: sanitizeForJson(split) })
+    );
+  });
+});
+
 describe('identitySqlExpr', () => {
   const migration = readFileSync(
     join(REPO_ROOT, 'docker/clickhouse/migrations/2026-10-18_dedup_identity_v2.sql'),
@@ -342,21 +381,46 @@ describe('schema and migrations stay in sync', () => {
     }
   });
 
+  // Only the statements the migration actually executes. The commented-out
+  // swap and catch-up blocks are documentation, and they name columns and
+  // clauses the live statements must not use.
+  const liveStatements = migration
+    .split('\n')
+    .filter(line => !line.trimStart().startsWith('--'))
+    .join('\n');
+
   // "Store less": a tool's arguments are the user's content. The column is
   // gone from a fresh volume and dropped by omission from the v2 copy, which
   // is what physically removes the values prod already holds.
   it('has no tool_parameters column and never copies one', () => {
     expect(schema).not.toContain('tool_parameters String');
-    expect(migration).not.toContain('tool_parameters');
+    expect(liveStatements).not.toContain('tool_parameters');
   });
 
   it('copies the old tables without FINAL — FINAL would re-apply the broken key', () => {
-    const statements = migration
-      .split('\n')
-      .filter(line => !line.trimStart().startsWith('--'))
-      .join('\n');
-    expect(statements).toContain('FROM metrics_raw;');
-    expect(statements).toContain('FROM events_raw;');
-    expect(statements).not.toContain('FINAL');
+    expect(liveStatements).toContain('FROM metrics_raw;');
+    expect(liveStatements).toContain('FROM events_raw;');
+    expect(liveStatements).not.toContain('FINAL');
+  });
+
+  // The old tables silently delete a user's first year the moment it turns 366
+  // days old. This is a usage history; the v2 tables must not inherit that.
+  it('gives the v2 tables no TTL', () => {
+    expect(liveStatements).not.toContain('TTL');
+  });
+
+  // The copy keeps the hash the app already wrote and computes one only for
+  // rows that predate the deploy. That is what makes it re-runnable, which is
+  // what makes the step-4 catch-up safe.
+  it('preserves an existing row_id instead of recomputing it', () => {
+    expect(liveStatements.match(/if\(row_id != '', row_id,/g)).toHaveLength(2);
+  });
+
+  // Atomic per pair, and it needs neither name to be free — so the app never
+  // sees a missing table and no OTLP batch is refused during the swap.
+  it('swaps with EXCHANGE TABLES, not RENAME', () => {
+    expect(migration).toContain('EXCHANGE TABLES metrics_raw AND metrics_raw_v2;');
+    expect(migration).toContain('EXCHANGE TABLES events_raw  AND events_raw_v2;');
+    expect(migration).not.toContain('RENAME TABLE');
   });
 });
