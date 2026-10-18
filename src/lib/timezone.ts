@@ -25,29 +25,50 @@ export const DEFAULT_TIMEZONE = 'UTC';
  */
 const TIMEZONE_SHAPE = /^[A-Za-z][A-Za-z0-9_+\-]*(?:\/[A-Za-z0-9_+\-]+){0,2}$/;
 
-/** True for a name Intl recognises. Anything else is not stored. */
-export function isValidTimezone(value: unknown): value is string {
-  if (typeof value !== 'string' || value.length === 0 || value.length > 64) return false;
-  if (!TIMEZONE_SHAPE.test(value)) return false;
+/**
+ * The CANONICAL spelling of a zone Intl recognises, or null.
+ *
+ * The canonical form, not the string we were handed, because ClickHouse's
+ * `toTimeZone` is CASE-SENSITIVE and Intl is not. `europe/paris` passes
+ * `new Intl.DateTimeFormat({ timeZone })` without complaint and then fails
+ * every query with `Time zone europe/paris is not supported (BAD_ARGUMENTS)` —
+ * so storing what the client sent could take a profile down with a zone the
+ * validator had just approved. Both sides measured against a real
+ * clickhouse-local: `europe/paris` and `utc` are rejected there, and
+ * `resolvedOptions().timeZone` turns both into the spelling it accepts.
+ *
+ * It does NOT resolve aliases — `Asia/Calcutta` stays `Asia/Calcutta` rather
+ * than becoming `Asia/Kolkata` — and that is fine, because ClickHouse carries
+ * the same aliases. Case is the part the two disagree about.
+ */
+export function canonicalTimezone(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 64) return null;
+  if (!TIMEZONE_SHAPE.test(value)) return null;
   try {
     // Throws RangeError on an unknown zone. There is no cheaper check: the
     // alternative is shipping a copy of the IANA database and letting it rot.
-    new Intl.DateTimeFormat('en-US', { timeZone: value });
-    return true;
+    // The locale is irrelevant to the resolved zone, so it is left to the host.
+    return new Intl.DateTimeFormat(undefined, { timeZone: value }).resolvedOptions().timeZone;
   } catch {
-    return false;
+    return null;
   }
 }
 
+/** True for a name Intl recognises. Anything else is not stored. */
+export function isValidTimezone(value: unknown): value is string {
+  return canonicalTimezone(value) !== null;
+}
+
 /**
- * A storable zone name, or UTC.
+ * A storable zone name, in its canonical spelling, or UTC.
  *
  * Reads fall back rather than throw: a row written before this column existed,
  * or by a client that sent nonsense, must still render a profile. UTC is the
- * honest default — it is what the raw timestamps already are.
+ * honest default — it is what the raw timestamps already are. A row stored in
+ * the wrong case before canonicalTimezone existed is repaired on the way out.
  */
 export function normalizeTimezone(value: unknown): string {
-  return isValidTimezone(value) ? value : DEFAULT_TIMEZONE;
+  return canonicalTimezone(value) ?? DEFAULT_TIMEZONE;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -93,6 +93,30 @@ export async function query<T = any>(
 
   if (!response.ok) {
     const errorText = await response.text();
+
+    // A STORED TIMEZONE MUST NEVER TAKE A PROFILE DOWN.
+    //
+    // `toTimeZone` is case-sensitive and Intl is not, so a row written before
+    // canonicalTimezone() existed can hold `europe/paris` — a name Intl
+    // approved and ClickHouse answers with `Time zone europe/paris is not
+    // supported (BAD_ARGUMENTS)`, on every single query that converts. The
+    // write path now canonicalizes and probes, but the rows already written
+    // are not reachable from there, and a 503 on somebody's profile is a worse
+    // way to find out than a log line and their hours in UTC.
+    //
+    // Deliberately narrow: only when a `tz` parameter was bound, only when it
+    // is not already UTC, and only on an error that names a time zone. Anything
+    // else throws as before. The write-path probe passes its candidate under a
+    // DIFFERENT parameter name for exactly this reason — it needs the truth,
+    // not a fallback.
+    if (params?.tz && String(params.tz) !== DEFAULT_TIMEZONE && /time zone/i.test(errorText)) {
+      console.error(
+        `[ClickHouse] timezone ${params.tz} is unusable; re-reading in ${DEFAULT_TIMEZONE}:`,
+        errorText.slice(0, 200)
+      );
+      return query<T>(sql, { ...params, tz: DEFAULT_TIMEZONE }, options);
+    }
+
     console.error('[ClickHouse] Query failed:', { sql: sql.slice(0, 200), error: errorText });
     throw new Error('Database query failed');
   }
@@ -534,6 +558,27 @@ export function eventRowId(row: EventRow): string {
 // ═══════════════════════════════════════════════════════════════════════════
 // Insert Functions
 // ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Can ClickHouse actually load this zone? Asked once, on the way IN.
+ *
+ * Intl is not the same database: it accepts spellings and (in principle) zones
+ * that `toTimeZone` refuses, and a zone that gets stored anyway converts
+ * nothing and errors everything. So the write path asks the engine that will
+ * have to use it, before the value becomes a row.
+ *
+ * The parameter is named `zone` and not `tz` ON PURPOSE: `query()` retries a
+ * `tz` parameter in UTC rather than failing (see the note there), which would
+ * make this function answer `true` for every zone on earth.
+ */
+export async function probeTimezone(zone: string): Promise<boolean> {
+  try {
+    await query(`SELECT toString(toTimeZone(now(), {zone:String})) AS local`, { zone });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Insert raw metrics (from OTel)
@@ -2156,6 +2201,7 @@ export const clickhouse = {
   query,
   insert,
   healthCheck,
+  probeTimezone,
   insertMetrics,
   insertEvents,
   getUserTotals,

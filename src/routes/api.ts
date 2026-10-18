@@ -6,7 +6,7 @@ import { requireAuth, optionalAuth } from '../lib/auth-middleware';
 import type { LeaderboardEntry, LeaderboardResponse } from '../types';
 import { normalizeEpochSeconds, parseRateLimits, shouldInsertSnapshot } from '../lib/plan-usage';
 import { getModelDisplayName } from '../lib/pricing';
-import { isValidTimezone, normalizeTimezone } from '../lib/timezone';
+import { DEFAULT_TIMEZONE, canonicalTimezone, normalizeTimezone } from '../lib/timezone';
 import { getFingerprint, type FingerprintData } from '../lib/fingerprint';
 import {
   getVisibility,
@@ -554,6 +554,17 @@ api.put('/me/profile-settings', requireAuth, async (c) => {
 // An unknown zone is a 400 rather than a silent fallback to UTC: writing UTC
 // after being told 'Europe/Pariss' would leave the user looking at the wrong
 // peak hour with nothing to tell them why.
+//
+// The GET answers `isDefault` as well as the zone, because 'UTC' is ambiguous
+// on its own: the column defaults to it, so a user who has never run `clawdgg
+// setup` and a user in Reykjavík who has read identically. `clawdgg setup`
+// needs to tell those apart to decide whether to offer to set it, and the only
+// thing it can key on is whether the stored value is still the default.
+//
+// `isDefault` is therefore "the stored value is UTC", not "nobody has ever set
+// it" — distinguishing those needs a column that records WHEN it was set, and
+// nothing has asked for one. `stored` is given raw beside it so a client can
+// make its own call. The web profile reads the same way (`timezoneAssumed`).
 api.get('/me/timezone', requireAuth, async (c) => {
   const user = c.get('user');
   if (!user) return c.json({ error: 'Unauthorized' }, 401);
@@ -564,7 +575,11 @@ api.get('/me/timezone', requireAuth, async (c) => {
     .where(eq(users.id, user.id))
     .get();
 
-  return c.json({ timezone: normalizeTimezone(row?.timezone) });
+  return c.json({
+    timezone: normalizeTimezone(row?.timezone),
+    stored: row?.timezone ?? null,
+    isDefault: normalizeTimezone(row?.timezone) === DEFAULT_TIMEZONE,
+  });
 });
 
 api.put('/me/timezone', requireAuth, async (c) => {
@@ -578,19 +593,43 @@ api.put('/me/timezone', requireAuth, async (c) => {
     return c.json({ error: 'Invalid JSON body' }, 400);
   }
 
-  if (!isValidTimezone(body.timezone)) {
+  // The CANONICAL spelling is what gets stored, not what was sent. ClickHouse's
+  // toTimeZone is case-sensitive and Intl is not, so 'europe/paris' passes
+  // validation and then fails every query that converts a timestamp — see
+  // canonicalTimezone().
+  const timezone = canonicalTimezone(body.timezone);
+  if (!timezone) {
     return c.json(
       { error: 'Not an IANA timezone name', example: 'Europe/Paris' },
       400
     );
   }
 
+  // And then ask the engine that will have to use it. Intl and ClickHouse are
+  // two different copies of the zone database, and a name only one of them has
+  // is a name that converts nothing: better a 400 here than a 503 on the
+  // profile afterwards.
+  const { clickhouse } = await import('../db/clickhouse');
+  if (!(await clickhouse.probeTimezone(timezone))) {
+    return c.json(
+      {
+        error: 'That zone is not one the analytics engine can load',
+        timezone,
+        hint: 'Use a current IANA name, e.g. Europe/Paris',
+      },
+      400
+    );
+  }
+
   await db
     .update(users)
-    .set({ timezone: body.timezone, updatedAt: new Date() })
+    .set({ timezone, updatedAt: new Date() })
     .where(eq(users.id, user.id));
 
-  return c.json({ success: true, timezone: body.timezone });
+  // Every cached figure for this user was read in the OLD clock.
+  fingerprintCache.deletePrefix(`${user.id}|`);
+
+  return c.json({ success: true, timezone });
 });
 
 // POST /api/otel/disable - Mark user as OTel-disabled

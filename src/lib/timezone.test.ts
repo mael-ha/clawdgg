@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import {
   DEFAULT_TIMEZONE,
+  canonicalTimezone,
   isValidTimezone,
   localMonth,
   normalizeTimezone,
@@ -35,6 +36,49 @@ describe('isValidTimezone', () => {
     expect(isValidTimezone(42)).toBe(false);
     expect(isValidTimezone('')).toBe(false);
     expect(isValidTimezone('A'.repeat(65))).toBe(false);
+  });
+});
+
+describe('canonicalTimezone', () => {
+  /**
+   * THE BUG THIS EXISTS FOR. Intl is case-insensitive and ClickHouse's
+   * `toTimeZone` is not, so `europe/paris` used to pass validation, get stored,
+   * and then fail EVERY query that converts a timestamp with `Time zone
+   * europe/paris is not supported (BAD_ARGUMENTS)` — a 503 on the profile,
+   * caused by a value the validator had just approved. Measured on a real
+   * clickhouse-local, both halves.
+   */
+  it('fixes the case ClickHouse insists on and Intl does not', () => {
+    expect(canonicalTimezone('europe/paris')).toBe('Europe/Paris');
+    expect(canonicalTimezone('utc')).toBe('UTC');
+    expect(canonicalTimezone('AMERICA/new_york')).toBe('America/New_York');
+  });
+
+  it('leaves a name that is already canonical alone', () => {
+    for (const zone of ['UTC', 'Europe/Paris', 'Pacific/Auckland', 'Etc/GMT+5']) {
+      expect(canonicalTimezone(zone)).toBe(zone);
+    }
+  });
+
+  /**
+   * Aliases are NOT resolved, and that is deliberate: ClickHouse carries the
+   * same ones, so `Asia/Calcutta` converts there exactly as well as
+   * `Asia/Kolkata` does. Case is the only thing the two databases disagree
+   * about, so case is the only thing this normalizes.
+   */
+  it('does not rewrite an alias to its modern name', () => {
+    expect(canonicalTimezone('Asia/Calcutta')).toBe('Asia/Calcutta');
+  });
+
+  it('answers null for everything isValidTimezone rejects', () => {
+    for (const bad of ['Mars/Olympus_Mons', "UTC' OR 1=1 --", '', 'A'.repeat(65), 42, null]) {
+      expect(canonicalTimezone(bad)).toBeNull();
+    }
+  });
+
+  it('is what normalizeTimezone returns, so a stored row is repaired on read', () => {
+    expect(normalizeTimezone('europe/paris')).toBe('Europe/Paris');
+    expect(normalizeTimezone('Mars/Olympus_Mons')).toBe(DEFAULT_TIMEZONE);
   });
 });
 
