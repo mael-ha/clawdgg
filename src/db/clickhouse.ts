@@ -182,6 +182,13 @@ export async function healthCheck(): Promise<boolean> {
  *                      we never receive. Today that is only the ultrathink flag
  *                      (cli/prompt-hook.ts): the prompt text is matched on the
  *                      user's machine and only the yes/no is sent.
+ *   repair           — a token or cost datapoint REBUILT from the api_request
+ *                      event that measured it, replacing a live row the old
+ *                      sorting key had collapsed. Same measurement, recovered
+ *                      from the other table that recorded it — see
+ *                      docker/clickhouse/migrations/2026-10-19_repair_token_metrics.ts.
+ *                      It is NOT an estimate, and it counts everywhere 'live'
+ *                      counts.
  */
 export type RowProvenance =
   | 'live'
@@ -189,7 +196,8 @@ export type RowProvenance =
   | 'backfill-history'
   | 'legacy'
   | 'import'
-  | 'hook';
+  | 'hook'
+  | 'repair';
 
 export interface MetricRow {
   timestamp: string;
