@@ -27,12 +27,26 @@ const ENTRY = join(ROOT, "cli/index.ts");
 const OUT_DIR = join(ROOT, "dist/cli");
 const BUNDLE_OUT = join(ROOT, "cli/dist/clawdgg.js");
 
-/** The platforms install.sh knows how to ask for. */
+/**
+ * The platforms install.sh knows how to ask for.
+ *
+ * The -musl and -baseline variants are not optional extras: a glibc binary
+ * will not start on Alpine (a very common CI image), and a non-baseline x64
+ * binary dies with SIGILL on a CPU without AVX2 — which is most pre-2013
+ * hardware and a surprising number of cloud instances. install.sh detects
+ * both and asks for the right asset, so every one of these has to exist.
+ *
+ * No darwin baseline: Bun needs macOS 13+, which needs hardware that has AVX2.
+ */
 const RELEASE_TARGETS = [
   "bun-darwin-arm64",
   "bun-darwin-x64",
   "bun-linux-x64",
+  "bun-linux-x64-baseline",
+  "bun-linux-x64-musl",
+  "bun-linux-x64-musl-baseline",
   "bun-linux-arm64",
+  "bun-linux-arm64-musl",
 ] as const;
 
 /** `clawdgg-darwin-arm64` — what the GitHub release asset is called. */
@@ -90,15 +104,37 @@ async function bundle(version: string): Promise<void> {
   await chmod(BUNDLE_OUT, 0o755);
 }
 
-async function writeChecksums(files: string[]): Promise<void> {
+/**
+ * `sha256sum`-format checksums, written twice.
+ *
+ * dist/cli/checksums.txt rides along with the release, for anyone who wants to
+ * check a download by hand. cli/checksums/<version>.txt is the copy that gets
+ * COMMITTED and served by clawd.gg — and that one is the security property:
+ * install.sh takes the binary from GitHub and the expected hash from clawd.gg,
+ * so swapping a release asset is not enough to make anyone run it. See
+ * cli/checksums/README.md for the release order.
+ */
+async function writeChecksums(files: string[], version: string): Promise<void> {
   const lines: string[] = [];
   for (const file of files) {
     const digest = createHash("sha256").update(await Bun.file(file).bytes()).digest("hex");
     lines.push(`${digest}  ${file.slice(OUT_DIR.length + 1)}`);
   }
-  const path = join(OUT_DIR, "checksums.txt");
-  await writeFile(path, `${lines.join("\n")}\n`);
+  const body = `${lines.join("\n")}\n`;
+
+  await writeFile(join(OUT_DIR, "checksums.txt"), body);
   console.log(`→ checksums.txt`);
+
+  const committed = join(ROOT, "cli/checksums", `${version}.txt`);
+  await mkdir(join(ROOT, "cli/checksums"), { recursive: true });
+  await writeFile(committed, body);
+  console.log(
+    `→ cli/checksums/${version}.txt` +
+      (files.length === RELEASE_TARGETS.length
+        ? "  (commit this, then deploy)"
+        : `  (only ${files.length} of ${RELEASE_TARGETS.length} targets — DO NOT commit; build with --all)`)
+  );
+
   for (const line of lines) console.log(`   ${line}`);
 }
 
@@ -117,7 +153,7 @@ if (!args.includes("--bundle") || args.includes("--all")) {
   const targets = args.includes("--all") ? [...RELEASE_TARGETS] : [hostTarget()];
   const built: string[] = [];
   for (const target of targets) built.push(await compile(target, version));
-  if (args.includes("--checksums")) await writeChecksums(built);
+  if (args.includes("--checksums")) await writeChecksums(built, version);
 }
 
 console.log(`\nDone.`);

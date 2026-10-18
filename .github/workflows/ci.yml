@@ -10,17 +10,24 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# CI reads the repo and nothing else. It runs `bun install` and a test suite on
+# pull_request, which means it runs code from the branch.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Pinned to a full SHA: a tag is a pointer the action's owner can repoint.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # The typecheck gate compares against the merge base, so it needs
           # more than a shallow clone.
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: "1.3.4"
 
@@ -58,6 +65,20 @@ jobs:
           echo "$NEW"
           exit 1
 
+      # The app's own build. A page that renders without its stylesheet is a
+      # broken deploy, and the manifest is what every template resolves its
+      # asset URLs through — so its absence is the failure to catch here.
+      - name: Build the web assets
+        run: |
+          set -eu
+          bun run build
+          test -f public/build/manifest.json || {
+            echo "::error::bun run build did not produce public/build/manifest.json"
+            exit 1
+          }
+          echo "manifest:"
+          cat public/build/manifest.json
+
       - name: Compile the CLI binary for this host
         run: bun scripts/build-cli.ts
 
@@ -86,13 +107,31 @@ jobs:
           test ! -e "$FIXTURE_HOME/.config/clawdgg"
           echo "doctor left the fixture home untouched."
 
+      # The installer is the one file every user executes, and a syntax error
+      # in it is a broken `curl | sh` for everyone.
+      - name: Check install.sh
+        run: |
+          set -eu
+          sh -n scripts/install.sh
+          # Everything must be inside main(), so a truncated download of the
+          # script cannot execute a half-read function body.
+          grep -q '^main "\$@"$' scripts/install.sh
+          # TLS is pinned on the real download path.
+          grep -q "curl --proto '=https' --tlsv1.2" scripts/install.sh
+
       - name: Package the CLI for bunx
         run: |
           set -eu
           cd cli
           npm pack --dry-run 2>&1 | tee pack.txt
-          # Nothing but the bundle, the readme and the manifest may ship.
-          if grep -qE '^npm notice .*(index\.ts|settings\.ts|paths\.ts|\.test\.ts|tsconfig)' pack.txt; then
+          # Nothing but the bundle, the readme and the manifest may ship. Any
+          # .ts at all is source: naming the files individually meant every
+          # new module had to be remembered here, and two were not.
+          if grep -qE '^npm notice .*\.ts([[:space:]]|$)' pack.txt; then
             echo "::error::npm package contains CLI source it should not publish"
+            exit 1
+          fi
+          if grep -qE '^npm notice .*(tsconfig|checksums/)' pack.txt; then
+            echo "::error::npm package contains files it should not publish"
             exit 1
           fi

@@ -27,7 +27,10 @@ WORKDIR /app
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json ./
 COPY --from=builder /app/src ./src
+# cli/ carries cli/checksums/, which GET /install/checksums/<version> serves.
 COPY --from=builder /app/cli ./cli
+# scripts/install.sh is what GET /install returns.
+COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/drizzle ./drizzle
 COPY --from=builder /app/tsconfig.json ./

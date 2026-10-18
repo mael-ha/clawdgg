@@ -3,6 +3,11 @@
 node_modules
 public/build
 
+# Compiled CLI binaries — 60MB+ each, rebuilt by the release workflow, and
+# never needed in the image.
+dist
+cli/dist
+
 .git
 .claude
 data

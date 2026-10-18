@@ -5,6 +5,7 @@ import { serveStatic } from 'hono/bun';
 import auth from './routes/auth';
 import api from './routes/api';
 import cli from './routes/cli';
+import install from './routes/install';
 import otel from './routes/otel';
 import pages from './routes/index';
 import profile from './routes/profile';
@@ -57,6 +58,9 @@ app.use(
 app.use('/public/*', serveStatic({ root: './' }));
 
 // Mount routes
+// Before the rate limiter's /api/* scope and before `pages`: `curl | sh` is a
+// public, unauthenticated path and must not be able to exhaust anyone's budget.
+app.route('/install', install);
 app.route('/auth', auth);
 // Before /api so the CLI's own endpoints aren't shadowed by api's 404 handling.
 app.route('/api/cli', cli);
