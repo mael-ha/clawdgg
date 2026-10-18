@@ -31,6 +31,7 @@ import { createHash } from 'node:crypto';
 import { getModelPricing, type PricingMatchQuality } from '../lib/pricing';
 import { bucketLabel, bucketSql, type ChartGroupBy } from '../lib/chart-buckets';
 import { DEFAULT_TIMEZONE, normalizeTimezone } from '../lib/timezone';
+import { ULTRATHINK_EVENT_NAME } from '../lib/ultrathink';
 
 const CLICKHOUSE_URL = process.env.CLICKHOUSE_URL || 'http://localhost:8123';
 const CLICKHOUSE_DATABASE = process.env.CLICKHOUSE_DATABASE || 'clawd';
@@ -177,8 +178,18 @@ export async function healthCheck(): Promise<boolean> {
  *                      docker/clickhouse/migrations/2026-10-18_import_daily_stats.ts
  *   import           — reconstructed from the user's own transcripts by
  *                      `clawdgg import` (user-run, src/routes/cli.ts)
+ *   hook             — reported by a local Claude Code hook that read something
+ *                      we never receive. Today that is only the ultrathink flag
+ *                      (cli/prompt-hook.ts): the prompt text is matched on the
+ *                      user's machine and only the yes/no is sent.
  */
-export type RowProvenance = 'live' | 'backfill' | 'backfill-history' | 'legacy' | 'import';
+export type RowProvenance =
+  | 'live'
+  | 'backfill'
+  | 'backfill-history'
+  | 'legacy'
+  | 'import'
+  | 'hook';
 
 export interface MetricRow {
   timestamp: string;
@@ -571,7 +582,7 @@ export const NO_LEGACY_SQL = `provenance != 'legacy'`;
  * be mistaken for a prompt or an API call. src/db/ultrathink-events.test.ts
  * holds the read layer to that.
  */
-export const ULTRATHINK_EVENT_NAME = 'clawdgg.ultrathink';
+export { ULTRATHINK_EVENT_NAME };
 export const ULTRATHINK_EVENT_SQL = `event_name = '${ULTRATHINK_EVENT_NAME}'`;
 
 /**
@@ -876,11 +887,14 @@ export async function getLeaderboard(
 
   const entries = await query<UserTotals>(sql, { limit, offset });
 
-  // Get total count
+  // Everyone with a PROMPT in the period, which is what the board ranks on.
+  // Without the predicate this counted users with any row at all, including
+  // ones whose only rows are synthetic (an ultrathink flag is not an entrant).
   const countSql = `
     SELECT count(DISTINCT user_id) as total
     FROM events_raw FINAL
     WHERE ${dateFilter}
+      AND ${PROMPT_EVENT_SQL}
   `;
   const countResult = await query<{ total: number }>(countSql);
   const total = countResult[0]?.total ?? 0;

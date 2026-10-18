@@ -20,6 +20,7 @@ import {
   revokeDeviceToken,
 } from '../lib/session';
 import {
+  ULTRATHINK_EVENT_NAME,
   eventRowId,
   insertEvents,
   insertMetrics,
@@ -30,6 +31,7 @@ import {
 } from '../db/clickhouse';
 import {
   computeCostUsd,
+  fmtTs,
   isBuiltinSlashCommand,
   type ImportEventRow,
   type ImportMetricRow,
@@ -250,6 +252,10 @@ const ALLOWED_EVENT_NAMES = new Set([
   'claude_code.user_prompt',
   'claude_code.api_request',
   'claude_code.tool_result',
+  // The ultrathink flag, matched on the client against the user's own history.
+  // It carries no payload at all beyond a timestamp and a session id — see
+  // src/lib/ultrathink.ts for why the match cannot happen here.
+  ULTRATHINK_EVENT_NAME,
 ]);
 
 /** Claude Code 2.1.117+ user_prompt attribution. */
@@ -320,6 +326,16 @@ export interface ImportDeps {
   cutoffMs: number;
   /** UTC days (YYYY-MM-DD) that already hold rows of ANY provenance. */
   coveredDays: Set<string>;
+  /**
+   * UTC days that already hold an ultrathink flag.
+   *
+   * A SEPARATE question from `coveredDays`, because a day being counted for
+   * prompts says nothing about whether its flags were recorded — and for every
+   * user who imported before the counter existed, every day is covered. Judging
+   * flags by the prompt-coverage set would mean the ultrathink count could
+   * never be filled in for anyone's existing history.
+   */
+  ultrathinkDays: Set<string>;
   insertEvents(rows: EventRow[]): Promise<void>;
   insertMetrics(rows: MetricRow[]): Promise<void>;
 }
@@ -574,10 +590,15 @@ export async function runImport(
 ): Promise<ImportResult> {
   const sanitized = sanitizeImportRows(userId, body, deps.cutoffMs);
 
-  const eventDays = dropCoveredDays(sanitized.events, deps.coveredDays);
+  // The two kinds of row answer to different coverage sets — see ImportDeps.
+  const flags = sanitized.events.filter((row) => row.event_name === ULTRATHINK_EVENT_NAME);
+  const measured = sanitized.events.filter((row) => row.event_name !== ULTRATHINK_EVENT_NAME);
+
+  const eventDays = dropCoveredDays(measured, deps.coveredDays);
+  const flagDays = dropCoveredDays(flags, deps.ultrathinkDays);
   const metricDays = dropCoveredDays(sanitized.metrics, deps.coveredDays);
 
-  const events = dropDuplicates(eventDays.kept, eventRowId);
+  const events = dropDuplicates([...eventDays.kept, ...flagDays.kept], eventRowId);
   const metrics = dropDuplicates(metricDays.kept, metricRowId);
 
   if (events.kept.length > 0) await deps.insertEvents(events.kept);
@@ -590,7 +611,7 @@ export async function runImport(
     skippedAfterCutoff: sanitized.skippedAfterCutoff,
     skippedBeforeEpoch: sanitized.skippedBeforeEpoch,
     skippedBuiltinCommand: sanitized.skippedBuiltinCommand,
-    skippedCoveredDay: eventDays.skipped + metricDays.skipped,
+    skippedCoveredDay: eventDays.skipped + flagDays.skipped + metricDays.skipped,
     skippedDuplicate: events.skipped + metrics.skipped,
     clamped: sanitized.clamped,
     ignoredClientMetrics: sanitized.ignoredClientMetrics,
@@ -663,6 +684,22 @@ async function computeImportCutoff(userId: string, otelSetupAt: Date | null): Pr
   return valid.length > 0 ? Math.min(...valid) : Date.now();
 }
 
+/** Every UTC day this user already holds an ultrathink flag on. */
+async function fetchUltrathinkDays(userId: string): Promise<Set<string>> {
+  const days = new Set<string>();
+  const rows = await query<{ day: string }>(
+    `SELECT DISTINCT toString(toDate(timestamp)) AS day
+     FROM events_raw
+     WHERE user_id = {userId:String} AND event_name = {eventName:String}`,
+    { userId, eventName: ULTRATHINK_EVENT_NAME }
+  );
+  for (const row of rows) {
+    const day = toDayString(row.day);
+    if (day) days.add(day);
+  }
+  return days;
+}
+
 /**
  * The covered-day set, cached for the life of one `clawdgg import` run.
  *
@@ -674,25 +711,38 @@ async function computeImportCutoff(userId: string, otelSetupAt: Date | null): Pr
 const IMPORT_RUN_TTL_MS = 30 * 60 * 1000;
 const RUN_ID_RE = /^[0-9a-zA-Z-]{1,64}$/;
 
-const importRuns = new Map<string, { days: Set<string>; expiresAt: number }>();
+interface RunCoverage {
+  days: Set<string>;
+  ultrathinkDays: Set<string>;
+}
 
-async function coveredDaysForRun(userId: string, runId: unknown): Promise<Set<string>> {
+const importRuns = new Map<string, { coverage: RunCoverage; expiresAt: number }>();
+
+async function fetchRunCoverage(userId: string): Promise<RunCoverage> {
+  const [days, ultrathinkDays] = await Promise.all([
+    fetchCoveredDays(userId),
+    fetchUltrathinkDays(userId),
+  ]);
+  return { days, ultrathinkDays };
+}
+
+async function coveredDaysForRun(userId: string, runId: unknown): Promise<RunCoverage> {
   const now = Date.now();
   for (const [key, entry] of importRuns) {
     if (entry.expiresAt <= now) importRuns.delete(key);
   }
 
   if (typeof runId !== 'string' || !RUN_ID_RE.test(runId)) {
-    return fetchCoveredDays(userId);
+    return fetchRunCoverage(userId);
   }
 
   const key = `${userId}:${runId}`;
   const cached = importRuns.get(key);
-  if (cached) return cached.days;
+  if (cached) return cached.coverage;
 
-  const days = await fetchCoveredDays(userId);
-  importRuns.set(key, { days, expiresAt: now + IMPORT_RUN_TTL_MS });
-  return days;
+  const coverage = await fetchRunCoverage(userId);
+  importRuns.set(key, { coverage, expiresAt: now + IMPORT_RUN_TTL_MS });
+  return coverage;
 }
 
 /**
@@ -773,14 +823,15 @@ cli.post(
       .get();
 
     try {
-      const [cutoffMs, coveredDays] = await Promise.all([
+      const [cutoffMs, coverage] = await Promise.all([
         computeImportCutoff(user.id, row?.otelSetupAt ?? null),
         coveredDaysForRun(user.id, payload.runId),
       ]);
 
       const result = await runImport(user.id, body, {
         cutoffMs,
-        coveredDays,
+        coveredDays: coverage.days,
+        ultrathinkDays: coverage.ultrathinkDays,
         insertEvents,
         insertMetrics,
       });
@@ -796,6 +847,129 @@ cli.post(
       console.error('[cli/import] failed:', error);
       return c.json({ error: 'Import failed' }, 500);
     }
+  }
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POST /api/cli/ultrathink — one prompt contained the word. That is all.
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Body: { session_id, timestamp, ultrathink: true }. There is no field for the
+// prompt, its length, or a hash of it, and the hook that posts this
+// (cli/prompt-hook.ts) never puts one in: the match happens on the user's
+// machine and only the answer travels.
+//
+// Idempotent for free. The row's identity is its timestamp + session + event
+// name + provenance (eventRowId), so a retry — or a second report of the same
+// prompt — hashes identically and ReplacingMergeTree collapses it. Two
+// DIFFERENT prompts in the same session in the same millisecond also collapse,
+// which is the right trade: nobody types two prompts in a millisecond, and the
+// alternative is accepting a client-chosen id that could be varied to inflate
+// the count.
+
+const ULTRATHINK_BODY_LIMIT = 2 * 1024;
+
+/** A report may be this far ahead of our clock before we call it nonsense. */
+const ULTRATHINK_FUTURE_SLACK_MS = 10 * 60 * 1000;
+
+/**
+ * One prompt a second, sustained, per user. A fast typist sends a few hundred
+ * prompts a day and only the ultrathink ones report at all, so this bounds a
+ * loop rather than a user.
+ */
+const ULTRATHINK_RATE_WINDOW_MS = 60 * 1000;
+const ULTRATHINK_RATE_MAX = 60;
+
+const ultrathinkRates = new Map<string, { count: number; windowEndsAt: number }>();
+
+export function checkUltrathinkRate(
+  userId: string,
+  now: number = Date.now()
+): { ok: boolean; retryAfterSeconds: number } {
+  for (const [key, entry] of ultrathinkRates) {
+    if (entry.windowEndsAt <= now) ultrathinkRates.delete(key);
+  }
+
+  const entry = ultrathinkRates.get(userId);
+  if (!entry || entry.windowEndsAt <= now) {
+    ultrathinkRates.set(userId, { count: 1, windowEndsAt: now + ULTRATHINK_RATE_WINDOW_MS });
+    return { ok: true, retryAfterSeconds: 0 };
+  }
+
+  entry.count++;
+  if (entry.count > ULTRATHINK_RATE_MAX) {
+    return { ok: false, retryAfterSeconds: Math.ceil((entry.windowEndsAt - now) / 1000) };
+  }
+  return { ok: true, retryAfterSeconds: 0 };
+}
+
+/**
+ * Validate one report into a row, or explain why not. Exported for the tests.
+ *
+ * The timestamp is the client's, bounded on both sides: a row predating Claude
+ * Code is a clock problem or a forgery, and one in the future would park a flag
+ * in a week that has not happened and move the header figure when it arrives.
+ */
+export function buildUltrathinkRow(
+  userId: string,
+  body: unknown,
+  now: number = Date.now()
+): { row: EventRow } | { error: string } {
+  const payload = (body ?? {}) as Record<string, unknown>;
+  if (payload.ultrathink !== true) return { error: 'Expected { ultrathink: true }' };
+
+  const raw = payload.timestamp;
+  const ms = typeof raw === 'string' ? Date.parse(raw) : NaN;
+  if (!Number.isFinite(ms)) return { error: 'Invalid timestamp' };
+  if (ms < EARLIEST_PLAUSIBLE_MS) return { error: 'Timestamp predates Claude Code' };
+  if (ms > now + ULTRATHINK_FUTURE_SLACK_MS) return { error: 'Timestamp is in the future' };
+
+  return {
+    row: {
+      timestamp: fmtTs(new Date(ms)),
+      user_id: userId,
+      session_id: safeIdentifier(payload.session_id, 256),
+      event_name: ULTRATHINK_EVENT_NAME,
+      provenance: 'hook',
+    },
+  };
+}
+
+cli.post(
+  '/ultrathink',
+  requireBearerAuth,
+  bodyLimit({
+    maxSize: ULTRATHINK_BODY_LIMIT,
+    onError: (c) => c.json({ error: 'Request body too large' }, 413),
+  }),
+  async (c) => {
+    const user = c.get('user');
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+    const rate = checkUltrathinkRate(user.id);
+    if (!rate.ok) {
+      c.header('Retry-After', String(rate.retryAfterSeconds));
+      return c.json({ error: 'Too many reports', retryAfter: rate.retryAfterSeconds }, 429);
+    }
+
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    const built = buildUltrathinkRow(user.id, body);
+    if ('error' in built) return c.json({ error: built.error }, 400);
+
+    try {
+      await insertEvents([built.row]);
+    } catch (error) {
+      console.error('[cli/ultrathink] insert failed:', error);
+      return c.json({ error: 'Could not record it' }, 500);
+    }
+
+    return c.json({ success: true });
   }
 );
 

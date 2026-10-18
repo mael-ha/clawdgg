@@ -39,6 +39,7 @@ import {
   applyOtelSettings,
   backupSettings,
   buildHelperCommand,
+  buildPromptHookCommand,
   buildStatusLineCommand,
   desiredOtelEnv,
   detectManagedSettings,
@@ -59,6 +60,14 @@ import {
   removeStatusLineSetting,
   type StatusLineMergeResult,
 } from "./statusline";
+import {
+  applyPromptHookSetting,
+  cmdPromptHook,
+  cmdPromptHookReport,
+  hasOurPromptHook,
+  removePromptHookSetting,
+  type PromptHookMergeResult,
+} from "./prompt-hook";
 import {
   deviceTokenId,
   isDeviceToken,
@@ -394,6 +403,7 @@ function showConsent(): void {
   console.log(`${plus} which tools ran, whether each succeeded, and how long it took`);
   console.log(`${plus} lines added/removed, commits, PRs, and active time`);
   console.log(`${plus} your Pro/Max limit percentages ${dim("(5h / 7d), via the status line")}`);
+  console.log(`${plus} whether a prompt said "ultrathink" ${dim("— a local hook checks each prompt for the word 'ultrathink'; only a yes/no leaves your machine")}`);
   console.log();
   console.log(`${colors.bright}What we store — the names ${dim("(read this part)")}${colors.reset}`);
   console.log(`${plus} your Anthropic ${colors.bright}account id${colors.reset} and ${colors.bright}organization id${colors.reset}`);
@@ -425,6 +435,7 @@ interface SettingsWriteResult {
   originals: OtelOriginals;
   backup: string | null;
   statusLine: StatusLineMergeResult;
+  promptHook: PromptHookMergeResult;
   removedStaticHeaders: string[];
   unchanged: boolean;
 }
@@ -506,6 +517,7 @@ async function writeOtelSettings(
     replaceForeign: plan.conflicts.length > 0,
   });
   const statusLine = applyStatusLineSetting(loaded.settings, buildStatusLineCommand(argv));
+  const promptHook = applyPromptHookSetting(loaded.settings, buildPromptHookCommand(argv));
 
   await mkdir(settingsDir(loaded.path), { recursive: true });
   await writeSettingsAtomic(loaded.path, loaded.settings);
@@ -514,6 +526,7 @@ async function writeOtelSettings(
     originals,
     backup,
     statusLine,
+    promptHook,
     removedStaticHeaders: plan.staticHeaders,
     unchanged: plan.unchanged,
   };
@@ -528,11 +541,24 @@ async function writeOtelSettings(
  */
 async function removeOtelSettings(
   originals: OtelOriginals | undefined
-): Promise<{ existed: boolean; outcome: ReturnType<typeof restoreOtelSettings>; statusLine: ReturnType<typeof removeStatusLineSetting> } | null> {
+): Promise<{
+  existed: boolean;
+  outcome: ReturnType<typeof restoreOtelSettings>;
+  statusLine: ReturnType<typeof removeStatusLineSetting>;
+  promptHook: ReturnType<typeof removePromptHookSetting>;
+} | null> {
   const loaded = await loadSettings(CLAUDE_SETTINGS_PATH);
-  if (!loaded.exists) return { existed: false, outcome: { removed: [], restored: [], leftAlone: [] }, statusLine: "absent" };
+  if (!loaded.exists) {
+    return {
+      existed: false,
+      outcome: { removed: [], restored: [], leftAlone: [] },
+      statusLine: "absent",
+      promptHook: "absent",
+    };
+  }
 
   const statusLine = removeStatusLineSetting(loaded.settings);
+  const promptHook = removePromptHookSetting(loaded.settings);
   const outcome = restoreOtelSettings(loaded.settings, originals, {
     apiBaseUrl: API_BASE_URL,
     desired: desiredOtelEnv(API_BASE_URL),
@@ -541,13 +567,18 @@ async function removeOtelSettings(
   // Nothing of ours in there: do not rewrite the file at all. `clawdgg logout`
   // on a machine we never set up must leave the user's own collector untouched,
   // down to the file's mtime.
-  if (outcome.removed.length === 0 && outcome.restored.length === 0 && statusLine !== "removed") {
-    return { existed: true, outcome, statusLine };
+  if (
+    outcome.removed.length === 0 &&
+    outcome.restored.length === 0 &&
+    statusLine !== "removed" &&
+    promptHook !== "removed"
+  ) {
+    return { existed: true, outcome, statusLine, promptHook };
   }
 
   await backupSettings(CLAUDE_SETTINGS_PATH);
   await writeSettingsAtomic(loaded.path, loaded.settings);
-  return { existed: true, outcome, statusLine };
+  return { existed: true, outcome, statusLine, promptHook };
 }
 
 // Report what happened to the user's statusLine. We never replace one we
@@ -566,6 +597,31 @@ function reportStatusLineMerge(result: StatusLineMergeResult, command: string): 
   console.log(`  ${colors.dim}To sync plan usage too, call${colors.reset} ${colors.cyan}${command} statusline${colors.reset} ${colors.dim}from your own`);
   console.log(`  status line, or set${colors.reset} ${colors.cyan}"statusLine": { "type": "command", "command": "${command} statusline" }${colors.reset}`);
   console.log(`  ${colors.dim}in ${CLAUDE_SETTINGS_PATH}.${colors.reset}`);
+  console.log();
+}
+
+/**
+ * Say what happened to the prompt hook.
+ *
+ * Unlike the status line there is no conflict case: hooks are a list, so ours
+ * runs alongside anyone else's. The only thing that can go wrong is a
+ * `hooks.UserPromptSubmit` we do not recognise the shape of, which we refuse to
+ * reshape — guessing at someone's hook configuration is how one gets destroyed.
+ */
+function reportPromptHookMerge(result: PromptHookMergeResult, command: string): void {
+  if (result.action === "already-ours") return;
+
+  if (result.action === "added") {
+    log.success("Ultrathink counter registered — a local hook, checking for one word.");
+    log.dim("    It prints nothing, blocks nothing, and sends only yes or no.");
+    return;
+  }
+
+  log.warn("Your settings.json has a hooks.UserPromptSubmit we don't recognise,");
+  log.dim("    so we left it alone and the ultrathink counter is off.");
+  console.log();
+  console.log(`  ${colors.dim}To turn it on, add${colors.reset} ${colors.cyan}{ "type": "command", "command": "${command} prompt-hook" }${colors.reset}`);
+  console.log(`  ${colors.dim}to that hook's own list in ${CLAUDE_SETTINGS_PATH}.${colors.reset}`);
   console.log();
 }
 
@@ -663,6 +719,7 @@ async function cmdSetup(flags: SetupFlags): Promise<void> {
   }
   log.success(`Exporter configured → ${API_BASE_URL}/otel`);
   reportStatusLineMerge(written.statusLine, binaryCommand);
+  reportPromptHookMerge(written.promptHook, binaryCommand);
 
   if (argv[0] !== INSTALLED_BINARY && !argv[0]?.startsWith("/")) {
     log.warn(`settings.json now calls \`${binaryCommand}\`, which only resolves here.`);
@@ -729,6 +786,7 @@ async function cmdDisable(purge: boolean): Promise<void> {
       reportRestore(result.outcome);
       if (result.statusLine === "removed") log.success("Status line hook removed.");
       if (result.statusLine === "not-ours") log.dim("Left your own status line alone.");
+      if (result.promptHook === "removed") log.success("Ultrathink prompt hook removed.");
     }
   } catch (error) {
     if (error instanceof SettingsParseError) {
@@ -1411,6 +1469,18 @@ async function cmdDoctor(): Promise<void> {
     } else {
       checks.push({ status: "warn", label: "No status line — plan usage isn't reporting", fix: "clawdgg setup" });
     }
+
+    // The ultrathink counter. A missing hook is a warn, not a fail: nothing
+    // else depends on it, and the number it feeds is simply absent without it.
+    if (hasOurPromptHook(settings)) {
+      checks.push({ status: "ok", label: 'Ultrathink counter registered (UserPromptSubmit)' });
+    } else {
+      checks.push({
+        status: "warn",
+        label: "No ultrathink counter — that number won't move",
+        fix: "clawdgg setup",
+      });
+    }
   }
 
   // 4. Server side: is the token good, and is anything arriving?
@@ -1853,6 +1923,17 @@ async function main() {
     // Run by `statusline` itself, detached, so the prompt never waits on a POST.
     case "statusline-report":
       await cmdStatuslineReport();
+      break;
+    // Claude Code's UserPromptSubmit hook. Prints NOTHING: on this event
+    // anything on stdout is injected into Claude's context.
+    case "prompt-hook":
+      await cmdPromptHook();
+      break;
+    // Run by `prompt-hook` itself, detached, for the same reason as above. The
+    // report travels on the argv, not stdin — see spawnReporter in
+    // cli/prompt-hook.ts for the measurement behind that.
+    case "prompt-hook-report":
+      await cmdPromptHookReport(args[1]);
       break;
     case "otel-headers":
       await cmdOtelHeaders();

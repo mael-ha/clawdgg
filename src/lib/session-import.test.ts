@@ -13,6 +13,7 @@ import {
   withoutWireOnlyFields,
   type MapOptions,
 } from './session-import';
+import { ULTRATHINK_EVENT_NAME, containsUltrathink } from './ultrathink';
 
 const OPTS: MapOptions = {
   userId: 'github_1',
@@ -561,5 +562,101 @@ describe('Haiku 5.5 prompt-length tier reaches the rows', () => {
     );
     // priced at the high tier: 60000*0.50 + 60000*0.05 per MTok
     expect(out.events[0]!.cost_usd).toBeCloseTo((60_000 * 0.5 + 60_000 * 0.05) / 1e6, 10);
+  });
+});
+
+
+describe('the ultrathink flag', () => {
+  const names = (events: { event_name: string }[]) => events.map((e) => e.event_name);
+
+  it('rides alongside a transcript prompt that used the word', () => {
+    const { events } = mapLine(userLine('ultrathink this refactor'), OPTS);
+    expect(names(events)).toEqual(['claude_code.user_prompt', ULTRATHINK_EVENT_NAME]);
+  });
+
+  it('is absent from a prompt that did not', () => {
+    expect(names(mapLine(userLine('just do it'), OPTS).events)).toEqual([
+      'claude_code.user_prompt',
+    ]);
+  });
+
+  // Same timestamp and session as its prompt, and nothing else at all: the row
+  // exists to be counted, not to describe anything.
+  it('carries no trace of the prompt', () => {
+    const { events } = mapLine(userLine('ultrathink the secret plan'), OPTS);
+    const flag = events[1]!;
+    expect(flag.timestamp).toBe(events[0]!.timestamp);
+    expect(flag.session_id).toBe(events[0]!.session_id);
+    expect(flag.prompt_length).toBeUndefined();
+    expect(JSON.stringify(flag)).not.toContain('secret');
+  });
+
+  it('is not emitted for a dropped built-in command', () => {
+    const line = userLine('<command-name>/compact</command-name> ultrathink');
+    expect(mapLine(line, OPTS).events).toEqual([]);
+  });
+
+  // Subagent prompts are orchestrator-written, not typed, so neither the prompt
+  // nor its flag is a human saying "ultrathink".
+  it('is not emitted for a subagent or sidechain prompt', () => {
+    expect(mapLine(userLine('ultrathink'), { ...OPTS, isSubagentFile: true }).events).toEqual([]);
+    expect(mapLine(userLine('ultrathink', { isSidechain: true }), OPTS).events).toEqual([]);
+  });
+
+  it('comes out of history.jsonl too, counted and never quoted', () => {
+    const history = [
+      JSON.stringify({ timestamp: 1772359200000, display: 'ultrathink the migration', sessionId: 's1' }),
+      JSON.stringify({ timestamp: 1772359260000, display: 'now ship it', sessionId: 's1' }),
+    ].join('\n');
+
+    const result = mapHistoryText(history, { userId: 'github_1', provenance: 'import' });
+    expect(result.ultrathinks).toBe(1);
+    expect(names(result.events)).toEqual([
+      'claude_code.user_prompt',
+      ULTRATHINK_EVENT_NAME,
+      'claude_code.user_prompt',
+    ]);
+    expect(JSON.stringify(result.events)).not.toContain('migration');
+  });
+
+  it('is dropped with its prompt when history repeats an up-arrow', () => {
+    const line = JSON.stringify({ timestamp: 1772359200000, display: 'ultrathink', sessionId: 's1' });
+    const result = mapHistoryText([line, line].join('\n'), {
+      userId: 'github_1',
+      provenance: 'import',
+    });
+    expect(result.droppedDuplicate).toBe(1);
+    expect(result.ultrathinks).toBe(1);
+    expect(result.events).toHaveLength(2);
+  });
+
+  /**
+   * One source per day, flags included. Both sources describe the same prompts
+   * and their timestamps differ by milliseconds, so keeping both would count
+   * every flag twice on a day the transcripts still cover.
+   */
+  it('takes a day\'s flags from the transcript, or from history, never both', () => {
+    const transcript = mapLine(userLine('ultrathink this'), OPTS).events;
+    const history = mapHistoryText(
+      [
+        // Same day as the transcript line (2026-03-01), plus a day it misses.
+        JSON.stringify({ timestamp: Date.parse('2026-03-01T10:00:05Z'), display: 'ultrathink again', sessionId: 's1' }),
+        JSON.stringify({ timestamp: Date.parse('2026-02-01T10:00:00Z'), display: 'ultrathink older', sessionId: 's0' }),
+      ].join('\n'),
+      { userId: 'github_1', provenance: 'import' }
+    ).events;
+
+    const filled = fillPromptGapsFromHistory(transcript, history);
+    expect(filled.gapDays).toEqual(['2026-02-01']);
+    // Only the uncovered day's rows survive — its prompt and its flag.
+    expect(filled.events.map((e) => e.timestamp.slice(0, 10))).toEqual(['2026-02-01', '2026-02-01']);
+    expect(names(filled.events)).toEqual(['claude_code.user_prompt', ULTRATHINK_EVENT_NAME]);
+  });
+});
+
+describe('one matcher, shared by the hook and the import', () => {
+  it('is the same function both sources call', () => {
+    expect(containsUltrathink('ultrathink')).toBe(true);
+    expect(containsUltrathink('ultrathinking')).toBe(false);
   });
 });

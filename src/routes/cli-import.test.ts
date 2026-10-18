@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'bun:test';
 import {
+  buildUltrathinkRow,
   checkImportRate,
+  checkUltrathinkRate,
   dropCoveredDays,
   dropDuplicates,
   EARLIEST_PLAUSIBLE_MS,
@@ -12,22 +14,28 @@ import {
   type ImportDeps,
 } from './cli';
 import { computeCostUsd, mapLine, type MapOptions } from '../lib/session-import';
-import { eventRowId, type EventRow, type MetricRow } from '../db/clickhouse';
+import {
+  ULTRATHINK_EVENT_NAME,
+  eventRowId,
+  type EventRow,
+  type MetricRow,
+} from '../db/clickhouse';
 
 const USER = 'github_1';
 const CUTOFF = Date.parse('2026-05-06T00:00:00.000Z');
 
 /**
- * A ClickHouse stand-in. The day-coverage set is what the real endpoint
+ * A ClickHouse stand-in. The two day-coverage sets are what the real endpoint
  * computes from the raw tables before the batch is processed.
  */
-function stubStore(coveredDays: string[] = []) {
+function stubStore(coveredDays: string[] = [], ultrathinkDays: string[] = []) {
   const events: EventRow[] = [];
   const metrics: MetricRow[] = [];
 
   const deps: ImportDeps = {
     cutoffMs: CUTOFF,
     coveredDays: new Set(coveredDays),
+    ultrathinkDays: new Set(ultrathinkDays),
     insertEvents: async (rows) => { events.push(...rows); },
     insertMetrics: async (rows) => { metrics.push(...rows); },
   };
@@ -475,6 +483,7 @@ describe('runImport', () => {
     const result = await runImport(USER, { events: [], metrics: [] }, {
       cutoffMs: CUTOFF,
       coveredDays: new Set(),
+      ultrathinkDays: new Set(),
       insertEvents: async () => { called++; },
       insertMetrics: async () => { called++; },
     });
@@ -576,5 +585,234 @@ describe('checkImportRate', () => {
     for (let i = 0; i < 301; i++) checkImportRate(a, now);
     expect(checkImportRate(a, now).ok).toBe(false);
     expect(checkImportRate(b, now).ok).toBe(true);
+  });
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The ultrathink flag
+// ═══════════════════════════════════════════════════════════════════════════
+
+const ultrathinkEvent = (overrides: Record<string, unknown> = {}) => ({
+  timestamp: '2026-03-01 10:00:00.000',
+  session_id: 's1',
+  event_name: ULTRATHINK_EVENT_NAME,
+  ...overrides,
+});
+
+describe('sanitizeImportRows — ultrathink flags', () => {
+  it('accepts a flag and stamps it as imported', () => {
+    const { events, rejected } = sanitizeImportRows(USER, { events: [ultrathinkEvent()] }, CUTOFF);
+    expect(rejected).toBe(0);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.event_name).toBe(ULTRATHINK_EVENT_NAME);
+    expect(events[0]!.provenance).toBe('import');
+    expect(events[0]!.user_id).toBe(USER);
+  });
+
+  // The row has no payload at all beyond when and where. Anything a client
+  // tried to attach must not survive, least of all a prompt or its length.
+  it('keeps nothing a client attaches to a flag', () => {
+    const { events } = sanitizeImportRows(
+      USER,
+      {
+        events: [
+          ultrathinkEvent({
+            prompt_length: 9999,
+            model: 'claude-opus-5',
+            cost_usd: 1000,
+            input_tokens: 1e9,
+            prompt: 'the secret text',
+          }),
+        ],
+      },
+      CUTOFF
+    );
+    const row = events[0]!;
+    expect(row.prompt_length).toBeUndefined();
+    expect(row.cost_usd).toBeUndefined();
+    expect(row.input_tokens).toBeUndefined();
+    expect(JSON.stringify(row)).not.toContain('secret');
+  });
+
+  it('derives no cost or token metrics from a flag', () => {
+    const { metrics } = sanitizeImportRows(USER, { events: [ultrathinkEvent()] }, CUTOFF);
+    expect(metrics).toEqual([]);
+  });
+
+  it('refuses a flag outside the same window as every other row', () => {
+    const early = sanitizeImportRows(
+      USER,
+      { events: [ultrathinkEvent({ timestamp: '2024-01-01 10:00:00.000' })] },
+      CUTOFF
+    );
+    expect(early.skippedBeforeEpoch).toBe(1);
+
+    const late = sanitizeImportRows(
+      USER,
+      { events: [ultrathinkEvent({ timestamp: '2026-06-01 10:00:00.000' })] },
+      CUTOFF
+    );
+    expect(late.skippedAfterCutoff).toBe(1);
+  });
+});
+
+describe('runImport — flags answer to their own coverage set', () => {
+  /**
+   * The case that matters: everyone who imported before the counter existed has
+   * every day already covered for prompts. Judging flags by that set would mean
+   * their ultrathink count could never be filled in.
+   */
+  it('inserts a flag on a day already covered for prompts', async () => {
+    const store = stubStore(['2026-03-01'], []);
+    const result = await runImport(
+      USER,
+      { events: [event(), ultrathinkEvent()] },
+      store.deps
+    );
+
+    expect(store.events.map((e) => e.event_name)).toEqual([ULTRATHINK_EVENT_NAME]);
+    expect(result.skippedCoveredDay).toBe(1); // the prompt, not the flag
+  });
+
+  it('skips a flag on a day that already holds one', async () => {
+    const store = stubStore([], ['2026-03-01']);
+    const result = await runImport(USER, { events: [ultrathinkEvent()] }, store.deps);
+
+    expect(store.events).toEqual([]);
+    expect(result.skippedCoveredDay).toBe(1);
+  });
+
+  it('is a no-op run twice, because the row identity is deterministic', async () => {
+    const first = stubStore();
+    await runImport(USER, { events: [ultrathinkEvent()] }, first.deps);
+    expect(first.events).toHaveLength(1);
+
+    // Same batch again, now that the day holds a flag.
+    const second = stubStore([], ['2026-03-01']);
+    await runImport(USER, { events: [ultrathinkEvent()] }, second.deps);
+    expect(second.events).toEqual([]);
+
+    // And even without the day guard, the identity collapses it.
+    expect(eventRowId(first.events[0]!)).toBe(
+      eventRowId({ ...first.events[0]!, session_id: 's1' })
+    );
+  });
+
+  it('drops a flag duplicated inside one batch', async () => {
+    const store = stubStore();
+    const result = await runImport(
+      USER,
+      { events: [ultrathinkEvent(), ultrathinkEvent()] },
+      store.deps
+    );
+    expect(store.events).toHaveLength(1);
+    expect(result.skippedDuplicate).toBe(1);
+  });
+});
+
+describe('buildUltrathinkRow', () => {
+  const NOW = Date.parse('2026-10-18T09:00:00.000Z');
+
+  it('builds a row from the flag, the session and the time', () => {
+    const built = buildUltrathinkRow(
+      USER,
+      { session_id: 's1', timestamp: '2026-10-18T08:59:30.250Z', ultrathink: true },
+      NOW
+    );
+    expect('row' in built).toBe(true);
+    if (!('row' in built)) return;
+    expect(built.row).toEqual({
+      timestamp: '2026-10-18 08:59:30.250',
+      user_id: USER,
+      session_id: 's1',
+      event_name: ULTRATHINK_EVENT_NAME,
+      provenance: 'hook',
+    });
+  });
+
+  it('refuses a report that does not claim the flag', () => {
+    expect(buildUltrathinkRow(USER, { timestamp: '2026-10-18T09:00:00.000Z' }, NOW)).toHaveProperty(
+      'error'
+    );
+    expect(
+      buildUltrathinkRow(USER, { timestamp: '2026-10-18T09:00:00.000Z', ultrathink: 'yes' }, NOW)
+    ).toHaveProperty('error');
+    expect(buildUltrathinkRow(USER, {}, NOW)).toHaveProperty('error');
+    expect(buildUltrathinkRow(USER, null, NOW)).toHaveProperty('error');
+  });
+
+  it.each([
+    ['not a date', 'nonsense'],
+    ['a number', 1_760_000_000_000 as unknown as string],
+    ['nothing', undefined as unknown as string],
+  ])('refuses %s as a timestamp', (_label, timestamp) => {
+    expect(buildUltrathinkRow(USER, { timestamp, ultrathink: true }, NOW)).toHaveProperty('error');
+  });
+
+  // A flag in the future would park itself in a week that has not happened and
+  // move the header figure when it arrives.
+  it('refuses a timestamp beyond the clock slack, and one predating Claude Code', () => {
+    expect(
+      buildUltrathinkRow(USER, { timestamp: '2026-10-18T09:30:00.000Z', ultrathink: true }, NOW)
+    ).toHaveProperty('error');
+    expect(
+      buildUltrathinkRow(USER, { timestamp: '2024-01-01T00:00:00.000Z', ultrathink: true }, NOW)
+    ).toHaveProperty('error');
+  });
+
+  it('allows a small amount of clock skew', () => {
+    expect(
+      buildUltrathinkRow(USER, { timestamp: '2026-10-18T09:05:00.000Z', ultrathink: true }, NOW)
+    ).toHaveProperty('row');
+  });
+
+  it('never takes the user id from the payload', () => {
+    const built = buildUltrathinkRow(
+      USER,
+      { user_id: 'github_someone_else', timestamp: '2026-10-18T09:00:00.000Z', ultrathink: true },
+      NOW
+    );
+    if (!('row' in built)) throw new Error('expected a row');
+    expect(built.row.user_id).toBe(USER);
+  });
+
+  it('reduces a session id to a charset that cannot carry SQL', () => {
+    const built = buildUltrathinkRow(
+      USER,
+      { session_id: "s1'; DROP TABLE events_raw --", timestamp: '2026-10-18T09:00:00.000Z', ultrathink: true },
+      NOW
+    );
+    if (!('row' in built)) throw new Error('expected a row');
+    expect(built.row.session_id).toBe('s1DROPTABLEevents_raw--');
+  });
+});
+
+describe('checkUltrathinkRate', () => {
+  it('allows a normal prompt rate and stops a loop', () => {
+    const user = `rate_${Math.random()}`;
+    const now = Date.now();
+    for (let i = 0; i < 60; i++) {
+      expect(checkUltrathinkRate(user, now).ok).toBe(true);
+    }
+    const blocked = checkUltrathinkRate(user, now);
+    expect(blocked.ok).toBe(false);
+    expect(blocked.retryAfterSeconds).toBeGreaterThan(0);
+  });
+
+  it('opens a fresh window after the old one passes', () => {
+    const user = `rate_${Math.random()}`;
+    const now = Date.now();
+    for (let i = 0; i < 61; i++) checkUltrathinkRate(user, now);
+    expect(checkUltrathinkRate(user, now + 61_000).ok).toBe(true);
+  });
+
+  it('counts each user separately', () => {
+    const now = Date.now();
+    const a = `rate_a_${Math.random()}`;
+    const b = `rate_b_${Math.random()}`;
+    for (let i = 0; i < 61; i++) checkUltrathinkRate(a, now);
+    expect(checkUltrathinkRate(a, now).ok).toBe(false);
+    expect(checkUltrathinkRate(b, now).ok).toBe(true);
   });
 });

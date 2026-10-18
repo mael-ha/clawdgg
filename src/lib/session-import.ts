@@ -35,6 +35,7 @@ import {
   splitCacheCreationTokens,
   type PricingMatchQuality,
 } from "./pricing";
+import { ULTRATHINK_EVENT_NAME, containsUltrathink } from "./ultrathink";
 
 export type Provenance = "live" | "backfill" | "backfill-history" | "import";
 
@@ -315,7 +316,8 @@ export function mapLine(line: any, opts: MapOptions): MapLineResult {
     // OTEL does NOT emit as user_prompt events.
     if (opts.isSubagentFile || isSidechain) return out;
     const content = line?.message?.content;
-    if (opts.excludeBuiltinSlashPrompts !== false && isBuiltinSlashCommand(contentText(content))) {
+    const text = contentText(content);
+    if (opts.excludeBuiltinSlashPrompts !== false && isBuiltinSlashCommand(text)) {
       return out;
     }
     out.events.push({
@@ -323,6 +325,12 @@ export function mapLine(line: any, opts: MapOptions): MapLineResult {
       event_name: "claude_code.user_prompt",
       prompt_length: contentLength(content),
     });
+    // The ultrathink flag, decided here and nowhere else. The transcript is the
+    // better source than history.jsonl for a day it still covers: it holds the
+    // prompt as submitted, with no up-arrow repeats to collapse.
+    if (containsUltrathink(text)) {
+      out.events.push({ ...base, event_name: ULTRATHINK_EVENT_NAME });
+    }
     return out;
   }
 
@@ -499,9 +507,19 @@ export interface HistoryResult {
   droppedEmpty: number;
   droppedOutOfWindow: number;
   droppedDuplicate: number;
+  /** Prompts that contained the word "ultrathink". A count, from a yes/no. */
+  ultrathinks: number;
 }
 
-/** Map history.jsonl text. Prompt text is used for filtering only, never emitted. */
+/**
+ * Map history.jsonl text. Prompt text is used for filtering only, never emitted.
+ *
+ * Including the ultrathink flag: the word is matched HERE, on the user's own
+ * machine, and what leaves is a second event row carrying a timestamp and a
+ * session id — no text, no length, no hash. It is the same matcher the live
+ * hook uses (src/lib/ultrathink.ts), so an imported month and a live month mean
+ * the same thing.
+ */
 export function mapHistoryText(raw: string, opts: HistoryOptions): HistoryResult {
   const result: HistoryResult = {
     events: [],
@@ -510,6 +528,7 @@ export function mapHistoryText(raw: string, opts: HistoryOptions): HistoryResult
     droppedEmpty: 0,
     droppedOutOfWindow: 0,
     droppedDuplicate: 0,
+    ultrathinks: 0,
   };
 
   const seen = new Set<string>();
@@ -554,14 +573,26 @@ export function mapHistoryText(raw: string, opts: HistoryOptions): HistoryResult
     }
     seen.add(key);
 
-    result.events.push({
+    const base = {
       timestamp: fmtTs(ts),
       user_id: opts.userId,
       session_id: sessionId,
+      provenance: opts.provenance,
+    };
+
+    result.events.push({
+      ...base,
       event_name: "claude_code.user_prompt",
       prompt_length: display.length,
-      provenance: opts.provenance,
     });
+
+    // A separate row rather than a column on the prompt: there is no OTEL
+    // attribute for this, so a live flag has nowhere else to go either, and one
+    // storage shape for both sources is what keeps the counts comparable.
+    if (containsUltrathink(display)) {
+      result.ultrathinks++;
+      result.events.push({ ...base, event_name: ULTRATHINK_EVENT_NAME });
+    }
   }
 
   return result;

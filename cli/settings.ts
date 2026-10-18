@@ -245,6 +245,11 @@ export function buildStatusLineCommand(argv: readonly string[]): string {
   return shellJoin([...argv, "statusline"]);
 }
 
+/** The `hooks.UserPromptSubmit[].hooks[].command` value. Same quoting rules. */
+export function buildPromptHookCommand(argv: readonly string[]): string {
+  return shellJoin([...argv, "prompt-hook"]);
+}
+
 /**
  * Does this command string invoke OUR `otel-headers`?
  *
@@ -267,6 +272,10 @@ export function isOurHelperCommand(command: unknown): boolean {
 
 export function isOurStatusLineCommand(command: unknown): boolean {
   return isOurSubcommand(command, "statusline");
+}
+
+export function isOurPromptHookCommand(command: unknown): boolean {
+  return isOurSubcommand(command, "prompt-hook");
 }
 
 /** Is this endpoint value pointed at us? */
