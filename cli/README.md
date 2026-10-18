@@ -36,7 +36,8 @@ Then **restart Claude Code** and visit [clawd.gg](https://clawd.gg).
 | `clawdgg doctor` | Why isn't my data showing up? |
 | `clawdgg import` | Backfill history from your local transcripts |
 | `clawdgg login` | Link your GitHub account |
-| `clawdgg logout` | Revoke the token and clear local state |
+| `clawdgg logout` | Revoke **this machine's** token and clear local state |
+| `clawdgg devices` | List your machines (`revoke <id>`, `revoke --all`, `rename <id> <name>`) |
 | `clawdgg disable` | Stop streaming (`--purge` also deletes `~/.config/clawdgg`) |
 | `clawdgg version` | Print the version |
 
@@ -50,28 +51,65 @@ Two more commands exist for Claude Code to call, not you: `statusline` (reports 
 
 Auth goes through `otelHeadersHelper`, Claude Code's hook for dynamic headers: it runs `clawdgg otel-headers` at startup and every 29 minutes, and that command prints your bearer token from `~/.config/clawdgg/config.json` (mode 0600). No credential is ever written into `settings.json`.
 
-That indirection is the point. The old design baked a token into `OTEL_EXPORTER_OTLP_HEADERS`; when the token was revoked, the exporter 401'd forever in silence and months of data went missing. A helper that exits non-zero makes Claude Code show a startup warning instead. `clawdgg doctor` checks the same thing from the other end, including whether the server has actually received anything recently.
+That indirection is the point. The old design baked a token into `OTEL_EXPORTER_OTLP_HEADERS`; when the token was revoked, the exporter 401'd forever in silence and months of data went missing. Now a revoked token makes `otel-headers` exit non-zero, so Claude Code shows a startup warning instead. `clawdgg doctor` checks the same thing from the other end, including whether the server has actually received anything recently.
 
-`clawdgg import` reads the transcripts Claude Code already keeps in `~/.claude/projects/` (and `~/.claude/history.jsonl` for days whose transcripts have rotated away) and sends the metrics telemetry would have sent. It only covers time before telemetry was switched on, the server enforces that boundary, and running it twice imports nothing the second time.
+`clawdgg import` reads the transcripts Claude Code already keeps in `~/.claude/projects/` (and `~/.claude/history.jsonl` for days whose transcripts have rotated away) and sends the counts telemetry would have sent. It only covers time before telemetry was switched on, the server enforces that boundary, and running it twice imports nothing the second time — any day already on record is skipped whole.
+
+Your uploaded rows are priced by the server, not by the CLI: cost is recomputed from the model and token counts with the shared pricing table, so the number on the leaderboard is one nobody's machine chose.
+
+## Devices
+
+Each `clawdgg login` mints a token for that machine alone.
+
+```bash
+clawdgg devices                  # list them, with "this machine" marked
+clawdgg devices revoke <id>      # log out one machine
+clawdgg devices revoke --all     # log out every machine
+clawdgg devices rename <id> <name>
+```
+
+`clawdgg logout` revokes only the machine you run it on. If you are still on a pre-2.0 token, `clawdgg doctor` says so — that format can only be revoked for every machine at once, and `clawdgg login` upgrades it.
 
 ## Privacy
 
-What gets sent:
+This is the authoritative list, written against the columns the server actually
+stores. `clawdgg setup` prints it and waits for your yes.
 
-- timestamps, model names, session ids
-- token counts (input / output / cache) and the cost they imply
-- how long your prompts were — the character count, not the text
-- which tools ran, whether they succeeded, how long they took
-- lines added/removed, commit counts
-- your Claude Code version, terminal, and Pro/Max limit percentages
+### What we store — the numbers
 
-What never leaves your machine:
+- timestamps and session ids
+- which model ran, and token counts (input / output / cache read / cache write)
+- cost — the API-equivalent price Claude Code computes, not what you pay
+- how long each prompt was: the character count, never the text
+- which tools ran, whether each succeeded, and how long it took
+- lines added/removed, commits, PRs, and active time
+- your Pro/Max limit percentages (5h / 7d), via the status line
+
+### What we store — the names
+
+Read this part. Some of it is more revealing than a number.
+
+- your Anthropic **account id** and **organization id**
+- tool names, and the names of agents, skills and plugins you run
+- **MCP server and MCP tool names** — these can name internal systems
+- slash command names — a custom command's name, not its content
+- the language of files you edit, and whether you accepted each edit
+- your Claude Code version and terminal
+- error messages, with absolute file paths stripped out server-side
+
+### What never leaves your machine
 
 - your prompts (we store the length, never the words)
-- file contents, code, diffs, file paths
-- tool arguments, environment variables, secrets
+- Claude's responses
+- tool parameters — no command lines, no file paths, no arguments
+- file contents, code, diffs
+- environment variables, secrets
 
-`clawdgg setup` prints this list and waits for you to agree. `clawdgg disable` turns streaming off and restores any OpenTelemetry settings you had before — it remembers what it replaced. Your settings.json is backed up to `settings.json.clawdgg-backup-<timestamp>` before the first change, and if that file ever fails to parse, clawdgg aborts rather than overwrite it.
+`clawdgg import` sends the same fields and nothing more.
+
+`clawdgg disable` turns streaming off and restores any OpenTelemetry settings you had before — it remembers what it replaced, and it only ever touches a value it can recognise as its own. It stops the stream; it does not delete what is already on clawd.gg. Ask and we will.
+
+Your settings.json is copied to `settings.json.clawdgg-backup-<timestamp>` before **every** write (the last five are kept), and if that file ever fails to parse, clawdgg aborts rather than overwrite it.
 
 ## Files
 
@@ -79,14 +117,18 @@ What never leaves your machine:
 |------|------|
 | `~/.clawdgg/bin/clawdgg` | the binary |
 | `~/.config/clawdgg/config.json` | auth token, mode 0600 |
+| `~/.config/clawdgg/statusline-state.json` | throttle + "this token was revoked" flag |
 | `~/.claude/settings.json` | the OTEL block and the two hooks |
+| `~/.claude/settings.json.clawdgg-backup-*` | a copy from before each of our writes |
 
 ## Environment variables
 
-- `CLAWDGG_API_URL` — override the API URL (default: `https://clawd.gg`)
+- `CLAWDGG_API_URL` — override the API URL. **Ignored by a release binary** unless `CLAWDGG_DEV=1` is also set, and it must be https or loopback. Your token is pinned to the origin that issued it and is never sent anywhere else.
+- `CLAWDGG_DEV=1` — allow the override above
 - `CLAWDGG_BIN` — override the path clawdgg registers for its own hooks
 - `CLAWDGG_INSTALL_DIR` — where `install.sh` puts the binary
 - `CLAWDGG_VERSION` — install a specific release
+- `CLAWDGG_DOWNLOAD_BASE` — fetch the binary from a mirror instead of GitHub Releases (must be https)
 
 ## Links
 

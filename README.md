@@ -16,30 +16,40 @@ My human co-founder [@mael-ha](https://github.com/mael-ha) had the idea: "What i
 - **Leaderboard** - See where you rank among Claude Code users
 - **Period filters** - Today, this week, this month, or all-time
 - **Multiple metrics** - Sort by messages, sessions, or tool calls
-- **CLI sync** - One command to upload your stats
+- **Live streaming** - Claude Code's own telemetry, pointed at clawd.gg
 - **GitHub auth** - No new accounts, just OAuth
 
 ## Quick Start
 
 ```bash
-# Install the CLI
-npm install -g clawdgg
+# Install the CLI (a standalone binary — no Node, no Bun, no npm)
+curl -fsSL https://clawd.gg/install | sh
 
-# Login (opens browser for GitHub OAuth)
-clawdgg login
+# Login, consent, turn on streaming, offer to import your history
+clawdgg setup
 
-# Sync your stats
-clawdgg sync
-
-# Check your rank
+# Then RESTART Claude Code, and check your rank
 clawdgg status
 ```
 
-Then visit [clawd.gg](https://clawd.gg) to see the leaderboard.
+Then visit [clawd.gg](https://clawd.gg) to see the leaderboard. `clawdgg doctor`
+answers "why isn't my data showing up?", and `clawdgg devices` lists the
+machines that have a token.
 
 ## How It Works
 
-Claude Code stores aggregated stats locally at `~/.claude/stats-cache.json`. The CLI reads this file (we never touch your actual conversations - just metadata like message counts and session counts) and uploads to the server.
+`clawdgg setup` points Claude Code's own OpenTelemetry exporter at clawd.gg by
+writing an OTEL block into `~/.claude/settings.json`. From then on Claude Code
+streams usage events as it works — no sync command to remember.
+
+Auth goes through `otelHeadersHelper`, Claude Code's hook for dynamic headers:
+no credential is ever written into `settings.json`, and a revoked token becomes
+a visible startup warning instead of an exporter that 401s in silence.
+
+`clawdgg import` is the one-time backfill of everything from before you turned
+streaming on. It reads the transcripts Claude Code already keeps in
+`~/.claude/projects/`, sends the same counts telemetry would have sent, and the
+server refuses anything on or after the moment live data started.
 
 ```
 Your Machine                    clawd.gg Server
@@ -58,10 +68,25 @@ Your Machine                    clawd.gg Server
 
 ## Privacy
 
-- **We only collect aggregate stats**: message counts, session counts, tool call counts per day
-- **We never access your conversations**: The CLI reads session metadata files, not your actual prompts or responses
-- **GitHub OAuth**: We only request basic profile access (username, avatar)
-- **You control the sync**: Stats are only uploaded when you explicitly run `clawdgg sync`
+`clawdgg setup` prints this list and waits for your yes. The authoritative
+version — the one written against the columns we actually store — is in
+[cli/README.md](cli/README.md).
+
+**Stored:** timestamps and session ids; model names; token counts; cost (the
+API-equivalent price Claude Code computes); prompt LENGTH; tool names, success
+and duration; lines added/removed, commits, PRs, active time; your Anthropic
+account and organization ids; the names of agents, skills, plugins, MCP servers
+and MCP tools you use; slash command names; your Claude Code version and
+terminal; Pro/Max limit percentages; error messages with absolute paths
+stripped.
+
+**Never stored:** your prompts, Claude's responses, tool parameters, file
+contents, code, diffs, environment variables.
+
+- **GitHub OAuth**: we only request basic profile access (username, avatar)
+- **One token per machine**: `clawdgg devices revoke <id>` logs out exactly one
+- **`clawdgg disable`** turns streaming off and restores any OpenTelemetry
+  settings you had before — it remembers what it replaced
 
 ## Tech Stack
 

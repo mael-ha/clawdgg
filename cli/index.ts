@@ -372,22 +372,50 @@ async function requireLogin(): Promise<{ config: Config; profile: ProfileData | 
 
 // ============= CONSENT =============
 
+/**
+ * Everything clawd.gg stores, and nothing it doesn't.
+ *
+ * This list is the contract. It is written against the columns the ingest path
+ * actually writes (src/routes/otel.ts), not against what we'd prefer to admit
+ * to — including the parts a user would be surprised by, which is exactly why
+ * the names section exists. If a column is added there, it belongs here on the
+ * same commit.
+ */
 function showConsent(): void {
-  console.log(`${colors.bright}What gets sent to clawd.gg${colors.reset}`);
-  console.log(`  ${colors.green}+${colors.reset} timestamps, model names and session ids`);
-  console.log(`  ${colors.green}+${colors.reset} token counts (input / output / cache) and the cost they imply`);
-  console.log(`  ${colors.green}+${colors.reset} how long your prompts were ${colors.dim}(character count — not the text)${colors.reset}`);
-  console.log(`  ${colors.green}+${colors.reset} which tools ran, whether they succeeded, and how long they took`);
-  console.log(`  ${colors.green}+${colors.reset} lines added/removed and commit counts`);
-  console.log(`  ${colors.green}+${colors.reset} your Claude Code version, terminal, and Pro/Max limit percentages`);
+  const plus = `  ${colors.green}+${colors.reset}`;
+  const minus = `  ${colors.red}-${colors.reset}`;
+  const dim = (text: string) => `${colors.dim}${text}${colors.reset}`;
+
+  console.log(`${colors.bright}What we store — the numbers${colors.reset}`);
+  console.log(`${plus} timestamps and session ids`);
+  console.log(`${plus} which model ran, and token counts ${dim("(input / output / cache read / cache write)")}`);
+  console.log(`${plus} cost ${dim("— the API-equivalent price Claude Code computes, not what you pay")}`);
+  console.log(`${plus} how long each prompt was ${dim("— the character count, never the text")}`);
+  console.log(`${plus} which tools ran, whether each succeeded, and how long it took`);
+  console.log(`${plus} lines added/removed, commits, PRs, and active time`);
+  console.log(`${plus} your Pro/Max limit percentages ${dim("(5h / 7d), via the status line")}`);
+  console.log();
+  console.log(`${colors.bright}What we store — the names ${dim("(read this part)")}${colors.reset}`);
+  console.log(`${plus} your Anthropic ${colors.bright}account id${colors.reset} and ${colors.bright}organization id${colors.reset}`);
+  console.log(`${plus} tool names, and the names of agents, skills and plugins you run`);
+  console.log(`${plus} ${colors.bright}MCP server and MCP tool names${colors.reset} ${dim("— these can name internal systems")}`);
+  console.log(`${plus} slash command names ${dim("— a custom command's name, not its content")}`);
+  console.log(`${plus} the language of files you edit, and whether you accepted each edit`);
+  console.log(`${plus} your Claude Code version and terminal`);
+  console.log(`${plus} error messages ${dim("— with absolute file paths stripped out server-side")}`);
   console.log();
   console.log(`${colors.bright}What never leaves your machine${colors.reset}`);
-  console.log(`  ${colors.red}-${colors.reset} your prompts ${colors.dim}(we store the length, never the words)${colors.reset}`);
-  console.log(`  ${colors.red}-${colors.reset} file contents, code, diffs, file paths`);
-  console.log(`  ${colors.red}-${colors.reset} tool arguments, environment variables, secrets`);
+  console.log(`${minus} your prompts ${dim("(we store the length, never the words)")}`);
+  console.log(`${minus} Claude's responses`);
+  console.log(`${minus} tool parameters ${dim("— no command lines, no file paths, no arguments")}`);
+  console.log(`${minus} file contents, code, diffs`);
+  console.log(`${minus} environment variables, secrets`);
   console.log();
-  console.log(`${colors.dim}This turns on Claude Code telemetry globally (~/.claude/settings.json).${colors.reset}`);
-  console.log(`${colors.dim}Undo any time with${colors.reset} ${colors.cyan}clawdgg disable${colors.reset}${colors.dim}.${colors.reset}`);
+  console.log(dim("Importing your history sends the same fields, nothing more."));
+  console.log(dim("This turns on Claude Code telemetry globally (~/.claude/settings.json)."));
+  console.log(`${dim("Undo any time with")} ${colors.cyan}clawdgg disable${colors.reset}${dim(" — which also restores whatever")}`);
+  console.log(dim("OpenTelemetry settings you had before. It stops the stream; it does not"));
+  console.log(dim("delete what is already on clawd.gg. Ask us and we will."));
   console.log();
 }
 
