@@ -39,6 +39,7 @@ import {
   fmtTs,
   mapHistoryText,
   mapJsonlText,
+  withoutWireOnlyFields,
   type ImportEventRow,
   type ImportMetricRow,
 } from "../lib/session-import";
@@ -393,7 +394,9 @@ async function mapFile(file: string, args: Args): Promise<MappedRows> {
     ...describeTranscriptPath(file),
   });
   rowsWithoutCacheBreakdown += mapped.flatCacheFallbacks;
-  return { events: mapped.events, metrics: mapped.metrics };
+  // This script inserts straight into ClickHouse, so the wire-only cache-TTL
+  // split has to come off — its cost is already baked into cost_usd here.
+  return { events: withoutWireOnlyFields(mapped.events), metrics: mapped.metrics };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

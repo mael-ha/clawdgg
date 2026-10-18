@@ -64,6 +64,23 @@ export interface ImportEventRow {
   cache_read_tokens?: number;
   cache_write_tokens?: number;
   /**
+   * How many of `cache_write_tokens` were written with a 1-HOUR TTL, which
+   * bills at 2x input against the 5m rate's 1.25x.
+   *
+   * WIRE-ONLY: there is no ClickHouse column for it, deliberately — api_request
+   * reports a single untyped cache-creation total, so a column would be empty
+   * on every live row (see the "NOT added" note in
+   * docker/clickhouse/migrations/2026-10-18_add_otel_attributes.sql). It exists
+   * so `clawdgg import` can tell the server the split it read out of the
+   * transcript, letting the server reprice the row the way the operator-run
+   * backfill does instead of pricing all cache writes at the 5m rate (~22% low
+   * on cache-write cost over the current corpus).
+   *
+   * ANYTHING THAT INSERTS THESE ROWS DIRECTLY must drop it first —
+   * withoutWireOnlyFields() below — or the insert dies on an unknown column.
+   */
+  cache_write_1h_tokens?: number;
+  /**
    * `message.usage.speed` as the transcript records it ('standard' | 'fast').
    * Stored, not just used: a row billed at Opus fast-mode rates has to say so
    * for its cost to be reconcilable, and it is part of the row identity, so a
@@ -323,6 +340,10 @@ export function mapLine(line: any, opts: MapOptions): MapLineResult {
       const { costUsd, pricingSource, usedFlatCacheFallback } = computeCostUsd(model, usage);
       if (usedFlatCacheFallback) out.flatCacheFallbacks++;
       const speed = typeof usage.speed === "string" ? usage.speed : "";
+      // Carried so the import endpoint can reprice this row at the same rates
+      // computeCostUsd just used. Omitted when there is nothing to say, which
+      // keeps it off the ~63% of rows that are all-5m.
+      const { tokens1h } = splitCacheCreationTokens(usage);
 
       out.events.push({
         ...base,
@@ -335,6 +356,7 @@ export function mapLine(line: any, opts: MapOptions): MapLineResult {
         output_tokens: outputTokens,
         cache_read_tokens: cacheRead,
         cache_write_tokens: cacheWrite,
+        ...(tokens1h > 0 && { cache_write_1h_tokens: tokens1h }),
       });
 
       const tokenMetricBase = { ...base, metric_name: "claude_code.token.usage", model, speed };
@@ -380,6 +402,19 @@ export function mapLine(line: any, opts: MapOptions): MapLineResult {
   }
 
   return out;
+}
+
+/**
+ * Drop the fields that exist only on the wire to POST /api/cli/import.
+ *
+ * Call this on any path that hands these rows to insertEvents() instead of to
+ * the import endpoint: the mapper's rows are a superset of the events_raw
+ * columns, and ClickHouse fails a JSONEachRow insert that names a column it
+ * does not have. The list is short on purpose — a wire-only field is a cost to
+ * every caller, so add one only when the server genuinely cannot derive it.
+ */
+export function withoutWireOnlyFields(rows: ImportEventRow[]): ImportEventRow[] {
+  return rows.map(({ cache_write_1h_tokens, ...row }) => row);
 }
 
 export interface MapTextOptions extends MapOptions {

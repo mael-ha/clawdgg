@@ -1469,20 +1469,26 @@ interface ImportBatchResult {
  * The cost the server will compute for these rows.
  *
  * Deliberately NOT the mapper's own `cost_usd`: the server recomputes cost from
- * model + token counts (it does not trust a client's arithmetic about money),
- * and it only has the flat cache-creation total to work from. Pricing the
- * preview the same way is what keeps "we'll upload $X" and "clawd.gg says $X"
- * the same number.
+ * model + token counts (it does not trust a client's arithmetic about money).
+ * Pricing the preview from exactly the fields we are about to upload — the
+ * cache-creation total AND its 1h share — is what keeps "we'll upload $X" and
+ * "clawd.gg says $X" the same number.
  */
 function previewCostUsd(events: ImportEventRow[]): number {
   let total = 0;
   for (const event of events) {
     if (event.event_name !== "claude_code.api_request") continue;
+    const cacheWrite = event.cache_write_tokens ?? 0;
+    const cacheWrite1h = Math.min(event.cache_write_1h_tokens ?? 0, cacheWrite);
     total += computeCostUsd(event.model ?? "", {
       input_tokens: event.input_tokens ?? 0,
       output_tokens: event.output_tokens ?? 0,
       cache_read_input_tokens: event.cache_read_tokens ?? 0,
-      cache_creation_input_tokens: event.cache_write_tokens ?? 0,
+      cache_creation_input_tokens: cacheWrite,
+      cache_creation: {
+        ephemeral_1h_input_tokens: cacheWrite1h,
+        ephemeral_5m_input_tokens: cacheWrite - cacheWrite1h,
+      },
     }).costUsd;
   }
   return total;
@@ -1577,6 +1583,9 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
   // from them, so sending the mapper's metrics too would be the same numbers
   // twice — and one of two copies can disagree with the other.
   const events: ImportEventRow[] = [];
+  // Rows whose transcript recorded no cache-TTL breakdown: those are the only
+  // ones whose cache-write cost is a floor rather than a figure.
+  let flatCacheRows = 0;
 
   for (const file of transcripts) {
     let raw: string;
@@ -1587,6 +1596,7 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
     }
     const mapped = mapJsonlText(raw, { ...mapOptions, ...describeTranscriptPath(file) });
     events.push(...mapped.events);
+    flatCacheRows += mapped.flatCacheFallbacks;
   }
 
   // history.jsonl outlives the transcripts (which rotate at ~60 days), so it
@@ -1629,7 +1639,9 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
   console.log();
   console.log(`  ${colors.bright}${prompts.toLocaleString()}${colors.reset} prompts  ${colors.dim}·${colors.reset}  ${colors.bright}${apiRequests.toLocaleString()}${colors.reset} API calls  ${colors.dim}·${colors.reset}  ${colors.bright}$${costUsd.toFixed(2)}${colors.reset} ${colors.dim}(estimated)${colors.reset}`);
   if (historyKept > 0) log.dim(`  ${historyKept.toLocaleString()} of those prompts come from history.jsonl`);
-  log.dim(`  cache writes are priced at the 5-minute rate, so that cost is a floor`);
+  if (flatCacheRows > 0) {
+    log.dim(`  ${flatCacheRows.toLocaleString()} API calls recorded no cache-TTL split, so their cache-write cost is a floor`);
+  }
   log.dim(`  ${total.toLocaleString()} rows to upload. Timestamps and counts only — no prompt text.`);
   console.log();
 

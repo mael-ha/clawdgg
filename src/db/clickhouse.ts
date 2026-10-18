@@ -28,7 +28,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { getModelPricing } from '../lib/pricing';
+import { getModelPricing, type PricingMatchQuality } from '../lib/pricing';
 import { bucketLabel, bucketSql, type ChartGroupBy } from '../lib/chart-buckets';
 
 const CLICKHOUSE_URL = process.env.CLICKHOUSE_URL || 'http://localhost:8123';
@@ -211,6 +211,12 @@ export interface MetricRow {
   start_type?: string;       // session.count: fresh | resume | continue | agents_view
   provenance?: RowProvenance;
   /**
+   * How the model id matched the price table behind an ESTIMATED cost. Empty on
+   * a live row: those carry Claude Code's own measured cost. NOT part of the
+   * row identity — see the note on METRIC_IDENTITY_COLUMNS.
+   */
+  pricing_source?: PricingMatchQuality;
+  /**
    * Deterministic per-row identity (see metricRowId). Part of the
    * ReplacingMergeTree sorting key — leave it unset and insertMetrics fills it.
    */
@@ -267,6 +273,8 @@ export interface EventRow {
   account_uuid?: string;
   organization_id?: string;
   provenance?: RowProvenance;
+  /** See MetricRow.pricing_source. */
+  pricing_source?: PricingMatchQuality;
   /**
    * Deterministic per-row identity (see eventRowId). Part of the
    * ReplacingMergeTree sorting key — leave it unset and insertEvents fills it.

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import {
   BUILTIN_SLASH_COMMANDS,
+  computeCostUsd,
   contentLength,
   describeTranscriptPath,
   fillPromptGapsFromHistory,
@@ -9,6 +10,7 @@ import {
   mapHistoryText,
   mapJsonlText,
   mapLine,
+  withoutWireOnlyFields,
   type MapOptions,
 } from './session-import';
 
@@ -184,6 +186,67 @@ describe('mapLine — assistant usage', () => {
     expect(split.events[0]!.cost_usd).toBeGreaterThan(flat.events[0]!.cost_usd!);
     expect(split.flatCacheFallbacks).toBe(0);
     expect(flat.flatCacheFallbacks).toBe(1);
+  });
+
+  it('carries the 1h cache share so the import endpoint can price it the same', () => {
+    const { events } = mapLine(
+      assistantLine({
+        input_tokens: 10,
+        output_tokens: 20,
+        cache_creation_input_tokens: 1000,
+        cache_creation: { ephemeral_5m_input_tokens: 400, ephemeral_1h_input_tokens: 600 },
+      }),
+      OPTS
+    );
+    expect(events[0]!.cache_write_tokens).toBe(1000);
+    expect(events[0]!.cache_write_1h_tokens).toBe(600);
+
+    // The server reprices from these two fields alone, so they must reproduce
+    // the cost the mapper computed from the full usage block.
+    const reprice = computeCostUsd('claude-opus-5', {
+      input_tokens: 10,
+      output_tokens: 20,
+      cache_creation_input_tokens: 1000,
+      cache_creation: { ephemeral_1h_input_tokens: 600, ephemeral_5m_input_tokens: 400 },
+    }).costUsd;
+    expect(events[0]!.cost_usd).toBeCloseTo(reprice, 12);
+  });
+
+  it('leaves the 1h share off a row that is all 5m, or has no breakdown', () => {
+    const allFiveMinute = mapLine(
+      assistantLine({
+        input_tokens: 1,
+        cache_creation_input_tokens: 100,
+        cache_creation: { ephemeral_5m_input_tokens: 100, ephemeral_1h_input_tokens: 0 },
+      }),
+      OPTS
+    );
+    const noBreakdown = mapLine(
+      assistantLine({ input_tokens: 1, cache_creation_input_tokens: 100 }),
+      OPTS
+    );
+    expect(allFiveMinute.events[0]!.cache_write_1h_tokens).toBeUndefined();
+    expect(noBreakdown.events[0]!.cache_write_1h_tokens).toBeUndefined();
+  });
+});
+
+describe('withoutWireOnlyFields', () => {
+  it('removes the wire-only cache split, which has no ClickHouse column', () => {
+    const { events } = mapLine(
+      assistantLine({
+        input_tokens: 10,
+        cache_creation_input_tokens: 1000,
+        cache_creation: { ephemeral_5m_input_tokens: 400, ephemeral_1h_input_tokens: 600 },
+      }),
+      OPTS
+    );
+    const stored = withoutWireOnlyFields(events);
+
+    expect('cache_write_1h_tokens' in stored[0]!).toBe(false);
+    // Everything events_raw does have a column for survives untouched.
+    expect(stored[0]!.cache_write_tokens).toBe(1000);
+    expect(stored[0]!.cost_usd).toBe(events[0]!.cost_usd);
+    expect(stored[0]!.pricing_source).toBe(events[0]!.pricing_source);
   });
 
   it('emits a tool_result per tool_use block', () => {

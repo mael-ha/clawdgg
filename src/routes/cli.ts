@@ -475,6 +475,8 @@ export function sanitizeImportRows(userId: string, body: unknown, cutoffMs: numb
       const cacheRead = safeCount(row.cache_read_tokens, MAX_CACHE_TOKENS_PER_REQUEST);
       const cacheWrite = safeCount(row.cache_write_tokens, MAX_CACHE_TOKENS_PER_REQUEST);
       // Only ever used for pricing, and only as far as the flat total allows.
+      // It is never written to `event`: events_raw has no column for it, and
+      // the cost it produces below is the whole reason the client sends it.
       const cacheWrite1h = safeCount(row.cache_write_1h_tokens, cacheWrite.value);
       if (input.clamped || output.clamped || cacheRead.clamped || cacheWrite.clamped) out.clamped++;
 
@@ -575,17 +577,11 @@ export async function runImport(
   const eventDays = dropCoveredDays(sanitized.events, deps.coveredDays);
   const metricDays = dropCoveredDays(sanitized.metrics, deps.coveredDays);
 
-  const events = dropDuplicates(eventDays.kept, (row) => eventRowId(row as unknown as EventRow));
-  const metrics = dropDuplicates(metricDays.kept, (row) => metricRowId(row as unknown as MetricRow));
+  const events = dropDuplicates(eventDays.kept, eventRowId);
+  const metrics = dropDuplicates(metricDays.kept, metricRowId);
 
-  // TODO(provenance): drop these casts once EventRow/MetricRow carry
-  // `pricing_source`. RowProvenance has since gained 'import', but the shared
-  // mapper's row types also hold pricing_source, which exists in the DDL and
-  // not in clickhouse.ts's interfaces — so the structural mismatch remains.
-  // Harmless meanwhile: the ClickHouse columns are a `String DEFAULT 'live'`
-  // and a LowCardinality(String), and insertEvents/insertMetrics fill row_id.
-  if (events.kept.length > 0) await deps.insertEvents(events.kept as unknown as EventRow[]);
-  if (metrics.kept.length > 0) await deps.insertMetrics(metrics.kept as unknown as MetricRow[]);
+  if (events.kept.length > 0) await deps.insertEvents(events.kept);
+  if (metrics.kept.length > 0) await deps.insertMetrics(metrics.kept);
 
   return {
     accepted: sanitized.events.length + sanitized.metrics.length,
