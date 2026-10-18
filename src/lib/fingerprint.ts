@@ -76,14 +76,37 @@ export interface AnatomyFigures {
   prompts: number;
   /** quantileExact(0.5), over prompts whose length was recorded. */
   medianPromptChars: number;
+  /**
+   * quantileExact(0.95) of the same population — the "long tail to N" figure.
+   *
+   * Exact and not an approximation, because the whole point of a p95 beside a
+   * median is that the two are compared: `quantile()`'s reservoir sampling
+   * would make the gap between them partly a property of the sample.
+   */
+  p95PromptChars: number;
   toolCallsPerPrompt: number;
   linesPerPrompt: number;
   valuePerPrompt: number;
 }
 
+/** A tool and how many results it returned. */
+export interface ToolCount {
+  name: string;
+  count: number;
+}
+
 export interface Anatomy {
   allTime: AnatomyFigures;
   last30d: AnatomyFigures;
+  /**
+   * The four tools most of those calls went to, all-time, biggest first.
+   *
+   * Counted from `tool_result`, the same event `toolCallsPerPrompt` counts, so
+   * the names and the ratio beside them describe one measurement. Rows with an
+   * empty `tool_name` are left out rather than grouped as "": pre-attribute
+   * ingest did not record it, and a blank bar named nothing is not a tool.
+   */
+  topTools: ToolCount[];
 }
 
 export interface Conversation {
@@ -182,11 +205,27 @@ export interface ClassVerdict {
   style: StyleClass | null;
 }
 
+/**
+ * A past month's verdict, with the evidence that produced it.
+ *
+ * The evidence is OPTIONAL on the type and always present in a payload this
+ * code builds: it was added after the shape was already being constructed in
+ * fixtures, and a required field would have broken them for nothing. A reader
+ * should treat its absence as "an older payload", not as "no evidence".
+ *
+ * It is here for the same reason the current month's is: a class a user cannot
+ * check is a horoscope, and that applies to August as much as to October.
+ */
+export interface PastVerdict extends ClassVerdict {
+  rhythm_evidence?: RhythmEvidence;
+  style_evidence?: StyleEvidence;
+}
+
 export interface UserClass extends ClassVerdict {
   rhythm_evidence: RhythmEvidence;
   style_evidence: StyleEvidence;
   /** Earlier months, newest first. The current month is NOT repeated here. */
-  history: ClassVerdict[];
+  history: PastVerdict[];
 }
 
 export type MilestoneKind = 'prompts' | 'lines' | 'streak' | 'ultrathink' | 'model';
@@ -222,6 +261,35 @@ export interface Ultrathink {
   firstSeen: string | null;
 }
 
+/**
+ * The nearest unreached threshold on each ladder, with the figure it is
+ * measured against.
+ *
+ * THE THRESHOLDS LIVE IN ONE PLACE. `milestones` only carries what has already
+ * been crossed, so a progress bar toward the next one needed the ladder — and
+ * the UI had its own copy of it (`LADDERS` in src/components/profile/
+ * geometry.ts), which is two lists of numbers that have to agree about what
+ * "10K prompts" means. They are MILESTONE_SPECS here, and this is how the page
+ * gets them.
+ *
+ * `current` is the figure the threshold is compared against, so progress is
+ * `current / target` and nothing has to be reassembled from other sections.
+ * One entry per ladder with anything left to reach; a ladder that has been
+ * finished is absent rather than present-and-complete. The order is stable
+ * (prompts, lines, streak, ultrathink), and which one to SHOW is a
+ * presentation choice the page keeps.
+ */
+export interface NextMilestone {
+  /** `${kind}_${target}`, matching the crossed milestone it will become. */
+  key: string;
+  kind: MilestoneKind;
+  emoji: string;
+  label: string;
+  target: number;
+  /** Prompts, lines, capped ultrathinks, or the longest streak so far. */
+  current: number;
+}
+
 export interface FingerprintData {
   username: string;
   /**
@@ -246,6 +314,8 @@ export interface FingerprintData {
   rings?: Rings;
   class?: UserClass;
   milestones?: Milestone[];
+  /** Hidden with `milestones`: it is the same ladder, read forwards. */
+  nextMilestones?: NextMilestone[];
   ultrathink?: Ultrathink;
 }
 
@@ -502,6 +572,79 @@ export function crossedMilestones(series: DailyPoint[]): Milestone[] {
 }
 
 /**
+ * The figures the ladders are measured against, from the same series.
+ *
+ * `longestStreak` is the longest RUN, not the current one, because that is what
+ * awards a streak milestone in crossedMilestones: a 30-day run reached in March
+ * is a milestone in March whatever happened since.
+ */
+export function milestoneTotals(series: DailyPoint[]): {
+  prompts: number;
+  lines: number;
+  ultrathink: number;
+  longestStreak: number;
+} {
+  const days = [...series].sort((a, b) => a.date.localeCompare(b.date));
+  const totals = { prompts: 0, lines: 0, ultrathink: 0, longestStreak: 0 };
+
+  let run = 0;
+  let previousDay: number | null = null;
+
+  for (const day of days) {
+    totals.prompts += day.prompts || 0;
+    totals.lines += day.lines || 0;
+    totals.ultrathink += day.ultrathinks || 0;
+
+    const dayNumber = Math.floor(Date.parse(`${day.date}T00:00:00Z`) / 86_400_000);
+    if (Number.isNaN(dayNumber)) continue;
+    if ((day.prompts || 0) <= 0) {
+      run = 0;
+      previousDay = dayNumber;
+      continue;
+    }
+    run = previousDay !== null && dayNumber === previousDay + 1 ? run + 1 : 1;
+    previousDay = dayNumber;
+    totals.longestStreak = Math.max(totals.longestStreak, run);
+  }
+
+  return totals;
+}
+
+/**
+ * The next threshold on each ladder. See NextMilestone for why it is here.
+ *
+ * Same specs, same series and the same `prompts > 0` streak rule as
+ * crossedMilestones, so the thing being approached is exactly the thing that
+ * will appear in `milestones` once it is reached.
+ */
+export function nextMilestones(series: DailyPoint[]): NextMilestone[] {
+  const totals = milestoneTotals(series);
+  const current: Record<keyof typeof MILESTONE_SPECS, number> = {
+    prompts: totals.prompts,
+    lines: totals.lines,
+    streak: totals.longestStreak,
+    ultrathink: totals.ultrathink,
+  };
+
+  const out: NextMilestone[] = [];
+  for (const key of ['prompts', 'lines', 'streak', 'ultrathink'] as const) {
+    const spec = MILESTONE_SPECS[key];
+    const reached = current[key];
+    const target = spec.thresholds.find((threshold) => reached < threshold);
+    if (target === undefined) continue;
+    out.push({
+      key: `${key}_${target}`,
+      kind: spec.kind,
+      emoji: spec.emoji,
+      label: spec.label(target),
+      target,
+      current: reached,
+    });
+  }
+  return out;
+}
+
+/**
  * Below this many active users, rarity is omitted rather than invented.
  *
  * With a few dozen users "top 1%" is a rounding of one person, and a rarity
@@ -623,6 +766,8 @@ interface EventTotals {
   chars_from_history: number;
   median_all: number;
   median_30d: number;
+  p95_all: number;
+  p95_30d: number;
   tools_all: number;
   tools_30d: number;
 }
@@ -650,6 +795,8 @@ async function fetchEventTotals(userId: string, tz: string): Promise<EventTotals
        toUInt64(sumIf(prompt_length, ${measured} AND provenance = 'backfill-history')) AS chars_from_history,
        toUInt64(quantileExactIf(0.5)(prompt_length, ${measured})) AS median_all,
        toUInt64(quantileExactIf(0.5)(prompt_length, ${measured} AND ${LAST_30D})) AS median_30d,
+       toUInt64(quantileExactIf(0.95)(prompt_length, ${measured})) AS p95_all,
+       toUInt64(quantileExactIf(0.95)(prompt_length, ${measured} AND ${LAST_30D})) AS p95_30d,
        toUInt64(countIf(event_name = 'claude_code.tool_result')) AS tools_all,
        toUInt64(countIf(event_name = 'claude_code.tool_result' AND ${LAST_30D})) AS tools_30d
      FROM events_raw FINAL
@@ -658,6 +805,22 @@ async function fetchEventTotals(userId: string, tz: string): Promise<EventTotals
     { userId, tz }
   );
   return rows[0] ?? null;
+}
+
+/** The four tools the most results came back from. See Anatomy.topTools. */
+async function fetchTopTools(userId: string): Promise<ToolCount[]> {
+  const rows = await query<{ name: string; count: number }>(
+    `SELECT tool_name AS name, toUInt64(count()) AS count
+     FROM events_raw FINAL
+     WHERE user_id = {userId:String}
+       AND event_name = 'claude_code.tool_result'
+       AND tool_name != ''
+     GROUP BY name
+     ORDER BY count DESC, name ASC
+     LIMIT 4`,
+    { userId }
+  );
+  return rows.map((row) => ({ name: row.name, count: Number(row.count) || 0 }));
 }
 
 /**
@@ -1171,7 +1334,14 @@ export function buildClassHistory(
   const current = judge(currentMonth);
   const history = months
     .filter((month) => month !== currentMonth)
-    .map((month) => judge(month).verdict)
+    .map((month) => {
+      const judged = judge(month);
+      return {
+        ...judged.verdict,
+        rhythm_evidence: judged.rhythmEvidence,
+        style_evidence: judged.styleEvidence,
+      };
+    })
     .filter((verdict) => verdict.rhythm !== null || verdict.style !== null);
 
   return {
@@ -1229,6 +1399,7 @@ export async function getFingerprint(
     modelFirstUse,
     activeUsers,
     ultrathink,
+    topTools,
   ] = await Promise.all([
     fetchEventTotals(userId, tz),
     fetchMetricTotals(userId, tz, week),
@@ -1242,6 +1413,7 @@ export async function getFingerprint(
     fetchModelFirstUse(userId, tz),
     countActiveUsers(),
     fetchUltrathinks(userId, tz),
+    fetchTopTools(userId),
   ]);
 
   const promptsAll = Number(eventTotals?.prompts_all) || 0;
@@ -1255,6 +1427,7 @@ export async function getFingerprint(
     allTime: {
       prompts: promptsAll,
       medianPromptChars: Number(eventTotals?.median_all) || 0,
+      p95PromptChars: Number(eventTotals?.p95_all) || 0,
       toolCallsPerPrompt: ratioOfSums(Number(eventTotals?.tools_all) || 0, promptsAll),
       linesPerPrompt: ratioOfSums(Number(metricTotals?.lines_all) || 0, promptsAll),
       valuePerPrompt: ratioOfSums(valueAll, promptsAll),
@@ -1262,10 +1435,12 @@ export async function getFingerprint(
     last30d: {
       prompts: promptsL30,
       medianPromptChars: Number(eventTotals?.median_30d) || 0,
+      p95PromptChars: Number(eventTotals?.p95_30d) || 0,
       toolCallsPerPrompt: ratioOfSums(Number(eventTotals?.tools_30d) || 0, promptsL30),
       linesPerPrompt: ratioOfSums(Number(metricTotals?.lines_30d) || 0, promptsL30),
       valuePerPrompt: ratioOfSums(Number(metricTotals?.value_30d) || 0, promptsL30),
     },
+    topTools,
   };
 
   const approxOutputChars = outputTokens * CHARS_PER_TOKEN;
@@ -1307,6 +1482,7 @@ export async function getFingerprint(
       monthlyValue
     ),
     milestones,
+    nextMilestones: nextMilestones(dailySeries),
     ultrathink: {
       // Both sides of the share come out of the same capped count, so it
       // cannot read over 100% however many flags a client posts.
@@ -1336,9 +1512,13 @@ export const BUILT_SECTIONS = [
   'ultrathink',
 ] as const;
 
+/**
+ * `nextMilestones` is not a SECTION — there is no toggle for it, because it is
+ * the `milestones` ladder read forwards and is hidden with it.
+ */
 export type BuiltSections = {
   [K in (typeof BUILT_SECTIONS)[number]]: NonNullable<FingerprintData[K]>;
-};
+} & { nextMilestones: NextMilestone[] };
 
 /**
  * The parts, minus what the owner has hidden.
@@ -1379,7 +1559,10 @@ export function assembleFingerprint(
     ...(show('conversation') && { conversation: parts.conversation }),
     ...(show('rings') && { rings: parts.rings }),
     ...(show('class') && { class: parts.class }),
-    ...(show('milestones') && { milestones: parts.milestones }),
+    ...(show('milestones') && {
+      milestones: parts.milestones,
+      nextMilestones: parts.nextMilestones,
+    }),
     ...(show('ultrathink') && { ultrathink: parts.ultrathink }),
   };
 }

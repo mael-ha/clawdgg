@@ -459,9 +459,24 @@ describe('buildClassHistory', () => {
     expect(verdict.rhythm).toBe('night-owl');
     expect(verdict.style).toBe('autopilot');
 
-    expect(verdict.history).toEqual([
-      { month: '2026-09', rhythm: 'afternoon', style: 'orchestrator' },
-    ]);
+    expect(verdict.history).toHaveLength(1);
+    expect(verdict.history[0]).toMatchObject({
+      month: '2026-09',
+      rhythm: 'afternoon',
+      style: 'orchestrator',
+    });
+  });
+
+  /**
+   * A class a user cannot check is a horoscope, and that is as true of August
+   * as of October — so a past month carries the same evidence the current one
+   * does, rather than a bare verdict the page can only assert.
+   */
+  it("carries each past month's evidence, not just its verdict", () => {
+    const verdict = buildClassHistory('2026-10', monthlyHours, monthlyEvents, monthlyValue);
+    const september = verdict.history[0]!;
+    expect(september.rhythm_evidence?.prompts).toBe(100);
+    expect(september.style_evidence?.subagentSharePct).toBeCloseTo(50, 10);
   });
 
   it('returns the evidence for the current month, not just the verdict', () => {
@@ -526,8 +541,9 @@ describe('assembleFingerprint', () => {
   const parts = {
     value: { thisWeek: 10, lastWeek: 5, deltaPct: 100, allTime: 99, weekStart: '2026-10-12T00:00:00.000Z' },
     anatomy: {
-      allTime: { prompts: 1, medianPromptChars: 170, toolCallsPerPrompt: 9.6, linesPerPrompt: 36, valuePerPrompt: 1.13 },
-      last30d: { prompts: 1, medianPromptChars: 170, toolCallsPerPrompt: 9.6, linesPerPrompt: 36, valuePerPrompt: 1.13 },
+      allTime: { prompts: 1, medianPromptChars: 170, p95PromptChars: 1400, toolCallsPerPrompt: 9.6, linesPerPrompt: 36, valuePerPrompt: 1.13 },
+      last30d: { prompts: 1, medianPromptChars: 170, p95PromptChars: 1400, toolCallsPerPrompt: 9.6, linesPerPrompt: 36, valuePerPrompt: 1.13 },
+      topTools: [{ name: 'Bash', count: 9 }, { name: 'Edit', count: 4 }],
     },
     conversation: {
       charsTyped: 100,
@@ -539,6 +555,9 @@ describe('assembleFingerprint', () => {
     rings: buildRings([], [], []),
     class: buildClassHistory('2026-10', [], [], []),
     milestones: [],
+    nextMilestones: [
+      { key: 'prompts_1000', kind: 'prompts' as const, emoji: '💬', label: '1K prompts', target: 1000, current: 1 },
+    ],
     ultrathink: { count: 7, sharePct: 50, firstSeen: '2026-10-01' },
   };
   const meta = {
@@ -598,6 +617,20 @@ describe('assembleFingerprint', () => {
 
   // `curve`, `year` and `plan` are toggleable sections this payload does not
   // carry yet. Hiding one must not disturb the sections it does carry.
+  /**
+   * The ladder read forwards is the same ladder. Hiding the milestones and
+   * leaving the next one up would say "you are 1 of 1,000 prompts in" on a
+   * profile whose owner asked for that section not to be shown.
+   */
+  it('hides the next milestone with the crossed ones', () => {
+    const shown = assembleFingerprint(parts, { ...meta, hidden: [] });
+    expect(shown.nextMilestones).toHaveLength(1);
+
+    const hiddenData = assembleFingerprint(parts, { ...meta, hidden: ['milestones'] });
+    expect('nextMilestones' in hiddenData).toBe(false);
+    expect('milestones' in hiddenData).toBe(false);
+  });
+
   it('tolerates hiding a section it does not build', () => {
     const data = assembleFingerprint(parts, { ...meta, hidden: ['curve', 'year', 'plan'] });
     expect(data.sections).toEqual([...BUILT_SECTIONS]);
