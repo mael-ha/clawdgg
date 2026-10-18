@@ -468,12 +468,22 @@ api.get('/u/:username/fingerprint', optionalAuth, async (c) => {
     const hiddenFromOthers = hiddenSections(settings);
 
     const data = await fingerprintCache.remember(
-      // The owner's payload is a different payload, so it is a different key.
-      `${row.id}|${isOwner ? 'owner' : 'public'}`,
+      // The owner's payload is a different payload, so it is a different key —
+      // and so is a payload built under a different set of hidden sections.
+      //
+      // The hidden list is IN THE KEY, not just evicted on save. Eviction alone
+      // loses a race it cannot see: a build that started before the toggle is
+      // still in flight, finishes after the delete, and writes the pre-toggle
+      // payload back under the same key for the rest of the TTL — so the
+      // section the owner just hid is served to visitors for another minute,
+      // after the UI said it was saved. Keyed this way, that build can only
+      // re-cache the key it was built for.
+      `${row.id}|${isOwner ? 'owner' : 'public'}|${hiddenFromOthers.join(',')}`,
       () =>
         getFingerprint(row.id, {
           username: row.githubUsername,
           timezone: row.timezone,
+          isOwner,
           // The owner always sees everything, including what they have hidden.
           hidden: isOwner ? [] : hiddenFromOthers,
         })
@@ -520,10 +530,12 @@ api.put('/me/profile-settings', requireAuth, async (c) => {
 
   const sections = await setVisibility(user.id, parsed.patch);
 
-  // Both payloads for this user are now stale. Evicting beats waiting out the
-  // TTL: a toggle that takes a minute to take effect reads as a failed save.
-  fingerprintCache.delete(`${user.id}|owner`);
-  fingerprintCache.delete(`${user.id}|public`);
+  // The new hidden list is part of the cache key (see the GET above), so the
+  // next read is a miss by construction and no in-flight build can re-cache a
+  // stale payload under it. This evicts the keys the PREVIOUS list made, which
+  // would otherwise sit out their TTL unread — and only this user's, which is
+  // why it is a prefix and not a clear().
+  fingerprintCache.deletePrefix(`${user.id}|`);
 
   return c.json({ success: true, sections });
 });

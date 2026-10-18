@@ -22,6 +22,8 @@
  */
 
 import {
+  CAPPED_ULTRATHINKS_SQL,
+  CLAUDE_CODE_EVENT_SQL,
   LOCAL_TS_SQL,
   MODEL_ID_SQL,
   NO_LEGACY_SQL,
@@ -30,6 +32,7 @@ import {
   query,
 } from '../db/clickhouse';
 import { getModelDisplayName } from './pricing';
+import { TtlCache } from './ttl-cache';
 import {
   DEFAULT_TIMEZONE,
   localMonth,
@@ -84,13 +87,34 @@ export interface Anatomy {
 }
 
 export interface Conversation {
-  /** Sum of prompt_length — characters the human typed. */
+  /**
+   * Sum of prompt_length — characters the human typed.
+   *
+   * Over the NON-LEGACY rows only, and `outputTokens` is summed over exactly
+   * the same population. A legacy row records that prompts happened and nothing
+   * about their length, so it contributes 0 characters while still contributing
+   * its day's output tokens: counting it on one side of the ratio and not the
+   * other made every pre-OTEL user look like they typed a word and got a novel.
+   */
   charsTyped: number;
+  /** Output tokens over the same rows `charsTyped` is measured on. */
   outputTokens: number;
   /** outputTokens × 4. An ESTIMATE, and the UI must say so. */
   approxOutputChars: number;
   /** Characters Claude wrote per character typed, or null with nothing typed. */
   ratio: number | null;
+  /**
+   * Share of `charsTyped` recovered from ~/.claude/history.jsonl.
+   *
+   * Those lengths UNDERSTATE what was sent: history.jsonl stores the REPL's
+   * display string, where a paste appears as `[Pasted text #1 +40 lines]`
+   * rather than as its forty lines. So this ratio — and the median prompt
+   * length in `anatomy` — read low by whatever share of that window was pasted,
+   * and the UI should caveat them above a few percent. Disclosed rather than
+   * excluded: those are real prompts, and dropping them would understate the
+   * COUNT to flatter the LENGTH.
+   */
+  historyDerivedCharsPct: number;
 }
 
 export interface RingItem {
@@ -200,8 +224,17 @@ export interface Ultrathink {
 
 export interface FingerprintData {
   username: string;
-  /** The IANA zone every hour, weekday and week above was read in. */
-  timezone: string;
+  /**
+   * The IANA zone every hour, weekday and week above was read in — OWNER ONLY.
+   *
+   * A profile is public and this is not usage data: `America/Argentina/
+   * Buenos_Aires` is where somebody lives, narrower than most of what a
+   * location field would give you, and nobody consented to publishing it by
+   * running `clawdgg setup`. A visitor gets the hours in the subject's own
+   * clock and is not told which clock that is, which is what the figures need
+   * and no more.
+   */
+  timezone?: string;
   generatedAt: string;
   /** Sections present in this payload. */
   sections: FingerprintSection[];
@@ -411,6 +444,14 @@ export function crossedMilestones(series: DailyPoint[]): Milestone[] {
   };
 
   // Streaks need the run length, not a cumulative total.
+  //
+  // ONE definition, shared with the sync job's users.current_streak /
+  // longest_streak: a run of consecutive LOCAL days with `prompts > 0`. The
+  // series this walks is already local (LOCAL_TS_SQL in fetchDailySeries) and
+  // `active` below is the same `prompts > 0` test that
+  // clickhouse.getUserActiveLocalDays applies. The two numbers therefore agree
+  // except where users.longest_streak remembers a run older than the 365-day
+  // window that job reads, which it keeps as a max on purpose.
   let run = 0;
   let previousDay: number | null = null;
   const pendingStreaks = [...MILESTONE_SPECS.streak.thresholds];
@@ -579,12 +620,11 @@ interface EventTotals {
   prompts_30d: number;
   chars_all: number;
   chars_30d: number;
+  chars_from_history: number;
   median_all: number;
   median_30d: number;
   tools_all: number;
   tools_30d: number;
-  ultrathinks: number;
-  ultrathink_first: string | null;
 }
 
 /**
@@ -607,19 +647,53 @@ async function fetchEventTotals(userId: string, tz: string): Promise<EventTotals
        toUInt64(countIf(${PROMPT_EVENT_SQL} AND ${LAST_30D})) AS prompts_30d,
        toUInt64(sumIf(prompt_length, ${measured})) AS chars_all,
        toUInt64(sumIf(prompt_length, ${measured} AND ${LAST_30D})) AS chars_30d,
+       toUInt64(sumIf(prompt_length, ${measured} AND provenance = 'backfill-history')) AS chars_from_history,
        toUInt64(quantileExactIf(0.5)(prompt_length, ${measured})) AS median_all,
        toUInt64(quantileExactIf(0.5)(prompt_length, ${measured} AND ${LAST_30D})) AS median_30d,
        toUInt64(countIf(event_name = 'claude_code.tool_result')) AS tools_all,
-       toUInt64(countIf(event_name = 'claude_code.tool_result' AND ${LAST_30D})) AS tools_30d,
-       toUInt64(countIf(${ULTRATHINK_EVENT_SQL})) AS ultrathinks,
-       if(countIf(${ULTRATHINK_EVENT_SQL}) > 0,
-          toString(minIf(toDate(${LOCAL_TS_SQL}), ${ULTRATHINK_EVENT_SQL})),
-          NULL) AS ultrathink_first
+       toUInt64(countIf(event_name = 'claude_code.tool_result' AND ${LAST_30D})) AS tools_30d
      FROM events_raw FINAL
-     WHERE user_id = {userId:String}`,
+     WHERE user_id = {userId:String}
+       AND ${CLAUDE_CODE_EVENT_SQL}`,
     { userId, tz }
   );
   return rows[0] ?? null;
+}
+
+/**
+ * The ultrathink count, capped at one per prompt per LOCAL day.
+ *
+ * Its own query because the cap needs a per-day grouping that the flat
+ * aggregate above cannot hold, and the local day is the grouping that means
+ * something to the person reading it.
+ *
+ * CAPPED_ULTRATHINKS_SQL is the shared definition (src/db/clickhouse.ts) — the
+ * board applies the same expression. An uncapped count could exceed the day's
+ * prompts, which would put a share above 100% on the page and rank whoever
+ * scripted the hook hardest; for an honest user the two numbers are identical.
+ */
+async function fetchUltrathinks(
+  userId: string,
+  tz: string
+): Promise<{ count: number; firstSeen: string | null }> {
+  const rows = await query<{ count: number; first_seen: string | null }>(
+    `SELECT
+       toUInt64(sum(day_flags)) AS count,
+       if(sum(day_flags) > 0, toString(minIf(day, day_flags > 0)), NULL) AS first_seen
+     FROM (
+       SELECT
+         toDate(${LOCAL_TS_SQL}) AS day,
+         ${CAPPED_ULTRATHINKS_SQL} AS day_flags
+       FROM events_raw FINAL
+       WHERE user_id = {userId:String}
+       GROUP BY day
+     )`,
+    { userId, tz }
+  );
+  return {
+    count: Number(rows[0]?.count) || 0,
+    firstSeen: rows[0]?.first_seen ?? null,
+  };
 }
 
 interface MetricTotals {
@@ -660,7 +734,12 @@ async function fetchMetricTotals(
        toFloat64(sumIf(value, ${value} AND ${lastWeek})) AS value_last_week,
        toUInt64(sumIf(value, ${lines})) AS lines_all,
        toUInt64(sumIf(value, ${lines} AND ${LAST_30D})) AS lines_30d,
-       toUInt64(sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'output')) AS output_tokens,
+       -- NO_LEGACY_SQL, to match charsTyped: a legacy row has no prompt_length
+       -- and so contributes nothing to the typed side of the ratio. Counting
+       -- its output tokens anyway made every pre-OTEL user look like they typed
+       -- a word and got a novel back.
+       toUInt64(sumIf(value, metric_name = 'claude_code.token.usage'
+                             AND token_type = 'output' AND ${NO_LEGACY_SQL})) AS output_tokens,
        toFloat64(sumIf(value, ${value} AND query_source = 'subagent')) AS subagent_value,
        toFloat64(sumIf(value, ${value} AND query_source != '')) AS attributed_value
      FROM metrics_raw FINAL
@@ -801,7 +880,10 @@ async function fetchDailySeries(userId: string, tz: string): Promise<DailyPoint[
       `SELECT
          toString(toDate(${LOCAL_TS_SQL})) AS date,
          toUInt64(countIf(${PROMPT_EVENT_SQL})) AS prompts,
-         toUInt64(countIf(${ULTRATHINK_EVENT_SQL})) AS ultrathinks
+         -- Capped here too, because the ultrathink MILESTONES walk this series:
+         -- an uncapped day would date "your 1,000th ultrathink" to a day that
+         -- did not contain a thousand prompts.
+         toUInt64(${CAPPED_ULTRATHINKS_SQL}) AS ultrathinks
        FROM events_raw FINAL
        WHERE user_id = {userId:String}
        GROUP BY date`,
@@ -860,13 +942,33 @@ async function fetchModelFirstUse(
  * answer would be thrown away anyway.
  */
 async function fetchPeerTotals(): Promise<{ peers: PeerTotals[]; activeUsers: number }> {
+  // Shared by every visitor for five minutes — see PEER_TTL_MS. The
+  // single-flight inside the cache also means N concurrent profile loads run
+  // this scan once rather than N times.
+  return peerCache.remember('all', fetchPeerTotalsUncached);
+}
+
+async function fetchPeerTotalsUncached(): Promise<{ peers: PeerTotals[]; activeUsers: number }> {
   const [events, metrics] = await Promise.all([
+    // The cap is applied per UTC day here, not per the user's own local day:
+    // one query cannot hold a hundred different zones, and this is a
+    // cross-user comparison rather than a figure on anybody's profile. For an
+    // honest user the two groupings give the same total (their flags never
+    // exceed their prompts on any day in any grouping), so the difference only
+    // exists for someone the cap is there to bound anyway.
     query<{ user_id: string; prompts: number; ultrathinks: number }>(
       `SELECT
          user_id,
-         toUInt64(countIf(${PROMPT_EVENT_SQL})) AS prompts,
-         toUInt64(countIf(${ULTRATHINK_EVENT_SQL})) AS ultrathinks
-       FROM events_raw FINAL
+         toUInt64(sum(day_prompts)) AS prompts,
+         toUInt64(sum(day_flags)) AS ultrathinks
+       FROM (
+         SELECT
+           user_id,
+           countIf(${PROMPT_EVENT_SQL}) AS day_prompts,
+           ${CAPPED_ULTRATHINKS_SQL} AS day_flags
+         FROM events_raw FINAL
+         GROUP BY user_id, toDate(timestamp)
+       )
        GROUP BY user_id
        HAVING prompts > 0`
     ),
@@ -889,14 +991,39 @@ async function fetchPeerTotals(): Promise<{ peers: PeerTotals[]; activeUsers: nu
   return { peers, activeUsers: peers.length };
 }
 
+/**
+ * The two CROSS-USER queries, cached for five minutes for everybody.
+ *
+ * Everything else here is scoped to one user and is cached per profile by the
+ * route. These two scan every row in events_raw and metrics_raw, they give the
+ * same answer to every visitor, and they ran on EVERY profile request — so one
+ * popular profile was re-counting the whole user base several times a minute to
+ * decide whether a milestone is rare.
+ *
+ * Five minutes, because the answers are a population count and a distribution:
+ * both move by a rounding error over that window, and a stale rarity tier is a
+ * worse outcome than no caching only if it is stale by hours.
+ */
+const PEER_TTL_MS = 5 * 60 * 1000;
+const peerCache = new TtlCache<{ peers: PeerTotals[]; activeUsers: number }>(PEER_TTL_MS, 4);
+const activeUserCache = new TtlCache<number>(PEER_TTL_MS, 4);
+
+/** Clears the cross-user caches. For the tests, and for an admin resync. */
+export function clearPeerCaches(): void {
+  peerCache.clear();
+  activeUserCache.clear();
+}
+
 /** How many users have ever sent a prompt — the rarity gate's denominator. */
 async function countActiveUsers(): Promise<number> {
-  const rows = await query<{ users: number }>(
-    `SELECT toUInt64(uniqExact(user_id)) AS users
-     FROM events_raw FINAL
-     WHERE ${PROMPT_EVENT_SQL}`
-  );
-  return Number(rows[0]?.users) || 0;
+  return activeUserCache.remember('all', async () => {
+    const rows = await query<{ users: number }>(
+      `SELECT toUInt64(uniqExact(user_id)) AS users
+       FROM events_raw FINAL
+       WHERE ${PROMPT_EVENT_SQL}`
+    );
+    return Number(rows[0]?.users) || 0;
+  });
 }
 
 /** A milestone for the first prompt sent to each model family. */
@@ -1058,6 +1185,8 @@ export function buildClassHistory(
 export interface FingerprintOptions {
   username: string;
   timezone?: string;
+  /** Whether the viewer is the subject. Decides nothing but `timezone` — see V2. */
+  isOwner?: boolean;
   /** Sections to leave out, from the owner's profile_settings. */
   hidden?: FingerprintSection[];
   /** Overridable so the tests do not depend on the wall clock. */
@@ -1099,6 +1228,7 @@ export async function getFingerprint(
     dailySeries,
     modelFirstUse,
     activeUsers,
+    ultrathink,
   ] = await Promise.all([
     fetchEventTotals(userId, tz),
     fetchMetricTotals(userId, tz, week),
@@ -1111,6 +1241,7 @@ export async function getFingerprint(
     fetchDailySeries(userId, tz),
     fetchModelFirstUse(userId, tz),
     countActiveUsers(),
+    fetchUltrathinks(userId, tz),
   ]);
 
   const promptsAll = Number(eventTotals?.prompts_all) || 0;
@@ -1118,7 +1249,7 @@ export async function getFingerprint(
   const valueAll = Number(metricTotals?.value_all) || 0;
   const outputTokens = Number(metricTotals?.output_tokens) || 0;
   const charsTyped = Number(eventTotals?.chars_all) || 0;
-  const ultrathinks = Number(eventTotals?.ultrathinks) || 0;
+  const charsFromHistory = Number(eventTotals?.chars_from_history) || 0;
 
   const anatomy: Anatomy = {
     allTime: {
@@ -1166,6 +1297,7 @@ export async function getFingerprint(
       outputTokens,
       approxOutputChars,
       ratio: charsTyped > 0 ? approxOutputChars / charsTyped : null,
+      historyDerivedCharsPct: charsTyped > 0 ? (charsFromHistory * 100) / charsTyped : 0,
     },
     rings: buildRings(grid, languages, models),
     class: buildClassHistory(
@@ -1176,15 +1308,18 @@ export async function getFingerprint(
     ),
     milestones,
     ultrathink: {
-      count: ultrathinks,
-      sharePct: promptsAll > 0 ? (ultrathinks * 100) / promptsAll : 0,
-      firstSeen: eventTotals?.ultrathink_first ?? null,
+      // Both sides of the share come out of the same capped count, so it
+      // cannot read over 100% however many flags a client posts.
+      count: ultrathink.count,
+      sharePct: promptsAll > 0 ? (Math.min(ultrathink.count, promptsAll) * 100) / promptsAll : 0,
+      firstSeen: ultrathink.firstSeen,
     },
   };
 
   return assembleFingerprint(full, {
     username: options.username,
     timezone: tz,
+    isOwner: options.isOwner ?? false,
     generatedAt: now.toISOString(),
     hidden,
   });
@@ -1222,6 +1357,8 @@ export function assembleFingerprint(
   meta: {
     username: string;
     timezone: string;
+    /** Owner-only fields are left out entirely for anyone else. */
+    isOwner?: boolean;
     generatedAt: string;
     hidden: readonly FingerprintSection[];
   }
@@ -1230,7 +1367,10 @@ export function assembleFingerprint(
 
   return {
     username: meta.username,
-    timezone: meta.timezone,
+    // Left OUT for a visitor rather than defaulted to UTC: a wrong zone is a
+    // claim about where somebody is, and the figures do not need it — they are
+    // already converted. See FingerprintData.timezone.
+    ...(meta.isOwner && { timezone: meta.timezone }),
     generatedAt: meta.generatedAt,
     sections: BUILT_SECTIONS.filter(show),
     hidden: [...meta.hidden],

@@ -90,6 +90,20 @@ export class TtlCache<T> {
     this.#entries.delete(key);
   }
 
+  /**
+   * Forget every key starting with `prefix`.
+   *
+   * For a cache whose key carries more than the subject — a profile payload
+   * keyed by user AND by the visibility settings it was built under, say. The
+   * settings change, so the old keys can no longer be named one by one, and
+   * `clear()` would throw away every other user's entry to evict one user's.
+   */
+  deletePrefix(prefix: string): void {
+    for (const key of this.#entries.keys()) {
+      if (key.startsWith(prefix)) this.#entries.delete(key);
+    }
+  }
+
   clear(): void {
     this.#entries.clear();
   }

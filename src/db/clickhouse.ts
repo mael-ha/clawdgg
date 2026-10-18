@@ -665,6 +665,16 @@ export const CLAUDE_CODE_EVENT_SQL = `startsWith(event_name, 'claude_code.')`;
  * rarity comparison by UTC day (one query cannot hold a hundred zones). All
  * three read the same expression — see fetchPeerTotals for why the UTC variant
  * differs only for an abuser.
+ *
+ * LOAD-BEARING ASSUMPTION: a flag carries the same instant as the prompt it
+ * describes. Both sources guarantee it — the hook posts the prompt's own
+ * timestamp, and the history import emits both rows from one record — and the
+ * cap depends on it: a flag grouped into a different day from its prompt is a
+ * day with flags and no prompts, which `least` reduces to zero. Verified
+ * against clickhouse-local, which is also how that was found: a fixture that
+ * put them an hour apart capped an honest count away. The residual is a prompt
+ * submitted across local midnight whose two rows land on opposite sides of the
+ * millisecond, which is at most one flag per user per lifetime.
  */
 export const CAPPED_ULTRATHINKS_SQL =
   `least(countIf(${ULTRATHINK_EVENT_SQL}), countIf(${PROMPT_EVENT_SQL}))`;

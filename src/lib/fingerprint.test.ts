@@ -529,7 +529,13 @@ describe('assembleFingerprint', () => {
       allTime: { prompts: 1, medianPromptChars: 170, toolCallsPerPrompt: 9.6, linesPerPrompt: 36, valuePerPrompt: 1.13 },
       last30d: { prompts: 1, medianPromptChars: 170, toolCallsPerPrompt: 9.6, linesPerPrompt: 36, valuePerPrompt: 1.13 },
     },
-    conversation: { charsTyped: 100, outputTokens: 50, approxOutputChars: 200, ratio: 2 },
+    conversation: {
+      charsTyped: 100,
+      outputTokens: 50,
+      approxOutputChars: 200,
+      ratio: 2,
+      historyDerivedCharsPct: 0,
+    },
     rings: buildRings([], [], []),
     class: buildClassHistory('2026-10', [], [], []),
     milestones: [],
@@ -569,7 +575,25 @@ describe('assembleFingerprint', () => {
     }
     // The identity of the profile survives; only its contents are withheld.
     expect(data.username).toBe('ann');
-    expect(data.timezone).toBe('Europe/Paris');
+  });
+
+  /**
+   * The zone is OWNER-ONLY. It is not usage data — `America/Argentina/
+   * Buenos_Aires` is where somebody lives, narrower than most location fields,
+   * and nobody consented to publishing it by running `clawdgg setup`. Left OUT
+   * for a visitor rather than defaulted to UTC, because a wrong zone is still a
+   * claim about where someone is, and the figures do not need it: they arrive
+   * already converted.
+   */
+  it('tells only the owner which clock the hours were read in', () => {
+    const owner = assembleFingerprint(parts, { ...meta, isOwner: true, hidden: [] });
+    expect(owner.timezone).toBe('Europe/Paris');
+
+    const visitor = assembleFingerprint(parts, { ...meta, hidden: [] });
+    expect('timezone' in visitor).toBe(false);
+    // And the figures are there all the same.
+    expect(visitor.rings).toBeDefined();
+    expect(visitor.class).toBeDefined();
   });
 
   // `curve`, `year` and `plan` are toggleable sections this payload does not
