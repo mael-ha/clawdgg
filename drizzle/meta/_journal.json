@@ -27,7 +27,7 @@
       "idx": 3,
       "version": "6",
       "when": 1766429839187,
-      "tag": "0003_certain_baron_strucker",
+      "tag": "0003_v3_token_breakdown",
       "breakpoints": true
     },
     {
@@ -91,6 +91,13 @@
       "version": "6",
       "when": 1794200000000,
       "tag": "0012_add_profile_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1794300000000,
+      "tag": "0013_dashboard_v2_archetypes",
       "breakpoints": true
     }
   ]
