@@ -223,103 +223,6 @@ html {
 }
 
 /* ============================================
-   GLITCH TEXT EFFECT
-   Hero-sized type only — the ghost layers need room to read as a glitch
-   instead of as a rendering bug (that is what broke the 20px nav logo).
-   ============================================ */
-
-.glitch-text {
-  position: relative;
-  animation: glitch-skew 1s infinite linear alternate-reverse;
-}
-
-.glitch-text::before,
-.glitch-text::after {
-  content: attr(data-text);
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-}
-
-.glitch-text::before {
-  left: 2px;
-  text-shadow: -2px 0 var(--magenta);
-  clip: rect(44px, 450px, 56px, 0);
-  animation: glitch-anim 5s infinite linear alternate-reverse;
-}
-
-.glitch-text::after {
-  left: -2px;
-  text-shadow: -2px 0 var(--cyan);
-  clip: rect(44px, 450px, 56px, 0);
-  animation: glitch-anim2 5s infinite linear alternate-reverse;
-}
-
-@keyframes glitch-anim {
-  0% { clip: rect(31px, 9999px, 94px, 0); transform: skew(0.85deg); }
-  5% { clip: rect(70px, 9999px, 71px, 0); transform: skew(0.34deg); }
-  10% { clip: rect(29px, 9999px, 24px, 0); transform: skew(0.99deg); }
-  15% { clip: rect(61px, 9999px, 98px, 0); transform: skew(0.13deg); }
-  20% { clip: rect(85px, 9999px, 72px, 0); transform: skew(0.81deg); }
-  25% { clip: rect(68px, 9999px, 25px, 0); transform: skew(0.63deg); }
-  30% { clip: rect(41px, 9999px, 34px, 0); transform: skew(0.14deg); }
-  35% { clip: rect(67px, 9999px, 62px, 0); transform: skew(0.95deg); }
-  40% { clip: rect(86px, 9999px, 73px, 0); transform: skew(0.86deg); }
-  45% { clip: rect(85px, 9999px, 56px, 0); transform: skew(0.41deg); }
-  50% { clip: rect(83px, 9999px, 29px, 0); transform: skew(0.14deg); }
-  55% { clip: rect(71px, 9999px, 97px, 0); transform: skew(0.64deg); }
-  60% { clip: rect(97px, 9999px, 35px, 0); transform: skew(0.63deg); }
-  65% { clip: rect(95px, 9999px, 11px, 0); transform: skew(0.44deg); }
-  70% { clip: rect(18px, 9999px, 13px, 0); transform: skew(0.95deg); }
-  75% { clip: rect(15px, 9999px, 46px, 0); transform: skew(0.07deg); }
-  80% { clip: rect(5px, 9999px, 5px, 0); transform: skew(0.58deg); }
-  85% { clip: rect(64px, 9999px, 91px, 0); transform: skew(0.31deg); }
-  90% { clip: rect(54px, 9999px, 8px, 0); transform: skew(0.89deg); }
-  95% { clip: rect(98px, 9999px, 69px, 0); transform: skew(0.22deg); }
-  100% { clip: rect(72px, 9999px, 14px, 0); transform: skew(0.15deg); }
-}
-
-@keyframes glitch-anim2 {
-  0% { clip: rect(65px, 9999px, 100px, 0); transform: skew(0.03deg); }
-  5% { clip: rect(52px, 9999px, 74px, 0); transform: skew(0.65deg); }
-  10% { clip: rect(79px, 9999px, 85px, 0); transform: skew(0.48deg); }
-  15% { clip: rect(75px, 9999px, 5px, 0); transform: skew(0.67deg); }
-  20% { clip: rect(67px, 9999px, 61px, 0); transform: skew(0.93deg); }
-  25% { clip: rect(14px, 9999px, 79px, 0); transform: skew(0.43deg); }
-  30% { clip: rect(1px, 9999px, 66px, 0); transform: skew(0.13deg); }
-  35% { clip: rect(86px, 9999px, 30px, 0); transform: skew(0.61deg); }
-  40% { clip: rect(23px, 9999px, 98px, 0); transform: skew(0.49deg); }
-  45% { clip: rect(85px, 9999px, 72px, 0); transform: skew(0.62deg); }
-  50% { clip: rect(71px, 9999px, 75px, 0); transform: skew(0.47deg); }
-  55% { clip: rect(2px, 9999px, 48px, 0); transform: skew(0.53deg); }
-  60% { clip: rect(30px, 9999px, 16px, 0); transform: skew(0.03deg); }
-  65% { clip: rect(59px, 9999px, 50px, 0); transform: skew(0.37deg); }
-  70% { clip: rect(32px, 9999px, 91px, 0); transform: skew(0.69deg); }
-  75% { clip: rect(58px, 9999px, 75px, 0); transform: skew(0.72deg); }
-  80% { clip: rect(4px, 9999px, 8px, 0); transform: skew(0.05deg); }
-  85% { clip: rect(82px, 9999px, 31px, 0); transform: skew(0.4deg); }
-  90% { clip: rect(47px, 9999px, 13px, 0); transform: skew(0.77deg); }
-  95% { clip: rect(57px, 9999px, 24px, 0); transform: skew(0.37deg); }
-  100% { clip: rect(4px, 9999px, 59px, 0); transform: skew(0.59deg); }
-}
-
-@keyframes glitch-skew {
-  0% { transform: skew(2deg); }
-  10% { transform: skew(-1deg); }
-  20% { transform: skew(0deg); }
-  30% { transform: skew(1deg); }
-  40% { transform: skew(-2deg); }
-  50% { transform: skew(0deg); }
-  60% { transform: skew(1deg); }
-  70% { transform: skew(-1deg); }
-  80% { transform: skew(0deg); }
-  90% { transform: skew(2deg); }
-  100% { transform: skew(-1deg); }
-}
-
-/* ============================================
    NEON GLOW EFFECTS
    ============================================ */
 
@@ -558,11 +461,6 @@ html {
    ============================================ */
 
 @media (max-width: 640px) {
-  .glitch-text::before,
-  .glitch-text::after {
-    display: none;
-  }
-
   .scanlines {
     display: none;
   }
@@ -754,9 +652,7 @@ html {
 @media print {
   .scanlines,
   .grid-bg,
-  nav,
-  .glitch-text::before,
-  .glitch-text::after {
+  nav {
     display: none !important;
   }
 
