@@ -116,6 +116,18 @@ jobs:
       - name: Migrations replay from zero
         run: bun scripts/check-migrations.ts
 
+      # The file production runs. Compose interpolates the secrets out of the
+      # server's .env, so CI passes dummy values by name: this asserts the file
+      # PARSES and that every variable it needs is one the server has to set,
+      # never that any value is right.
+      - name: Production compose file parses
+        env:
+          GITHUB_CLIENT_ID: ci-dummy
+          GITHUB_CLIENT_SECRET: ci-dummy
+          APP_URL: https://ci.invalid
+          SESSION_SECRET: ci-dummy
+        run: docker compose -f docker-compose.staging.yml config -q
+
       # The app's own build. A page that renders without its stylesheet is a
       # broken deploy, and the manifest is what every template resolves its
       # asset URLs through — so its absence is the failure to catch here.

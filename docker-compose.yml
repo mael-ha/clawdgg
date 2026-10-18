@@ -1,8 +1,26 @@
+# LOCAL full stack — the app and ClickHouse together, on your own machine.
+#
+#   docker compose up -d --build        # app on http://localhost:3000
+#
+# This is NOT what production runs. Production is docker-compose.staging.yml
+# (the server, /opt/clawdgg) and `scripts/deploy.sh` is how it gets there.
+# If you only want a database to point `bun run dev` at, that is
+# docker-compose.dev.yml — ClickHouse alone, which is the usual way to work.
+#
+# No Caddy here. It used to be in this file, mounting the production Caddyfile:
+# on a laptop that means asking Let's Encrypt for a clawd.gg certificate, and
+# on the server it meant the live reverse proxy was defined in one file while
+# everything it proxied was defined in another — which is how `up
+# --remove-orphans` with the production file came to be a way to delete the
+# site's TLS terminator. Caddy now lives in docker-compose.staging.yml, with
+# the services it fronts.
+
 services:
   app:
     build: .
     ports:
-      - "3000:3000"
+      # Loopback: a laptop on a café network should not be serving this.
+      - "127.0.0.1:3000:3000"
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -12,10 +30,12 @@ services:
       - DATABASE_PATH=/data/clawd.db
       - CLICKHOUSE_URL=http://clickhouse:8123
       - CLICKHOUSE_DATABASE=clawd
-      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID}
-      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET}
+      # Local defaults, so this comes up without a .env. The OAuth flow needs
+      # real GitHub credentials; everything else works without them.
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
       - APP_URL=${APP_URL:-http://localhost:3000}
-      - SESSION_SECRET=${SESSION_SECRET}
+      - SESSION_SECRET=${SESSION_SECRET:-local-development-secret}
     volumes:
       - sqlite_data:/data
     restart: unless-stopped
@@ -23,8 +43,8 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:24.3-alpine
     ports:
-      - "8123:8123"  # HTTP interface
-      - "9000:9000"  # Native interface
+      - "127.0.0.1:8123:8123"  # HTTP interface
+      - "127.0.0.1:9000:9000"  # Native interface
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./docker/clickhouse/init:/docker-entrypoint-initdb.d:ro
@@ -43,21 +63,6 @@ services:
       retries: 10
     restart: unless-stopped
 
-  caddy:
-    image: caddy:2-alpine
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      - app
-    restart: unless-stopped
-
 volumes:
   sqlite_data:
   clickhouse_data:
-  caddy_data:
-  caddy_config:

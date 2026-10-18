@@ -1,0 +1,102 @@
+# PRODUCTION. This is the file clawd.gg actually runs on (the host `clawdgg`,
+# /opt/clawdgg), and the one `scripts/deploy.sh` syncs there. For a local full
+# stack use docker-compose.yml; for ClickHouse alone, docker-compose.dev.yml.
+#
+# "staging" is a name from the first deploy and nothing else: there is one
+# server and this file runs it.
+#
+# NO VALUES LIVE HERE. Every secret is `${NAME}`, interpolated by compose from
+# /opt/clawdgg/.env on the server — which is not in this repo and never will
+# be. A missing variable becomes an empty string, not an error, so a rename
+# here without the matching rename there is a silently unconfigured app.
+#
+# NO `name:` KEY, AND NO `container_name:` ANYWHERE. The project name comes
+# from the directory (`/opt/clawdgg` → `clawdgg`), which is what makes the
+# volumes `clawdgg_sqlite_data`, `clawdgg_clickhouse_data`,
+# `clawdgg_caddy_data`, `clawdgg_caddy_config` and the containers
+# `clawdgg-app-1`, `clawdgg-clickhouse-1`, `clawdgg-caddy-1`. Those are the
+# names the running server already uses: `up -d` with this file ADOPTS the
+# existing containers and the existing certificates instead of standing up a
+# second set beside them. Set either key and Caddy comes up as a new container
+# fighting the old one for :443, with an empty /data and a fresh (rate-limited)
+# certificate order.
+#
+# NEVER PASS --remove-orphans. Caddy used to be defined in the server's own
+# docker-compose.yml, so until that file is gone a --remove-orphans run against
+# this one deletes the live Caddy container and takes the site down with it.
+
+services:
+  app:
+    build: .
+    ports:
+      # Loopback ONLY. Caddy is the public door and it reaches the app over the
+      # compose network, so a published port is for curl on the box. Published
+      # on 0.0.0.0 this was the whole app, without TLS, on port 3000.
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DATABASE_PATH=/data/clawd.db
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_DATABASE=clawd
+      # `:?` so a variable missing from the server's .env fails the compose
+      # command outright. Compose otherwise substitutes an empty string, and an
+      # empty APP_URL is the cookie `secure` flag silently off (it is derived
+      # from the URL scheme, never from NODE_ENV) on an app that still starts.
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:?set it in /opt/clawdgg/.env}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:?set it in /opt/clawdgg/.env}
+      - APP_URL=${APP_URL:?set it in /opt/clawdgg/.env, e.g. https://clawd.gg}
+      - SESSION_SECRET=${SESSION_SECRET:?set it in /opt/clawdgg/.env}
+    volumes:
+      - sqlite_data:/data
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    ports:
+      # Loopback only: nothing outside the box talks to ClickHouse.
+      - "127.0.0.1:8123:8123"  # HTTP interface
+      - "127.0.0.1:9000:9000"  # Native interface
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./docker/clickhouse/init:/docker-entrypoint-initdb.d:ro
+      - ./docker/clickhouse/config.xml:/etc/clickhouse-server/config.d/custom.xml:ro
+    environment:
+      - CLICKHOUSE_DB=clawd
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # caddy_data holds the Let's Encrypt account and the certificates. The
+      # volume name must stay exactly this: it is what the live container is
+      # already mounting, and a new one means re-issuing clawd.gg's
+      # certificate against Let's Encrypt's rate limit.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  sqlite_data:
+  clickhouse_data:
+  caddy_data:
+  caddy_config:
