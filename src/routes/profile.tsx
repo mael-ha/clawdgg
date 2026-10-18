@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { FC } from 'hono/jsx';
 import { Layout } from '../components/Layout';
+import type { Island } from '../lib/assets';
 import { db } from '../db';
 import { dailyStats, users } from '../db/schema';
 import { eq, sql, asc } from 'drizzle-orm';
@@ -153,7 +154,7 @@ const ContributionGraph: FC<{ days: ContributionDay[] }> = ({ days }) => {
               {week.map((day, dayIdx) => (
                 <div
                   key={dayIdx}
-                  class={`contrib-cell w-[10px] h-[10px] rounded-sm ${day.date ? levelColors[day.level] : 'bg-transparent'} ${day.date ? 'cursor-pointer hover:ring-1 hover:ring-gray-600 transition-all' : ''}`}
+                  class={`contrib-cell w-[10px] h-[10px] rounded-xs ${day.date ? levelColors[day.level] : 'bg-transparent'} ${day.date ? 'cursor-pointer hover:ring-1 hover:ring-gray-600 transition-all' : ''}`}
                   {...buildDataAttrs(day)}
                 />
               ))}
@@ -163,87 +164,11 @@ const ContributionGraph: FC<{ days: ContributionDay[] }> = ({ days }) => {
         <div class="flex items-center gap-1 mt-2 justify-end text-xs text-gray-500">
           <span>Less</span>
           {levelColors.map((color, i) => (
-            <div key={i} class={`w-[10px] h-[10px] rounded-sm ${color}`} />
+            <div key={i} class={`w-[10px] h-[10px] rounded-xs ${color}`} />
           ))}
           <span>More</span>
         </div>
       </div>
-
-      {/* Tooltip script */}
-      <script dangerouslySetInnerHTML={{
-        __html: `
-          (function() {
-            const container = document.getElementById('contribution-graph-container');
-            const tooltip = document.getElementById('contrib-tooltip');
-            if (!container || !tooltip) return;
-
-            function formatNum(n) {
-              n = parseInt(n, 10) || 0;
-              if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
-              if (n >= 1000) return Math.round(n / 1000) + 'K';
-              return n.toString();
-            }
-
-            function formatDate(dateStr) {
-              const d = new Date(dateStr);
-              const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
-              return months[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear();
-            }
-
-            container.addEventListener('mouseover', function(e) {
-              const cell = e.target.closest('.contrib-cell');
-              if (!cell || !cell.dataset.date) return;
-
-              const date = cell.dataset.date;
-              const count = parseInt(cell.dataset.count, 10) || 0;
-              const tokens = cell.dataset.tokens;
-              const linesAdded = cell.dataset.linesAdded;
-              const linesRemoved = cell.dataset.linesRemoved;
-              const cost = cell.dataset.cost;
-
-              let html = '<div class="text-gray-300 mb-1">' + formatDate(date) + '</div>';
-              html += '<div class="border-t border-gray-700 pt-1 mt-1 space-y-0.5">';
-              if (count > 0) {
-                html += '<div class="text-white">' + count + ' prompts</div>';
-              } else if (tokens !== undefined && parseInt(tokens, 10) > 0) {
-                html += '<div class="text-gray-500 text-xs italic">backfilled — prompt count unavailable</div>';
-              }
-
-              if (tokens !== undefined) {
-                html += '<div class="text-cyan-400">' + formatNum(tokens) + ' tokens</div>';
-              }
-              if (linesAdded !== undefined || linesRemoved !== undefined) {
-                const added = parseInt(linesAdded, 10) || 0;
-                const removed = parseInt(linesRemoved, 10) || 0;
-                // Show +/- format for OTEL data, just + for legacy (no removed tracking)
-                if (linesRemoved !== undefined) {
-                  html += '<div><span class="text-green-400">+' + formatNum(added) + '</span> / <span class="text-red-400">-' + formatNum(removed) + '</span> lines</div>';
-                } else {
-                  html += '<div><span class="text-green-400">+' + formatNum(added) + ' lines</span></div>';
-                }
-              }
-              if (cost !== undefined) {
-                const costVal = parseFloat(cost) || 0;
-                html += '<div class="text-amber-400">$' + (costVal >= 1 ? costVal.toFixed(0) : costVal.toFixed(2)) + '</div>';
-              }
-              html += '</div>';
-
-              tooltip.innerHTML = html;
-              tooltip.classList.remove('hidden');
-
-              const rect = cell.getBoundingClientRect();
-              const containerRect = container.getBoundingClientRect();
-              tooltip.style.left = (rect.left - containerRect.left + rect.width / 2) + 'px';
-              tooltip.style.top = (rect.top - containerRect.top - tooltip.offsetHeight - 8) + 'px';
-            });
-
-            container.addEventListener('mouseout', function(e) {
-              if (!e.target.closest('.contrib-cell')) return;
-              tooltip.classList.add('hidden');
-            });
-          })();
-        `
-      }} />
     </div>
   );
 };
@@ -471,7 +396,6 @@ clawd.gg/u/${profile.username}`;
           {isOwnProfile && (
             <button
               data-share-text={shareText}
-              onclick="navigator.clipboard.writeText(this.dataset.shareText).then(() => { this.textContent = '✓ copied'; setTimeout(() => this.textContent = 'copy stats', 2000); });"
               class="px-3 py-1.5 bg-transparent hover:bg-gray-900 border border-gray-800 hover:border-gray-700 rounded text-gray-500 hover:text-gray-300 font-mono text-xs transition-all"
             >
               copy stats
@@ -867,7 +791,11 @@ app.get('/:username', async (c) => {
 
   if (user.length === 0) {
     return c.html(
-      <Layout title={`@${username} - Not Found`} user={currentUser}>
+      <Layout
+        title={`@${username} - Not Found - clawd.gg`}
+        description={`@${username} hasn't joined clawd.gg yet.`}
+        user={currentUser}
+      >
         <NotFound username={username} />
       </Layout>,
       404
@@ -1152,8 +1080,24 @@ app.get('/:username', async (c) => {
     hourCounts,
   };
 
+  const islands: Island[] = ['contribution-tooltip'];
+  if (isOwnProfile) islands.push('analytics-chart', 'copy-share');
+
+  const summary = `${formatArchetypeDisplay(archetypes)} · ${formatCost(totalCostCents)} invested in Claude · rank #${rank} of ${totalUsers}`;
+
   return c.html(
-    <Layout title={`@${username} - clawd.gg`} user={currentUser}>
+    <Layout
+      title={`@${username} - clawd.gg`}
+      description={summary}
+      user={currentUser}
+      islands={islands}
+      og={{
+        title: `@${username} on clawd.gg`,
+        description: summary,
+        image: userData.avatarUrl ?? undefined,
+        url: `${process.env.APP_URL || 'https://clawd.gg'}/u/${username}`,
+      }}
+    >
       <Profile
         profile={profile}
         archetypes={archetypes}

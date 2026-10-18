@@ -1,15 +1,92 @@
 /* ============================================
-   clawd.gg - Custom Styles
+   clawd.gg - the ONE theme source
    Terminal/Cyberpunk Theme
+
+   Compiled by `bun run build` (scripts/build-assets.ts) into a hashed
+   public/build/app-<hash>.css. Nothing else defines brand colors, fonts or
+   effects: the four inline `tailwind.config` blobs that used to drift
+   (Layout/index/about/auth) are gone.
    ============================================ */
+
+@import "tailwindcss" source(none);
+@source "../**/*.{ts,tsx}";
+
+@theme {
+  /* ── Brand ──────────────────────────────────────────────────────────── */
+  /* Terminal green masquerading as "cyan" since v0.1 — the name is load
+     bearing (hundreds of `text-cyan-400`), the value is the identity. */
+  --color-cyan-400: #00ff9f;
+  --color-cyan-500: #00d884;
+  --color-magenta-400: #ff00ff;
+  --color-magenta-500: #cc00cc;
+
+  --font-mono: 'JetBrains Mono', monospace;
+  --font-sans: 'Inter', sans-serif;
+
+  --animate-pulse-slow: pulse-slow 4s ease-in-out infinite;
+  --animate-glow: glow 2s ease-in-out infinite alternate;
+
+  /* ── Palette ────────────────────────────────────────────────────────── */
+  /* Pinned to the Tailwind v3 values the Play CDN served, so moving the
+     build to v4 changes zero pixels. Only the shades actually used. */
+  --color-gray-50: #f9fafb;
+  --color-gray-100: #f3f4f6;
+  --color-gray-200: #e5e7eb;
+  --color-gray-300: #d1d5db;
+  --color-gray-400: #9ca3af;
+  --color-gray-500: #6b7280;
+  --color-gray-600: #4b5563;
+  --color-gray-700: #374151;
+  --color-gray-800: #1f2937;
+  --color-gray-900: #111827;
+  --color-gray-950: #030712;
+
+  --color-cyan-300: #67e8f9;
+  --color-cyan-700: #0e7490;
+  --color-cyan-900: #164e63;
+
+  --color-red-400: #f87171;
+  --color-red-500: #ef4444;
+  --color-orange-400: #fb923c;
+  --color-amber-300: #fcd34d;
+  --color-amber-400: #fbbf24;
+  --color-amber-500: #f59e0b;
+  --color-amber-600: #d97706;
+  --color-amber-800: #92400e;
+  --color-yellow-400: #facc15;
+  --color-yellow-500: #eab308;
+  --color-green-400: #4ade80;
+  --color-green-500: #22c55e;
+  --color-blue-500: #3b82f6;
+  --color-blue-600: #2563eb;
+  --color-purple-400: #c084fc;
+  --color-purple-500: #a855f7;
+}
+
+/* ── v3 compatibility ─────────────────────────────────────────────────────
+   Two preflight defaults flipped in Tailwind v4. Both would be silent visual
+   regressions here, so they are pinned back to what the CDN rendered. */
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop {
+    border-color: var(--color-gray-200);
+  }
+
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+}
 
 /* ============================================
    BASE STYLES
    ============================================ */
 
 :root {
-  --cyan: #00ff9f;
-  --magenta: #ff00ff;
+  --cyan: var(--color-cyan-400);
+  --magenta: var(--color-magenta-400);
   --dark: #0a0a0a;
   --grid-color: rgba(0, 255, 159, 0.03);
 }
@@ -125,6 +202,8 @@ html {
 
 /* ============================================
    GLITCH TEXT EFFECT
+   Hero-sized type only — the ghost layers need room to read as a glitch
+   instead of as a rendering bug (that is what broke the 20px nav logo).
    ============================================ */
 
 .glitch-text {
@@ -265,8 +344,10 @@ html {
   }
 }
 
-.animate-glow {
-  animation: glow 2s ease-in-out infinite alternate;
+/* Device-link page backdrop */
+@keyframes pulse-slow {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 0.5; }
 }
 
 /* ============================================
@@ -370,22 +451,6 @@ html {
   }
 }
 
-/* ============================================
-   HTMX LOADING STATES
-   ============================================ */
-
-.htmx-indicator {
-  display: none;
-}
-
-.htmx-request .htmx-indicator {
-  display: flex;
-}
-
-.htmx-request.htmx-indicator {
-  display: flex;
-}
-
 /* Loading skeleton */
 .skeleton {
   background: linear-gradient(
@@ -424,6 +489,37 @@ html {
     linear-gradient(0deg, transparent 24%, rgba(0, 255, 159, 0.05) 25%, rgba(0, 255, 159, 0.05) 26%, transparent 27%, transparent 74%, rgba(0, 255, 159, 0.05) 75%, rgba(0, 255, 159, 0.05) 76%, transparent 77%, transparent),
     linear-gradient(90deg, transparent 24%, rgba(0, 255, 159, 0.05) 25%, rgba(0, 255, 159, 0.05) 26%, transparent 27%, transparent 74%, rgba(0, 255, 159, 0.05) 75%, rgba(0, 255, 159, 0.05) 76%, transparent 77%, transparent);
   background-size: 50px 50px;
+}
+
+/* ============================================
+   ACTIVITY RADAR (components/ActivityRadar.tsx)
+   Lived in an inline <style> inside the card's space-y-3, where v4's
+   space-y (margin-bottom on :not(:last-child)) gave the invisible element
+   a real 12px gap.
+   ============================================ */
+
+.radar-container {
+  filter: drop-shadow(0 0 15px rgba(34, 211, 238, 0.08));
+}
+
+.radar-segment {
+  animation: segment-fade-in 0.5s ease-out forwards;
+  animation-delay: var(--delay);
+  opacity: 0;
+}
+
+.peak-segment {
+  animation: peak-pulse 2s ease-in-out infinite;
+}
+
+@keyframes segment-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes peak-pulse {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.2); }
 }
 
 /* ============================================

@@ -40,6 +40,18 @@ app.use('*', optionalAuth);
 // Apply rate limiting to API routes
 app.use('/api/*', rateLimit);
 
+// Build output is content-hashed (public/build/app-<hash>.css), so a new
+// build is a new URL and the old one can be cached forever.
+app.use(
+  '/public/build/*',
+  serveStatic({
+    root: './',
+    onFound: (_path, c) => {
+      c.header('Cache-Control', 'public, max-age=31536000, immutable');
+    },
+  })
+);
+
 // Serve static files from public/
 app.use('/public/*', serveStatic({ root: './' }));
 

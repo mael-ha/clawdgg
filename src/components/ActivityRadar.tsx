@@ -213,29 +213,6 @@ export const ActivityRadar: FC<ActivityRadarProps> = ({ hourCounts }) => {
           Activity distribution across 24 hours
         </p>
       </div>
-
-      {/* CSS for animations */}
-      <style>{`
-        .radar-container {
-          filter: drop-shadow(0 0 15px rgba(34, 211, 238, 0.08));
-        }
-        .radar-segment {
-          animation: segment-fade-in 0.5s ease-out forwards;
-          animation-delay: var(--delay);
-          opacity: 0;
-        }
-        .peak-segment {
-          animation: peak-pulse 2s ease-in-out infinite;
-        }
-        @keyframes segment-fade-in {
-          from { opacity: 0; }
-          to { opacity: 1; }
-        }
-        @keyframes peak-pulse {
-          0%, 100% { filter: brightness(1); }
-          50% { filter: brightness(1.2); }
-        }
-      `}</style>
     </div>
   );
 };

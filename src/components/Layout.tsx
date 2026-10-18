@@ -1,10 +1,44 @@
 import type { FC, PropsWithChildren } from 'hono/jsx';
 import type { SessionUser } from '../types';
+import { islandUrl, stylesheet, type Island } from '../lib/assets';
+
+/**
+ * The only <head> on the site. Every HTML response goes through here — the
+ * homepage, profiles and 404s, /about, and the device-link page — so the
+ * stylesheet, the fonts and the meta tags are defined once instead of in four
+ * inline copies that drifted (the device page's magenta was a different
+ * magenta for months).
+ *
+ * `nav` and `effects` exist because the pages genuinely differ: the homepage
+ * and /about carry their own headers, and the device-link page is a centered
+ * card with no chrome at all.
+ */
+
+interface OpenGraph {
+  title?: string;
+  description?: string;
+  image?: string;
+  url?: string;
+}
 
 interface LayoutProps extends PropsWithChildren {
-  title?: string;
+  title: string;
+  description?: string;
   user?: SessionUser | null;
+  og?: OpenGraph;
+  /** Islands this page needs. Each is a separate module — pages pay for what they use. */
+  islands?: Island[];
+  /** The fixed top nav, and the padded <main> that makes room for it. */
+  nav?: boolean;
+  /** Scanlines + grid background. */
+  effects?: boolean;
+  bodyClass?: string;
 }
+
+const DEFAULT_DESCRIPTION =
+  "The leaderboard for Claude Code power users. Track your prompts, tokens, and lines of code.";
+
+const DEFAULT_BODY_CLASS = 'bg-black text-gray-100 font-mono min-h-screen antialiased';
 
 // ASCII art logo for clawd.gg - the terminal vibe
 const ASCII_LOGO = `
@@ -92,74 +126,67 @@ const NavBar: FC<{ user?: SessionUser | null }> = ({ user }) => (
   </nav>
 );
 
-export const Layout: FC<LayoutProps> = ({ children, title = 'clawd.gg', user }) => (
+export const Layout: FC<LayoutProps> = ({
+  children,
+  title,
+  description = DEFAULT_DESCRIPTION,
+  user,
+  og,
+  islands = [],
+  nav = true,
+  effects = true,
+  bodyClass = DEFAULT_BODY_CLASS,
+}) => (
   <html lang="en" class="dark">
     <head>
       <meta charset="UTF-8" />
       <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-      <title>{title} - Claude Code Leaderboard</title>
-      <meta name="description" content="The ultimate Claude Code usage leaderboard. See who's shipping the most with AI-powered coding." />
+      <title>{title}</title>
+      <meta name="description" content={description} />
+
+      {/* Social cards */}
+      <meta property="og:site_name" content="clawd.gg" />
+      <meta property="og:type" content="website" />
+      <meta property="og:title" content={og?.title ?? title} />
+      <meta property="og:description" content={og?.description ?? description} />
+      {og?.url && <meta property="og:url" content={og.url} />}
+      {og?.image && <meta property="og:image" content={og.image} />}
+      <meta name="twitter:card" content="summary" />
+      <meta name="twitter:title" content={og?.title ?? title} />
+      <meta name="twitter:description" content={og?.description ?? description} />
+      {og?.image && <meta name="twitter:image" content={og.image} />}
 
       {/* Fonts */}
       <link rel="preconnect" href="https://fonts.googleapis.com" />
       <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
       <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
-      {/* Tailwind CSS */}
-      <script src="https://cdn.tailwindcss.com"></script>
-      <script dangerouslySetInnerHTML={{
-        __html: `
-          tailwind.config = {
-            darkMode: 'class',
-            theme: {
-              extend: {
-                colors: {
-                  cyan: {
-                    400: '#00ff9f',
-                    500: '#00d884',
-                  },
-                  magenta: {
-                    400: '#ff00ff',
-                    500: '#cc00cc',
-                  },
-                },
-                fontFamily: {
-                  mono: ['JetBrains Mono', 'monospace'],
-                  sans: ['Inter', 'sans-serif'],
-                },
-                animation: {
-                  'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
-                  'glow': 'glow 2s ease-in-out infinite alternate',
-                },
-              },
-            },
-          }
-        `
-      }} />
+      {/* Compiled Tailwind + theme (bun run build) */}
+      <link rel="stylesheet" href={stylesheet()} />
 
-      {/* HTMX */}
-      <script src="https://unpkg.com/htmx.org@1.9.10"></script>
-
-      {/* Chart.js for analytics charts */}
-      <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-
-      {/* Custom Styles */}
-      <link rel="stylesheet" href="/public/styles.css" />
+      {/* Islands: ES modules, so deferred by definition */}
+      {islands.map((island) => (
+        <script key={island} type="module" src={islandUrl(island)}></script>
+      ))}
     </head>
-    <body class="bg-black text-gray-100 font-mono min-h-screen antialiased">
-      {/* Scanline overlay */}
-      <div class="scanlines pointer-events-none fixed inset-0 z-[100]"></div>
+    <body class={bodyClass}>
+      {effects && (
+        <>
+          {/* Scanline overlay */}
+          <div class="scanlines pointer-events-none fixed inset-0 z-[100]"></div>
+          {/* Grid background */}
+          <div class="grid-bg fixed inset-0 z-0 pointer-events-none"></div>
+        </>
+      )}
 
-      {/* Grid background */}
-      <div class="grid-bg fixed inset-0 z-0 pointer-events-none"></div>
-
-      {/* Navigation */}
-      <NavBar user={user} />
-
-      {/* Main content */}
-      <main class="relative z-10 pt-16">
-        {children}
-      </main>
+      {nav ? (
+        <>
+          <NavBar user={user} />
+          <main class="relative z-10 pt-16">{children}</main>
+        </>
+      ) : (
+        children
+      )}
 
       {/* ASCII Art Easter Egg in Console */}
       <script dangerouslySetInnerHTML={{

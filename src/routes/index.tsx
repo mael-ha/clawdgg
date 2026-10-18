@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { Layout } from '../components/Layout';
 import { optionalAuth } from '../lib/auth-middleware';
 import { db } from '../db';
 import { dailyStats, users } from '../db/schema';
@@ -289,9 +290,6 @@ const LeaderboardRow = ({ entry, isCurrentUser }: RowProps) => {
   );
 };
 
-// Row component for HTMX partial rendering
-export const LeaderboardRowPartial = LeaderboardRow;
-
 interface YourRankPillProps {
   rank: number;
   total: number;
@@ -511,7 +509,7 @@ async function getLeaderboardData(period: Period, sort: SortKey, limit: number, 
 // Routes
 // ═══════════════════════════════════════════════════════════════════════════
 
-// HTMX endpoint for loading more rows
+// HTML fragment the leaderboard-more island appends (rows + the next button)
 app.get('/rows', optionalAuth, async (c) => {
   const user = c.get('user');
   const offset = parseInt(c.req.query('offset') || '0', 10);
@@ -537,10 +535,8 @@ app.get('/rows', optionalAuth, async (c) => {
       {hasMore && (
         <div class="text-center mt-4">
           <button
-            hx-get={`/rows?period=${period}&sort=${sort}&offset=${nextOffset}`}
-            hx-target="#leaderboard-rows"
-            hx-swap="beforeend"
-            class="px-6 py-2 text-cyan-400 hover:text-cyan-300 border border-cyan-500/30 hover:border-cyan-500/50 rounded-lg font-mono text-sm transition-all load-more-btn"
+            data-load-more={`/rows?period=${period}&sort=${sort}&offset=${nextOffset}`}
+            class="px-6 py-2 text-cyan-400 hover:text-cyan-300 border border-cyan-500/30 hover:border-cyan-500/50 rounded-lg font-mono text-sm transition-all"
           >
             Load More ({total - nextOffset} remaining)
           </button>
@@ -608,58 +604,13 @@ app.get('/', optionalAuth, async (c) => {
   const sortConfig = SORT_OPTIONS[sort];
 
   return c.html(
-    <html lang="en" class="dark">
-      <head>
-        <meta charset="UTF-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>clawd.gg - Claude Code Leaderboard</title>
-        <meta name="description" content="The leaderboard for Claude Code power users. Track your prompts, tokens, and lines of code." />
-
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
-        <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
-
-        <script src="https://cdn.tailwindcss.com"></script>
-        <script dangerouslySetInnerHTML={{
-          __html: `
-            tailwind.config = {
-              darkMode: 'class',
-              theme: {
-                extend: {
-                  colors: {
-                    cyan: { 400: '#00ff9f', 500: '#00d884' },
-                    magenta: { 400: '#ff00ff', 500: '#cc00cc' },
-                  },
-                  fontFamily: {
-                    mono: ['JetBrains Mono', 'monospace'],
-                    sans: ['Inter', 'sans-serif'],
-                  },
-                },
-              },
-            }
-          `
-        }} />
-
-        {/* HTMX */}
-        <script src="https://unpkg.com/htmx.org@1.9.10"></script>
-        <script dangerouslySetInnerHTML={{
-          __html: `
-            // Remove load more button container after HTMX request
-            document.addEventListener('htmx:afterRequest', function(e) {
-              if (e.target.classList.contains('load-more-btn')) {
-                e.target.parentElement.remove();
-              }
-            });
-          `
-        }} />
-
-        <link rel="stylesheet" href="/public/styles.css" />
-      </head>
-      <body class="bg-black text-gray-100 font-mono min-h-screen antialiased">
-        <div class="scanlines pointer-events-none fixed inset-0 z-[100]"></div>
-        <div class="grid-bg fixed inset-0 z-0 pointer-events-none"></div>
-
-        <div class="relative z-10">
+    <Layout
+      title="clawd.gg - Claude Code Leaderboard"
+      user={user}
+      nav={false}
+      islands={hasMore && entries.length > 0 ? ['leaderboard-more'] : []}
+    >
+      <div class="relative z-10">
           <Header user={user} />
           <SmallHero
             totalUsers={heroStats.totalUsers}
@@ -713,14 +664,12 @@ app.get('/', optionalAuth, async (c) => {
                 )}
               </div>
 
-              {/* Load more button (HTMX) */}
+              {/* Load more (leaderboard-more island) */}
               {hasMore && entries.length > 0 && (
-                <div class="text-center mt-6" id="load-more-container">
+                <div class="text-center mt-6">
                   <button
-                    hx-get={`/rows?period=${period}&sort=${sort}&offset=${initialSize}`}
-                    hx-target="#leaderboard-rows"
-                    hx-swap="beforeend"
-                    class="px-6 py-3 text-cyan-400 hover:text-cyan-300 border border-cyan-500/30 hover:border-cyan-500/50 rounded-lg font-mono text-sm transition-all hover:shadow-lg hover:shadow-cyan-500/10 load-more-btn"
+                    data-load-more={`/rows?period=${period}&sort=${sort}&offset=${initialSize}`}
+                    class="px-6 py-3 text-cyan-400 hover:text-cyan-300 border border-cyan-500/30 hover:border-cyan-500/50 rounded-lg font-mono text-sm transition-all hover:shadow-lg hover:shadow-cyan-500/10"
                   >
                     Load More ({total - initialSize} remaining)
                   </button>
@@ -739,8 +688,7 @@ app.get('/', optionalAuth, async (c) => {
           <HowItWorks />
           <Footer />
         </div>
-      </body>
-    </html>
+    </Layout>
   );
 });
 

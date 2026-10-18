@@ -43,3 +43,6 @@ data/*.db-wal
 
 # Bun lockfile (optional - can include for reproducibility)
 # bun.lockb
+
+# built assets (bun run build)
+public/build

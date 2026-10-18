@@ -88,7 +88,7 @@ export const TokenBreakdown: FC<TokenBreakdownProps> = ({
             <div key={key} class="group">
               <div class="flex items-center justify-between text-sm mb-1">
                 <div class="flex items-center gap-2">
-                  <div class="w-3 h-3 rounded-sm" style={`background-color: ${color}`} />
+                  <div class="w-3 h-3 rounded-xs" style={`background-color: ${color}`} />
                   <span class="text-gray-400">{label}</span>
                   <span class="text-gray-600 text-xs">{description}</span>
                 </div>
