@@ -35,6 +35,8 @@ import {
   mapJsonlText,
   type ImportEventRow,
 } from "../src/lib/session-import";
+import { ULTRATHINK_EVENT_NAME } from "../src/lib/ultrathink";
+import { DEFAULT_TIMEZONE } from "../src/lib/timezone";
 import {
   applyOtelSettings,
   backupSettings,
@@ -625,6 +627,18 @@ function reportPromptHookMerge(result: PromptHookMergeResult, command: string): 
   console.log();
 }
 
+/** The zone the server has on file, or null if we could not ask. */
+async function fetchServerTimezone(token: string): Promise<string | null> {
+  try {
+    const response = await apiFetch("/api/me/timezone", { token });
+    if (!response.ok) return null;
+    const body = (await response.json()) as { timezone?: unknown };
+    return typeof body.timezone === "string" && body.timezone ? body.timezone : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Tell the server which wall clock this machine keeps.
  *
@@ -633,9 +647,19 @@ function reportPromptHookMerge(result: PromptHookMergeResult, command: string): 
  * question put to the user. The server validates it against the IANA database
  * and keeps UTC if it does not recognise it.
  *
+ * Only ever ONCE, unless asked again. `setup` is re-run routinely (a reinstall,
+ * a new machine, after `disable`), and it used to PUT this machine's zone every
+ * time — so running setup over SSH on a UTC server replaced the zone the user
+ * had picked on the site, silently, and every "when" on their profile moved.
+ * The server's zone wins if it has one; `--timezone` is how you overrule it
+ * from the machine you are on.
+ *
  * Returns the zone it managed to register, or null.
  */
-async function reportTimezone(token: string | undefined): Promise<string | null> {
+async function reportTimezone(
+  token: string | undefined,
+  options: { force?: boolean } = {}
+): Promise<string | null> {
   if (!token) return null;
 
   let timezone: string;
@@ -645,6 +669,21 @@ async function reportTimezone(token: string | undefined): Promise<string | null>
     return null;
   }
   if (!timezone) return null;
+
+  if (!options.force) {
+    const existing = await fetchServerTimezone(token);
+    // DEFAULT_TIMEZONE is what the endpoint answers for a user who has never
+    // set one, so it is the only reading of "none set" available here — which
+    // does mean an explicit UTC looks unset. Overwriting UTC with the machine's
+    // real zone is the lesser of the two wrong answers, and `--timezone` on a
+    // UTC machine puts it back.
+    if (existing && existing !== DEFAULT_TIMEZONE) {
+      if (existing !== timezone) {
+        log.dim(`Timezone stays ${existing} (set on the site). \`clawdgg setup --timezone\` to use ${timezone}.`);
+      }
+      return existing;
+    }
+  }
 
   try {
     const response = await apiFetch("/api/me/timezone", {
@@ -673,6 +712,8 @@ async function cmdLogin(): Promise<void> {
 interface SetupFlags {
   assumeYes: boolean;
   skipImport: boolean;
+  /** Re-register this machine's timezone even if the server already has one. */
+  forceTimezone: boolean;
 }
 
 async function cmdSetup(flags: SetupFlags): Promise<void> {
@@ -738,7 +779,7 @@ async function cmdSetup(flags: SetupFlags): Promise<void> {
   // — peak hour, the weekday ring, this week — is wrong by the UTC offset
   // without it. Best-effort: a failure here costs an accurate peak hour, not a
   // working setup, and the zone is changeable on the site afterwards.
-  await reportTimezone(config.token);
+  await reportTimezone(config.token, { force: flags.forceTimezone });
 
   // 5. History import (B2 adds the implementation).
   if (!flags.skipImport) {
@@ -1702,6 +1743,16 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
   // ones whose cache-write cost is a floor rather than a figure.
   let flatCacheRows = 0;
 
+  // The cutoff stops the prompt and API rows, because telemetry has been
+  // sending those since otelSetupAt and a second copy would double them. The
+  // ultrathink flags are different: the UserPromptSubmit hook only exists since
+  // October 2026, so every flag between otelSetupAt and the day that hook was
+  // installed has no other source at all and is simply lost. So the flags —
+  // only ever a yes/no about a prompt, never a prompt — are swept out of the
+  // WHOLE of local history, and the server drops any that postdate the user's
+  // first live flag.
+  const afterCutoff: ImportEventRow[] = [];
+
   for (const file of transcripts) {
     let raw: string;
     try {
@@ -1709,9 +1760,16 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
     } catch {
       continue;
     }
-    const mapped = mapJsonlText(raw, { ...mapOptions, ...describeTranscriptPath(file) });
+    const describe = describeTranscriptPath(file);
+    const mapped = mapJsonlText(raw, { ...mapOptions, ...describe });
     events.push(...mapped.events);
     flatCacheRows += mapped.flatCacheFallbacks;
+
+    // The same file again, from the cutoff onward. Mapped whole rather than
+    // filtered to flags, so the day-coverage rule below sees the prompts too.
+    afterCutoff.push(
+      ...mapJsonlText(raw, { ...mapOptions, ...describe, to: undefined, from: cutoff }).events
+    );
   }
 
   // history.jsonl outlives the transcripts (which rotate at ~60 days), so it
@@ -1732,10 +1790,24 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
       if (gaps.gapDays.length > 0) {
         log.dim(`history.jsonl fills ${gaps.gapDays.length} day(s) with no transcripts left`);
       }
+
+      // And the same for the flags past the cutoff: history.jsonl only for the
+      // days the transcripts no longer cover, or the overlap counts twice.
+      const historyAfter = mapHistoryText(await readFile(CLAUDE_HISTORY_PATH, "utf-8"), {
+        userId: mapOptions.userId,
+        provenance: "import",
+        from: cutoff,
+        slashPolicy: "drop-builtin",
+      });
+      afterCutoff.push(...fillPromptGapsFromHistory(afterCutoff, historyAfter.events).events);
     } catch (error) {
       log.warn(`Couldn't read ${CLAUDE_HISTORY_PATH} (${error}) — importing transcripts only.`);
     }
   }
+
+  // Flags only. Everything else after the cutoff is already on the server.
+  const lateFlags = afterCutoff.filter((event) => event.event_name === ULTRATHINK_EVENT_NAME);
+  events.push(...lateFlags);
 
   // Chronological, so one UTC day lands in as few batches as possible: the
   // server's double-count guard works a whole day at a time.
@@ -1754,6 +1826,9 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
   console.log();
   console.log(`  ${colors.bright}${prompts.toLocaleString()}${colors.reset} prompts  ${colors.dim}·${colors.reset}  ${colors.bright}${apiRequests.toLocaleString()}${colors.reset} API calls  ${colors.dim}·${colors.reset}  ${colors.bright}$${costUsd.toFixed(2)}${colors.reset} ${colors.dim}(estimated)${colors.reset}`);
   if (historyKept > 0) log.dim(`  ${historyKept.toLocaleString()} of those prompts come from history.jsonl`);
+  if (lateFlags.length > 0) {
+    log.dim(`  ${lateFlags.length.toLocaleString()} ultrathink flags from before the hook existed`);
+  }
   if (flatCacheRows > 0) {
     log.dim(`  ${flatCacheRows.toLocaleString()} API calls recorded no cache-TTL split, so their cache-write cost is a floor`);
   }
@@ -1873,6 +1948,7 @@ ${colors.bright}Commands:${colors.reset}
 ${colors.bright}Flags:${colors.reset}
   ${colors.dim}--yes${colors.reset}           Assume yes for every prompt (scripts, CI)
   ${colors.dim}--no-import${colors.reset}     Skip the history import during setup
+  ${colors.dim}--timezone${colors.reset}      Re-register this machine's timezone, replacing the one on file
   ${colors.dim}--purge${colors.reset}         With ${colors.dim}disable${colors.reset}: remove ~/.config/clawdgg too
 
 ${colors.dim}Run by Claude Code, not by you:${colors.reset}
@@ -1893,7 +1969,11 @@ async function main() {
   switch (command) {
     case "setup":
     case "gg":
-      await cmdSetup({ assumeYes, skipImport: args.includes("--no-import") });
+      await cmdSetup({
+        assumeYes,
+        skipImport: args.includes("--no-import"),
+        forceTimezone: args.includes("--timezone"),
+      });
       break;
     case "import":
       await cmdImport(assumeYes);

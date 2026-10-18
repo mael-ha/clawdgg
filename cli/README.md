@@ -84,6 +84,7 @@ stores. `clawdgg setup` prints it and waits for your yes.
 - which tools ran, whether each succeeded, and how long it took
 - lines added/removed, commits, PRs, and active time
 - your Pro/Max limit percentages (5h / 7d), via the status line
+- whether a prompt said "ultrathink" — a local hook checks each prompt for the word 'ultrathink'; only a yes/no leaves your machine
 
 ### What we store — the names
 
