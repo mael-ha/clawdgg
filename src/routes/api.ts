@@ -37,10 +37,15 @@ api.post('/stats', (c) =>
     {
       error: 'Endpoint retired',
       message:
-        'clawd.gg no longer accepts uploaded daily summaries. Upgrade the CLI ' +
-        '(`clawdgg upgrade`, then `clawdgg setup`) to stream usage over OTEL, ' +
-        'and `clawdgg import` to load your local history.',
-      upgrade: 'https://clawd.gg',
+        'clawd.gg no longer accepts uploaded daily summaries. Reinstall the CLI ' +
+        '(`curl -fsSL https://clawd.gg/install | sh`), then `clawdgg setup` to ' +
+        'stream usage over OTEL and `clawdgg import` to load your local history.',
+      // The literal install line. This used to name a `clawdgg` subcommand for
+      // upgrading, and there is no such subcommand — an instruction that errors
+      // is worse than no instruction, because it reads as the site being
+      // broken rather than as the CLI being old.
+      install: 'curl -fsSL https://clawd.gg/install | sh',
+      upgrade: 'https://clawd.gg/install',
     },
     410
   )
@@ -56,7 +61,28 @@ api.post('/stats', (c) =>
 // ClickHouse too, so there is nothing left to union.
 api.get('/leaderboard', optionalAuth, async (c) => {
   try {
-    const period = (c.req.query('period') || 'all') as 'today' | 'week' | 'month' | 'all';
+    // Validated, not cast. `?period=yesterday` used to reach the date-filter
+    // lookup, come back `undefined`, and get interpolated into the SQL as the
+    // string "undefined" — a 500 from a query string, on a public endpoint.
+    const PERIODS = ['today', 'week', 'month', 'all'] as const;
+    const periodParam = c.req.query('period') || 'all';
+    if (!(PERIODS as readonly string[]).includes(periodParam)) {
+      return c.json(
+        { error: `Invalid period parameter. Valid: ${PERIODS.join(', ')}` },
+        400
+      );
+    }
+    const period = periodParam as (typeof PERIODS)[number];
+
+    // See LeaderboardResponse.window: `week` and `month` here are ROLLING
+    // windows, which /api/boards's "week" is not.
+    const WINDOW = {
+      all: 'all time',
+      today: 'today, UTC',
+      week: 'rolling 7 UTC days',
+      month: 'rolling 30 UTC days',
+    } as const;
+
     const sort = (c.req.query('sort') || 'prompts') as string;
     const page = Math.max(1, parseInt(c.req.query('page') || '1', 10));
     const limit = Math.min(100, Math.max(1, parseInt(c.req.query('limit') || '42', 10)));
@@ -164,6 +190,7 @@ api.get('/leaderboard', optionalAuth, async (c) => {
       const response: LeaderboardResponse = {
         entries,
         period,
+        window: WINDOW[period],
         total: countResult[0]?.count || 0,
         page,
         pageSize: limit,
@@ -213,6 +240,7 @@ api.get('/leaderboard', optionalAuth, async (c) => {
     const response: LeaderboardResponse = {
       entries,
       period,
+      window: WINDOW[period],
       total: chResults.total,
       page,
       pageSize: limit,
@@ -998,74 +1026,6 @@ api.get('/me/heatmap', requireAuth, async (c) => {
   } catch (error) {
     console.error('Error fetching heatmap:', error);
     return c.json({ error: 'Failed to fetch heatmap' }, 500);
-  }
-});
-
-// GET /api/me/chart - Flexible analytics chart data
-//
-// ClickHouse only. There used to be a second chart builder reading SQLite
-// daily_stats, plus a merge that aligned the two series by bucket key — and a
-// boundary bug in it: the legacy side selected `date <= otelSetupDate` while
-// the ClickHouse side started AT otelSetupDate, so the setup day was counted
-// twice. The pre-OTEL days are ClickHouse rows now, so one query answers every
-// period for every user and there is no boundary to get wrong.
-api.get('/me/chart', requireAuth, async (c) => {
-  try {
-    const user = c.get('user');
-    if (!user) {
-      return c.json({ error: 'Unauthorized' }, 401);
-    }
-
-    const userData = await db
-      .select({ otelEnabled: users.otelEnabled, timezone: users.timezone })
-      .from(users)
-      .where(eq(users.id, user.id))
-      .get();
-
-    // Parse query params
-    const metricParam = c.req.query('metric') || 'tokens';
-    const periodParam = c.req.query('period') || '30d';
-    const groupByParam = c.req.query('groupBy') || 'day';
-
-    const validMetrics = ['tokens', 'cost', 'prompts', 'lines', 'commits'] as const;
-    type ChartMetric = typeof validMetrics[number];
-    const metric: ChartMetric = validMetrics.includes(metricParam as ChartMetric)
-      ? (metricParam as ChartMetric)
-      : 'tokens';
-
-    const validPeriods = ['1d', '7d', '30d', '90d', 'all'] as const;
-    type ChartPeriod = typeof validPeriods[number];
-    const period: ChartPeriod = validPeriods.includes(periodParam as ChartPeriod)
-      ? (periodParam as ChartPeriod)
-      : '30d';
-
-    // Validate groupBy — ignored for '1d', which is always hourly
-    const validGroupBys = ['day', 'week', 'month'] as const;
-    type ChartGroupBy = typeof validGroupBys[number];
-    const groupBy: ChartGroupBy = validGroupBys.includes(groupByParam as ChartGroupBy)
-      ? (groupByParam as ChartGroupBy)
-      : 'day';
-
-    // The one period imported history cannot answer: daily_stats held a day at
-    // a time, so every imported row sits at 12:00 UTC. An hourly chart off
-    // those rows would be a single noon spike presented as a daily rhythm.
-    if (!userData?.otelEnabled && period === '1d') {
-      return c.json({
-        noData: true,
-        reason: 'otel_required',
-        message: 'Hourly breakdown requires OTEL telemetry',
-        action: 'Run clawdgg setup to enable',
-        fallbackPeriod: '7d',
-      });
-    }
-
-    const { clickhouse } = await import('../db/clickhouse');
-    return c.json(
-      await clickhouse.getChartData(user.id, metric, period, groupBy, userData?.timezone)
-    );
-  } catch (error) {
-    console.error('Error fetching chart data:', error);
-    return c.json({ error: 'Failed to fetch chart data' }, 500);
   }
 });
 

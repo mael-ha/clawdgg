@@ -100,10 +100,13 @@ describe('the retired CLI upload endpoint answers 410', () => {
     expect(api).not.toContain('onConflictDoUpdate');
   });
 
-  it('answers POST /api/stats with 410 Gone and an upgrade message', () => {
+  it('answers POST /api/stats with 410 Gone and a command that exists', () => {
     expect(api).toContain("api.post('/stats'");
     expect(api).toContain('410');
-    expect(api).toMatch(/Upgrade the CLI/i);
+    // `clawdgg upgrade` is NOT a command. Telling a user to run it reads as the
+    // site being broken, so the message carries the install line verbatim.
+    expect(api).not.toMatch(/clawdgg upgrade/);
+    expect(api).toContain('https://clawd.gg/install');
   });
 });
 

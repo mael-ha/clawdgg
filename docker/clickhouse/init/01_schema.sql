@@ -81,7 +81,12 @@ CREATE TABLE IF NOT EXISTS metrics_raw (
 -- and line_type stay in the key for scan locality; they are redundant for dedup.
 ORDER BY (user_id, metric_name, token_type, line_type, timestamp, row_id)
 PARTITION BY toYYYYMM(timestamp)
-TTL toDateTime(timestamp) + INTERVAL 365 DAY
+-- NO TTL, deliberately. There was a 365-day one here and it was REMOVED from
+-- prod on 2026-10-18 before the v2 migration, because this is the only copy of
+-- the data: a profile shows all-time totals and dated milestones, so a row
+-- expiring silently lowers a number somebody has already read. events_raw never
+-- had one. Re-adding a TTL deletes history — if storage ever becomes the
+-- problem, aggregate into a rollup table first and keep the rollup forever.
 SETTINGS index_granularity = 8192;
 
 -- Raw events from OTel (user_prompt, tool_result, api_request, etc.)
@@ -161,5 +166,5 @@ CREATE TABLE IF NOT EXISTS events_raw (
 -- row_id is what keeps two tool_results in the same millisecond apart.
 ORDER BY (user_id, session_id, event_name, timestamp, tool_name, row_id)
 PARTITION BY toYYYYMM(timestamp)
-TTL toDateTime(timestamp) + INTERVAL 365 DAY
+-- NO TTL — see metrics_raw above. This table never had one on prod either.
 SETTINGS index_granularity = 8192;

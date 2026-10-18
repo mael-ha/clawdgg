@@ -100,6 +100,18 @@ export interface LeaderboardEntry {
 export interface LeaderboardResponse {
   entries: LeaderboardEntry[];
   period: 'today' | 'week' | 'month' | 'all';
+  /**
+   * What `period` actually measures, spelled out.
+   *
+   * This endpoint's `week` and `month` are ROLLING windows — the last 7 and 30
+   * UTC days — while /api/boards means the calendar week from Monday 00:00 UTC.
+   * Two endpoints answering "this week" with two different windows is the kind
+   * of thing a reader cannot see, so the window says which one this is rather
+   * than the caller having to know. Changing the windows to match would change
+   * what a public endpoint returns for an unchanged request, which is the one
+   * thing worse than the inconsistency.
+   */
+  window: 'all time' | 'today, UTC' | 'rolling 7 UTC days' | 'rolling 30 UTC days';
   total: number;
   page: number;
   pageSize: number;
