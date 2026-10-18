@@ -1,4 +1,18 @@
 <clickhouse>
+    <!-- The clock every stored timestamp is read in.
+         LOAD-BEARING, not tidiness. `timestamp` is a DateTime64(3) with no
+         timezone of its own, so the server timezone is what parses the
+         'YYYY-MM-DD HH:MM:SS.sss' literals the app inserts — and those are
+         always UTC (src/lib/session-import.ts fmtTs, src/routes/otel.ts). It
+         is also the source zone `toTimeZone(timestamp, <user zone>)` converts
+         FROM, which is how every hour-of-day, weekday and week figure on a
+         profile is computed. If this is ever not UTC, every one of those is
+         wrong by the server's offset AND the stored instants themselves were
+         parsed wrong — which no query can repair afterwards.
+         The image already defaults to UTC; this says so, so a host with a TZ
+         set cannot change it silently. Verify with: SELECT timezone(). -->
+    <timezone>UTC</timezone>
+
     <!-- Memory settings optimized for 4GB VPS -->
     <max_server_memory_usage_to_ram_ratio>0.5</max_server_memory_usage_to_ram_ratio>
 

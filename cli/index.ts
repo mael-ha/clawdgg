@@ -569,6 +569,45 @@ function reportStatusLineMerge(result: StatusLineMergeResult, command: string): 
   console.log();
 }
 
+/**
+ * Tell the server which wall clock this machine keeps.
+ *
+ * `Intl.DateTimeFormat().resolvedOptions().timeZone` is the zone the OS is set
+ * to — the same one Claude Code's own timestamps are shown in — so it needs no
+ * question put to the user. The server validates it against the IANA database
+ * and keeps UTC if it does not recognise it.
+ *
+ * Returns the zone it managed to register, or null.
+ */
+async function reportTimezone(token: string | undefined): Promise<string | null> {
+  if (!token) return null;
+
+  let timezone: string;
+  try {
+    timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  } catch {
+    return null;
+  }
+  if (!timezone) return null;
+
+  try {
+    const response = await apiFetch("/api/me/timezone", {
+      method: "PUT",
+      token,
+      body: JSON.stringify({ timezone }),
+    });
+    if (!response.ok) {
+      log.dim(`Couldn't set your timezone (HTTP ${response.status}) — times will read in UTC.`);
+      return null;
+    }
+    log.success(`Timezone set to ${timezone}.`);
+    return timezone;
+  } catch {
+    log.dim("Couldn't set your timezone — times will read in UTC until you set it on the site.");
+    return null;
+  }
+}
+
 // ============= COMMANDS =============
 
 async function cmdLogin(): Promise<void> {
@@ -637,6 +676,12 @@ async function cmdSetup(flags: SetupFlags): Promise<void> {
   } catch (error) {
     log.warn(`Couldn't tell the server you're streaming (${error}). \`clawdgg doctor\` will retry.`);
   }
+
+  // 4b. And which clock to read the timestamps in. Every "when" on the profile
+  // — peak hour, the weekday ring, this week — is wrong by the UTC offset
+  // without it. Best-effort: a failure here costs an accurate peak hour, not a
+  // working setup, and the zone is changeable on the site afterwards.
+  await reportTimezone(config.token);
 
   // 5. History import (B2 adds the implementation).
   if (!flags.skipImport) {

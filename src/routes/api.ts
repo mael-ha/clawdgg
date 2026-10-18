@@ -6,6 +6,7 @@ import { requireAuth, optionalAuth } from '../lib/auth-middleware';
 import type { LeaderboardEntry, LeaderboardResponse } from '../types';
 import { normalizeEpochSeconds, parseRateLimits, shouldInsertSnapshot } from '../lib/plan-usage';
 import { getModelDisplayName } from '../lib/pricing';
+import { isValidTimezone, normalizeTimezone } from '../lib/timezone';
 
 const api = new Hono();
 
@@ -402,6 +403,59 @@ api.post('/otel/enable', requireAuth, async (c) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Timezone — the wall clock every "when" on the profile is read in
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// GET /api/me/timezone  → { timezone }
+// PUT /api/me/timezone  ← { timezone: 'Europe/Paris' }
+//
+// One endpoint, two callers: `clawdgg setup` posts the zone Intl resolves on
+// the machine, and the settings UI posts whatever the user picks. requireAuth
+// takes either a bearer or the session cookie, so neither needs its own route.
+//
+// An unknown zone is a 400 rather than a silent fallback to UTC: writing UTC
+// after being told 'Europe/Pariss' would leave the user looking at the wrong
+// peak hour with nothing to tell them why.
+api.get('/me/timezone', requireAuth, async (c) => {
+  const user = c.get('user');
+  if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+  const row = await db
+    .select({ timezone: users.timezone })
+    .from(users)
+    .where(eq(users.id, user.id))
+    .get();
+
+  return c.json({ timezone: normalizeTimezone(row?.timezone) });
+});
+
+api.put('/me/timezone', requireAuth, async (c) => {
+  const user = c.get('user');
+  if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+  let body: { timezone?: unknown };
+  try {
+    body = (await c.req.json()) ?? {};
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  if (!isValidTimezone(body.timezone)) {
+    return c.json(
+      { error: 'Not an IANA timezone name', example: 'Europe/Paris' },
+      400
+    );
+  }
+
+  await db
+    .update(users)
+    .set({ timezone: body.timezone, updatedAt: new Date() })
+    .where(eq(users.id, user.id));
+
+  return c.json({ success: true, timezone: body.timezone });
+});
+
 // POST /api/otel/disable - Mark user as OTel-disabled
 api.post('/otel/disable', requireAuth, async (c) => {
   try {
@@ -708,7 +762,7 @@ api.get('/me/heatmap', requireAuth, async (c) => {
     }
 
     const userData = await db
-      .select({ otelEnabled: users.otelEnabled })
+      .select({ otelEnabled: users.otelEnabled, timezone: users.timezone })
       .from(users)
       .where(eq(users.id, user.id))
       .get();
@@ -722,7 +776,8 @@ api.get('/me/heatmap', requireAuth, async (c) => {
 
     const days = parseInt(c.req.query('days') || '90', 10);
     const { clickhouse } = await import('../db/clickhouse');
-    const heatmap = await clickhouse.getActivityHeatmap(user.id, days);
+    // The grid is hour-of-day by weekday, so it has to be the user's own clock.
+    const heatmap = await clickhouse.getActivityHeatmap(user.id, days, userData.timezone);
 
     // Transform to a matrix format for easier frontend rendering
     // Initialize 7x24 matrix (days x hours)
@@ -786,7 +841,7 @@ api.get('/me/chart', requireAuth, async (c) => {
     }
 
     const userData = await db
-      .select({ otelEnabled: users.otelEnabled })
+      .select({ otelEnabled: users.otelEnabled, timezone: users.timezone })
       .from(users)
       .where(eq(users.id, user.id))
       .get();
@@ -829,7 +884,9 @@ api.get('/me/chart', requireAuth, async (c) => {
     }
 
     const { clickhouse } = await import('../db/clickhouse');
-    return c.json(await clickhouse.getChartData(user.id, metric, period, groupBy));
+    return c.json(
+      await clickhouse.getChartData(user.id, metric, period, groupBy, userData?.timezone)
+    );
   } catch (error) {
     console.error('Error fetching chart data:', error);
     return c.json({ error: 'Failed to fetch chart data' }, 500);

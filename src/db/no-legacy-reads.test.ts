@@ -172,6 +172,33 @@ describe('legacy rows are excluded where their shape is fabricated', () => {
   });
 });
 
+/**
+ * A UTC hour is not an hour anyone worked. Read in UTC, a Berlin user's 23:00
+ * peak reads as 21:00 and an Auckland user's Monday morning falls in the
+ * previous week — the figure is not approximate, it is in the wrong bucket. So
+ * every read of an hour, a weekday or a week boundary converts with the user's
+ * own zone, and the conversion is defined in exactly one place.
+ */
+describe('hour-of-day and weekday reads use the user\'s own clock', () => {
+  const clickhouse = sourceOf('db/clickhouse.ts');
+
+  it('defines the conversion once', () => {
+    expect(clickhouse).toContain(
+      'export const LOCAL_TS_SQL = `toTimeZone(timestamp, {tz:String})`'
+    );
+  });
+
+  it.each(['db/clickhouse.ts', 'jobs/sync-clickhouse.ts'])(
+    '%s never buckets a bare UTC timestamp by hour or weekday',
+    relPath => {
+      const offenders = codeLines(sourceOf(relPath)).filter(
+        line => /\btoHour\(timestamp\)|\btoDayOfWeek\(timestamp\)/.test(line)
+      );
+      expect(offenders).toEqual([]);
+    }
+  );
+});
+
 describe('one prompt predicate everywhere', () => {
   it.each(['db/clickhouse.ts', 'jobs/sync-clickhouse.ts'])(
     '%s never checks the user_prompt event name by hand',

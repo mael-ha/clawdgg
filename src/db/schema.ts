@@ -10,6 +10,13 @@ export const users = sqliteTable('users', {
   avatarUrl: text('avatar_url'),
   firstSessionDate: text('first_session_date'), // YYYY-MM-DD
 
+  // IANA zone name, e.g. 'Europe/Paris'. Set by `clawdgg setup` from the
+  // machine's own Intl resolution, and changeable at PUT /api/me/timezone.
+  // EVERY hour-of-day, weekday and week-boundary query converts with it
+  // (ClickHouse toTimeZone) — see src/lib/timezone.ts for why. 'UTC' is the
+  // honest default: it is what the raw timestamps already are.
+  timezone: text('timezone').notNull().default('UTC'),
+
   // Badge-relevant stats (updated on sync)
   badges: text('badges'), // JSON array of badge IDs: ["night_owl", "streak_7", ...]
   hourCounts: text('hour_counts'), // JSON object: {"0": 5, "1": 2, ...}

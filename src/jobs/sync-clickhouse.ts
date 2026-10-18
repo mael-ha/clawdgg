@@ -22,7 +22,8 @@
 
 import { db } from '../db';
 import { users } from '../db/schema';
-import { clickhouse, query, NO_LEGACY_SQL, PROMPT_EVENT_SQL } from '../db/clickhouse';
+import { clickhouse, query, LOCAL_TS_SQL, NO_LEGACY_SQL, PROMPT_EVENT_SQL } from '../db/clickhouse';
+import { normalizeTimezone } from '../lib/timezone';
 import { computeBadges } from '../lib/badges';
 import { eq } from 'drizzle-orm';
 
@@ -104,13 +105,20 @@ function calculateStreaks(dates: string[]): { currentStreak: number; longestStre
 /**
  * Get hourly activity counts for badge calculation
  * Returns { "0": count, "1": count, ..., "23": count }
+ *
+ * In the USER'S timezone, because this is what decides the night-owl badge and
+ * the archetype. Read in UTC, a Berlin user who stops at 23:00 looks like they
+ * stop at 21:00, and one in Los Angeles looks nocturnal all day.
  */
-async function getUserHourlyCounts(userId: string): Promise<Record<string, number>> {
+async function getUserHourlyCounts(
+  userId: string,
+  tz: string
+): Promise<Record<string, number>> {
   try {
     const result = await query<{ hour: number; count: number }>(
       `
       SELECT
-        toHour(timestamp) as hour,
+        toHour(${LOCAL_TS_SQL}) as hour,
         COUNT(*) as count
       FROM events_raw FINAL
       WHERE user_id = {userId:String}
@@ -118,7 +126,7 @@ async function getUserHourlyCounts(userId: string): Promise<Record<string, numbe
         AND ${NO_LEGACY_SQL}
       GROUP BY hour
       `,
-      { userId }
+      { userId, tz: normalizeTimezone(tz) }
     );
 
     const counts: Record<string, number> = {};
@@ -194,6 +202,7 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         createdAt: users.createdAt,
         currentLongestStreak: users.longestStreak,
         currentFirstSessionDate: users.firstSessionDate,
+        timezone: users.timezone,
       })
       .from(users);
 
@@ -212,6 +221,7 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         id: userId,
         currentLongestStreak: existingLongestStreak = 0,
         currentFirstSessionDate,
+        timezone,
       } = user;
 
       try {
@@ -245,7 +255,7 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         const activeDates = dailyData.map((d) => d.date);
         const streaks = calculateStreaks(activeDates);
 
-        const hourCounts = await getUserHourlyCounts(userId);
+        const hourCounts = await getUserHourlyCounts(userId, timezone);
         const longestSession = await getLongestSessionMessages(userId);
         const toolCalls = await clickhouse.getUserTotalToolCalls(userId);
 

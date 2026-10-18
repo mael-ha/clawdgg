@@ -30,6 +30,7 @@
 import { createHash } from 'node:crypto';
 import { getModelPricing, type PricingMatchQuality } from '../lib/pricing';
 import { bucketLabel, bucketSql, type ChartGroupBy } from '../lib/chart-buckets';
+import { DEFAULT_TIMEZONE, normalizeTimezone } from '../lib/timezone';
 
 const CLICKHOUSE_URL = process.env.CLICKHOUSE_URL || 'http://localhost:8123';
 const CLICKHOUSE_DATABASE = process.env.CLICKHOUSE_DATABASE || 'clawd';
@@ -558,6 +559,25 @@ export const PROMPT_EVENT_SQL =
 export const NO_LEGACY_SQL = `provenance != 'legacy'`;
 
 /**
+ * `timestamp` in the user's own wall clock. Every hour-of-day, weekday and
+ * week-boundary read goes through this, never bare `toHour(timestamp)`.
+ *
+ * Why: a 23:00 prompt in Paris is 22:00 UTC and a Monday-morning one in
+ * Auckland is a Sunday prompt in UTC — the figure does not just shift, it lands
+ * in the wrong bucket and (for a week) the wrong week. UTC hours made every
+ * non-UTC user's peak hour and weekday ring wrong by their offset.
+ *
+ * The caller passes `tz` as a query parameter (an IANA name validated by
+ * src/lib/timezone.ts). ClickHouse substitutes a parameter before parsing, so
+ * it satisfies toTimeZone's constant-argument requirement.
+ *
+ * ALWAYS combine with NO_LEGACY_SQL: the pre-OTEL daily_stats rows are all
+ * stamped 12:00 UTC, so converting them produces a spike at whatever 12:00 UTC
+ * is locally — an artefact of the import, not an hour anyone worked.
+ */
+export const LOCAL_TS_SQL = `toTimeZone(timestamp, {tz:String})`;
+
+/**
  * Model id reduced to its bare form for GROUPING, mirroring
  * stripModelDecorations() in src/lib/pricing.ts: a Bedrock region/vendor
  * prefix, a `-v1:0` revision, and a bracketed context variant all come off, so
@@ -738,13 +758,19 @@ export async function getUserModelUsage(userId: string, days?: number): Promise<
 }
 
 /**
- * Get hourly activity for heatmap
+ * Get hourly activity for heatmap, in the user's own wall clock.
+ *
+ * `day_of_week` is ClickHouse's default mode: 1 = Monday … 7 = Sunday.
  */
-export async function getUserHourlyActivity(userId: string, days: number = 90): Promise<HourlyActivity[]> {
+export async function getUserHourlyActivity(
+  userId: string,
+  days: number = 90,
+  tz: string = DEFAULT_TIMEZONE
+): Promise<HourlyActivity[]> {
   const sql = `
     SELECT
-      toUInt8(toHour(timestamp)) as hour,
-      toUInt8(toDayOfWeek(timestamp)) as day_of_week,
+      toUInt8(toHour(${LOCAL_TS_SQL})) as hour,
+      toUInt8(toDayOfWeek(${LOCAL_TS_SQL})) as day_of_week,
       toUInt64(sumIf(value, metric_name = 'claude_code.token.usage')) as activity
     FROM metrics_raw FINAL
     WHERE user_id = {userId:String}
@@ -754,7 +780,7 @@ export async function getUserHourlyActivity(userId: string, days: number = 90): 
     ORDER BY day_of_week, hour
   `;
 
-  return query<HourlyActivity>(sql, { userId, days });
+  return query<HourlyActivity>(sql, { userId, days, tz: normalizeTimezone(tz) });
 }
 
 /**
@@ -1110,11 +1136,15 @@ export interface HeatmapCell {
   promptCount: number;
 }
 
-export async function getActivityHeatmap(userId: string, days: number = 90): Promise<HeatmapCell[]> {
+export async function getActivityHeatmap(
+  userId: string,
+  days: number = 90,
+  tz: string = DEFAULT_TIMEZONE
+): Promise<HeatmapCell[]> {
   const sql = `
     SELECT
-      toUInt8(toHour(timestamp)) as hour,
-      toUInt8(toDayOfWeek(timestamp)) as dayOfWeek,
+      toUInt8(toHour(${LOCAL_TS_SQL})) as hour,
+      toUInt8(toDayOfWeek(${LOCAL_TS_SQL})) as dayOfWeek,
       toUInt64(SUM(input_tokens + output_tokens)) as activity,
       toUInt64(COUNT(*)) as promptCount
     FROM events_raw FINAL
@@ -1126,7 +1156,7 @@ export async function getActivityHeatmap(userId: string, days: number = 90): Pro
     ORDER BY dayOfWeek, hour
   `;
 
-  return query<HeatmapCell>(sql, { userId, days });
+  return query<HeatmapCell>(sql, { userId, days, tz: normalizeTimezone(tz) });
 }
 
 /**
@@ -1272,15 +1302,21 @@ export async function getChartData(
   userId: string,
   metric: ChartMetric,
   period: ChartPeriod,
-  groupBy: ChartGroupBy = 'day'
+  groupBy: ChartGroupBy = 'day',
+  tz: string = DEFAULT_TIMEZONE
 ): Promise<ChartData> {
   // For "1d" (today), we group by hour; otherwise by the requested bucket
   const isHourly = period === '1d';
 
   // Calculate date range
   const days = period === '7d' ? 7 : period === '30d' ? 30 : period === '90d' ? 90 : 365;
+  // The 1d view is hour-of-day, so BOTH its bucket and its day boundary are the
+  // user's own: a "today" that ends at 00:00 UTC cuts a Tokyo afternoon in half
+  // and an Auckland user's day before it starts. The multi-day windows stay on
+  // UTC days — there the boundary moves one partial day at the far end of the
+  // range, which is not a figure anyone reads.
   const dateFilter = period === '1d'
-    ? `AND toDate(timestamp) = today()`
+    ? `AND toDate(${LOCAL_TS_SQL}) = toDate(toTimeZone(now(), {tz:String}))`
     : period === 'all'
       ? ''
       : `AND toDate(timestamp) >= today() - ${days}`;
@@ -1294,7 +1330,7 @@ export async function getChartData(
   // The date range itself is NOT snapped to bucket boundaries: week/month
   // buckets stay an exact partition of the days the daily view would show, so
   // their sums reconcile to it (the oldest bucket is simply partial).
-  const groupByClause = isHourly ? 'toHour(timestamp) as hour' : bucketSql(groupBy);
+  const groupByClause = isHourly ? `toHour(${LOCAL_TS_SQL}) as hour` : bucketSql(groupBy);
   const orderByClause = isHourly ? 'hour' : 'date';
 
   switch (metric) {
@@ -1373,7 +1409,7 @@ export async function getChartData(
       break;
   }
 
-  const rawData = await query<ChartDataPoint>(sql, { userId });
+  const rawData = await query<ChartDataPoint>(sql, { userId, tz: normalizeTimezone(tz) });
 
   // Transform data for charting
   const keys: string[] = [];
