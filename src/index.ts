@@ -4,6 +4,7 @@ import { logger } from 'hono/logger';
 import { serveStatic } from 'hono/bun';
 import auth from './routes/auth';
 import api from './routes/api';
+import cli from './routes/cli';
 import otel from './routes/otel';
 import pages from './routes/index';
 import profile from './routes/profile';
@@ -57,6 +58,8 @@ app.use('/public/*', serveStatic({ root: './' }));
 
 // Mount routes
 app.route('/auth', auth);
+// Before /api so the CLI's own endpoints aren't shadowed by api's 404 handling.
+app.route('/api/cli', cli);
 app.route('/api', api);
 app.route('/u', profile);
 app.route('/about', about);

@@ -16,16 +16,11 @@
 import { readFile, appendFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import {
-  API_BASE_URL,
-  CONFIG_DIR,
-  CONFIG_FILE,
-  LEGACY_CONFIG_FILE,
-  PREV_CONFIG_FILE,
-} from "./paths";
+import { API_BASE_URL, CONFIG_DIR, CONFIG_FILE } from "./paths";
 import { parseRateLimits } from "../src/lib/plan-usage";
 
-// What we register in ~/.claude/settings.json.
+// Fallback for callers that don't pass an absolute binary path (and the shape
+// `isOurStatusLine` recognises in a settings.json written by an older CLI).
 export const STATUSLINE_COMMAND = "clawdgg statusline";
 
 const DEBUG_LOG_FILE = join(CONFIG_DIR, "statusline-debug.log");
@@ -80,7 +75,10 @@ function isOurStatusLine(command: string): boolean {
  * Never overwrites a statusLine that isn't ours, and re-running is a no-op
  * (including when the user invokes us through their own wrapper).
  */
-export function applyStatusLineSetting(settings: Record<string, any>): StatusLineMergeResult {
+export function applyStatusLineSetting(
+  settings: Record<string, any>,
+  command: string = STATUSLINE_COMMAND
+): StatusLineMergeResult {
   const existing = statusLineCommandOf(settings);
 
   if (existing !== null) {
@@ -88,7 +86,7 @@ export function applyStatusLineSetting(settings: Record<string, any>): StatusLin
     return { action: "conflict", existing };
   }
 
-  settings.statusLine = { type: "command", command: STATUSLINE_COMMAND };
+  settings.statusLine = { type: "command", command };
   return { action: "added" };
 }
 
@@ -154,14 +152,12 @@ async function appendDebugCapture(raw: string): Promise<void> {
 
 // Deliberately NOT index.ts's loadConfig — see the header note about stdout.
 async function readTokenQuietly(): Promise<string | null> {
-  for (const file of [CONFIG_FILE, PREV_CONFIG_FILE, LEGACY_CONFIG_FILE]) {
-    try {
-      if (!existsSync(file)) continue;
-      const parsed = JSON.parse(await readFile(file, "utf-8"));
-      if (typeof parsed?.token === "string" && parsed.token) return parsed.token;
-    } catch {
-      // Unreadable config: fall through to the next location.
-    }
+  try {
+    if (!existsSync(CONFIG_FILE)) return null;
+    const parsed = JSON.parse(await readFile(CONFIG_FILE, "utf-8"));
+    if (typeof parsed?.token === "string" && parsed.token) return parsed.token;
+  } catch {
+    // Unreadable config: no token, no report. Never a thrown prompt.
   }
   return null;
 }
