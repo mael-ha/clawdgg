@@ -11,6 +11,7 @@ import {
   BOARD_KEYS,
   boardMetricName,
   boardRankChanges,
+  boardRowFor,
   boardValue,
   classFromEvidence,
   classLabel,
@@ -237,6 +238,27 @@ describe('rankBoard', () => {
    * and compared with a board rendered under another shows BOTH of them a move
    * that never happened — every day, forever. Same rule as rank-snapshots.ts.
    */
+  /**
+   * BINARY id order, matching SQL `ORDER BY value DESC, id ASC` — the ordering
+   * the snapshot side uses. localeCompare disagrees with it on ids containing
+   * punctuation (it sorts `github_1_x` before `github_10`, SQLite after), and a
+   * tie ordered one way in the snapshot and the other on the page shows both
+   * users an arrow for a move that never happened.
+   */
+  it('breaks ties the way SQLite does, not the way a locale would', () => {
+    const tied = figureMap([
+      ['github_10', { valueUsd: 7 }],
+      ['github_1_x', { valueUsd: 7 }],
+    ]);
+    const ranked = rankBoard(
+      'value',
+      [boardUser('github_10'), boardUser('github_1_x')],
+      tied
+    );
+    expect(ranked.map((r) => r.userId)).toEqual(['github_10', 'github_1_x']);
+    expect('github_10' < 'github_1_x').toBe(true);
+  });
+
   it('breaks ties by user id, so the order is stable across runs', () => {
     const tied = figureMap([
       ['zoe', { ultrathinks: 5 }],
@@ -320,6 +342,86 @@ describe('rankBoard', () => {
     for (const board of BOARD_KEYS) {
       expect(defaultVisibility()[BOARDS[board].section]).toBe(true);
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// What a row shows, and what it withholds
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('boardRowFor', () => {
+  const evidence = {
+    hours: Array.from({ length: 24 }, (_, h) => (h === 9 ? 80 : h === 10 ? 40 : 0)),
+    prompts: 120,
+    tools: 240,
+    subagentValue: 50,
+    attributedValue: 100,
+  };
+  const entry = { userId: 'a', value: 1_284, rank: 2 };
+  const figure = figures({ userId: 'a', ultrathinks: 312 });
+
+  it('shows the clock, the class and both side figures by default', () => {
+    const row = boardRowFor('value', entry, boardUser('a', { streak: 19 }), figure, evidence, 3);
+    expect(row.hours).toEqual(evidence.hours);
+    expect(row.classLabel).toBe('☀️ morning orchestrator');
+    expect(row.ultrathinks).toBe(312);
+    expect(row.streak).toBe(19);
+    expect(row.change).toBe(3);
+    expect(row.display).toBe('$1,284');
+  });
+
+  /**
+   * Each part hangs off its own section, and a hidden one is ABSENT rather
+   * than zero: a zero is a claim about the data, an absent figure is a claim
+   * about the owner's choice, and only the second one is true.
+   */
+  const hiddenExpectations = {
+    rings: 'hours',
+    class: 'classLabel',
+    ultrathink: 'ultrathinks',
+    curve: 'streak',
+  } as const;
+
+  for (const [section, field] of Object.entries(hiddenExpectations) as [
+    keyof typeof hiddenExpectations,
+    (typeof hiddenExpectations)[keyof typeof hiddenExpectations],
+  ][]) {
+    it(`leaves out ${field} when the owner hid '${section}'`, () => {
+      const visibility = defaultVisibility();
+      visibility[section] = false;
+      const row = boardRowFor(
+        'value',
+        entry,
+        boardUser('a', { streak: 19, visibility }),
+        figure,
+        evidence,
+        3
+      );
+      expect(row[field]).toBeUndefined();
+      // Only that one part goes: hiding the rings must not take the class too.
+      const others = (['hours', 'classLabel', 'ultrathinks', 'streak'] as const).filter(
+        (key) => key !== field
+      );
+      for (const key of others) expect(row[key]).toBeDefined();
+    });
+  }
+
+  it('still prints the figure the board ranks on', () => {
+    const visibility = defaultVisibility();
+    visibility.rings = false;
+    visibility.class = false;
+    visibility.ultrathink = false;
+    visibility.curve = false;
+    const row = boardRowFor('value', entry, boardUser('a', { visibility }), figure, evidence, undefined);
+    expect(row.display).toBe('$1,284');
+    expect(row.rank).toBe(2);
+    expect(row.change).toBeUndefined();
+  });
+
+  it('has no clock at all when the class evidence could not be read', () => {
+    const row = boardRowFor('value', entry, boardUser('a'), figure, undefined, undefined);
+    expect(row.hours).toBeUndefined();
+    expect(row.classLabel).toBeUndefined();
   });
 });
 
@@ -489,7 +591,7 @@ describe('boardRankChanges', () => {
 
   it('is positive for a user who climbed since the last snapshot', async () => {
     await snapshot('2026-10-14', boardMetricName('value', 'week'), [['a', 3], ['b', 1]]);
-    const changes = await boardRankChanges(
+    const { previousDay, changes } = await boardRankChanges(
       'value',
       'week',
       ids,
@@ -497,6 +599,7 @@ describe('boardRankChanges', () => {
       now,
       database
     );
+    expect(previousDay).toBe('2026-10-14');
     expect(changes.get('a')).toBe(2);
     expect(changes.get('b')).toBe(-1);
   });
@@ -505,7 +608,7 @@ describe('boardRankChanges', () => {
   // arrived. An arrow would be invented.
   it('gives no arrow to a user with no previous rank', async () => {
     await snapshot('2026-10-14', boardMetricName('value', 'week'), [['a', 1]]);
-    const changes = await boardRankChanges(
+    const { changes } = await boardRankChanges(
       'value',
       'week',
       ids,
@@ -516,9 +619,14 @@ describe('boardRankChanges', () => {
     expect(changes.has('b')).toBe(false);
   });
 
-  it('gives no arrow to a user who did not move', async () => {
+  /**
+   * Zero is a VALUE here, not an absence: it says the user was on the board
+   * yesterday and has not moved ("—"), which the page has to tell apart from a
+   * user who was not there at all ("new").
+   */
+  it('reports a user who did not move as zero, not as missing', async () => {
     await snapshot('2026-10-14', boardMetricName('value', 'week'), [['a', 1], ['b', 2]]);
-    const changes = await boardRankChanges(
+    const { changes } = await boardRankChanges(
       'value',
       'week',
       ids,
@@ -526,14 +634,15 @@ describe('boardRankChanges', () => {
       now,
       database
     );
-    expect(changes.size).toBe(0);
+    expect(changes.get('a')).toBe(0);
+    expect(changes.get('b')).toBe(0);
   });
 
   // The most recent EARLIER day, not literally yesterday: a day the server was
   // down leaves a gap, and skipping it would hide every arrow until it aged out.
   it('compares against the most recent earlier snapshot, gap or not', async () => {
     await snapshot('2026-10-13', boardMetricName('value', 'week'), [['a', 2], ['b', 1]]);
-    const changes = await boardRankChanges(
+    const { previousDay, changes } = await boardRankChanges(
       'value',
       'week',
       ids,
@@ -541,6 +650,7 @@ describe('boardRankChanges', () => {
       now,
       database
     );
+    expect(previousDay).toBe('2026-10-13');
     expect(changes.get('a')).toBe(1);
   });
 
@@ -551,7 +661,7 @@ describe('boardRankChanges', () => {
    */
   it('gives no weekly arrow across the Monday reset', async () => {
     await snapshot('2026-10-11', boardMetricName('value', 'week'), [['a', 9], ['b', 1]]);
-    const changes = await boardRankChanges(
+    const { previousDay, changes } = await boardRankChanges(
       'value',
       'week',
       ids,
@@ -559,13 +669,16 @@ describe('boardRankChanges', () => {
       now,
       database
     );
+    // Null, not merely empty: the column goes blank rather than printing "new"
+    // beside everyone on the first board of a new week.
+    expect(previousDay).toBeNull();
     expect(changes.size).toBe(0);
   });
 
   // All-time is one continuous field, so the same old snapshot IS comparable.
   it('still shows all-time arrows across a week boundary', async () => {
     await snapshot('2026-10-11', boardMetricName('value', 'all'), [['a', 9], ['b', 1]]);
-    const changes = await boardRankChanges(
+    const { changes } = await boardRankChanges(
       'value',
       'all',
       ids,
@@ -578,7 +691,7 @@ describe('boardRankChanges', () => {
 
   it('never reads another board’s snapshot', async () => {
     await snapshot('2026-10-14', boardMetricName('streak', 'week'), [['a', 5], ['b', 1]]);
-    const changes = await boardRankChanges(
+    const { previousDay, changes } = await boardRankChanges(
       'value',
       'week',
       ids,
@@ -586,13 +699,14 @@ describe('boardRankChanges', () => {
       now,
       database
     );
+    expect(previousDay).toBeNull();
     expect(changes.size).toBe(0);
   });
 
   it('has nothing to compare with no users', async () => {
     await snapshot('2026-10-14', boardMetricName('value', 'week'), [['a', 1]]);
     expect(
-      (await boardRankChanges('value', 'week', [], new Map(), now, database)).size
+      (await boardRankChanges('value', 'week', [], new Map(), now, database)).changes.size
     ).toBe(0);
   });
 });

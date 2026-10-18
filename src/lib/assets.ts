@@ -18,6 +18,7 @@ export type Island =
   | 'contribution-tooltip'
   | 'copy-share'
   | 'device-code-input'
+  | 'home-copy'
   | 'leaderboard-more';
 
 function url(name: string): string {

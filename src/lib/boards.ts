@@ -49,7 +49,7 @@ import {
   type StyleClass,
 } from './fingerprint';
 import { localMonth, normalizeTimezone } from './timezone';
-import { assignRanks, rankChange, utcDay } from './rank-snapshots';
+import { rankChange, utcDay } from './rank-snapshots';
 import { visibilityOf, type Visibility } from './profile-settings';
 import { TtlCache } from './ttl-cache';
 
@@ -276,7 +276,11 @@ export interface BoardRow {
   /** The raw figure, so the API's consumer can re-format it. */
   value: number;
   display: string;
-  /** Positive when the user climbed since the last snapshot; absent when new. */
+  /**
+   * Positions gained since the last snapshot. 0 is "did not move"; ABSENT means
+   * the user was not in that snapshot — they are new to the board, which is a
+   * different thing and printed differently.
+   */
   change?: number;
   /** 24 local-hour prompt counts for the mini clock. Absent when hidden. */
   hours?: number[];
@@ -298,6 +302,12 @@ export interface BoardPage {
   weekStart: string;
   /** "2d 4h" until the weekly reset. */
   resetIn: string;
+  /**
+   * The snapshot day the ▲▼ column compares against, or null when this board
+   * has no history yet. Null means the column is BLANK rather than full of
+   * "new": with no snapshot, nobody has been seen here before.
+   */
+  comparedTo: string | null;
   /**
    * False when a query failed and the page is missing figures. Never cached —
    * one ClickHouse hiccup must not pin an empty board for the whole TTL.
@@ -401,7 +411,15 @@ export function rankBoard(
     eligible.push({ userId: user.userId, value });
   }
 
-  return assignRanks(eligible);
+  // Deliberately NOT assignRanks(): that one breaks ties with localeCompare,
+  // and the snapshot side of these boards is SQL `ORDER BY value DESC, id ASC`,
+  // which is a BINARY comparison. The two disagree on ids like `github_1_x` vs
+  // `github_10` (locale collation ignores the underscore), and a tie ordered
+  // one way in the snapshot and the other way on the page shows both users a
+  // ±1 arrow that nothing happened to cause.
+  return [...eligible]
+    .sort((a, b) => b.value - a.value || (a.userId < b.userId ? -1 : a.userId > b.userId ? 1 : 0))
+    .map((entry, index) => ({ ...entry, rank: index + 1 }));
 }
 
 function emptyFigures(userId: string, streak = 0): BoardFigures {
@@ -430,6 +448,47 @@ interface FigureRow {
 }
 
 /**
+ * `timestamp` in each listed user's own wall clock, as a ClickHouse expression.
+ *
+ * ClickHouse `toTimeZone` needs a CONSTANT zone, so it cannot batch users who
+ * live in different ones. Shifting by each user's current offset gives the same
+ * local wall clock in one pass. The caveat is DST: a row on the far side of a
+ * transition lands an hour off, which moves nothing that matters here — a bar
+ * on a 30px clock, or a prompt at local midnight into the neighbouring day.
+ *
+ * The ids go in as parameters (`param_u0`, …), never as literals: ClickHouse
+ * substitutes them before parsing, which is what makes this injection-proof.
+ */
+function localTsExpr(
+  boardUsers: BoardUser[],
+  now: Date
+): { expr: string; params: Record<string, string> } {
+  if (boardUsers.length === 0) return { expr: 'timestamp', params: {} };
+
+  const params: Record<string, string> = {};
+  const branches = boardUsers.map((user, index) => {
+    params[`u${index}`] = user.userId;
+    return `user_id = {u${index}:String}, ${offsetMinutes(user.timezone, now)}`;
+  });
+  return { expr: `timestamp + toIntervalMinute(multiIf(${branches.join(', ')}, 0))`, params };
+}
+
+/**
+ * Ultrathink flags, CAPPED AT ONE PER PROMPT PER LOCAL DAY.
+ *
+ * A flag is a synthetic row a local hook posts (commit 1afec9d), so nothing
+ * stops a client from sending more of them than it sent prompts. Uncapped,
+ * the 🌈 board ranks whoever scripted the hook hardest. `least(flags, prompts)`
+ * per user per local day is the read-side rule: it cannot exceed what the same
+ * day's prompts could have carried, and it costs an honest user nothing.
+ *
+ * TODO: switch to the shared helper track D is adding to src/db/clickhouse.ts
+ * once it lands, so the profile, the board and the sync job all apply one
+ * definition rather than three copies of this expression.
+ */
+const CAPPED_ULTRATHINKS_SQL = `least(countIf(${ULTRATHINK_EVENT_SQL}), countIf(${PROMPT_EVENT_SQL}))`;
+
+/**
  * Value, ultrathinks, output tokens and typed characters for every user, over
  * one scope, in one query.
  *
@@ -446,18 +505,33 @@ async function fetchFigures(
   const measured = `${PROMPT_EVENT_SQL} AND prompt_length > 0`;
   const window =
     scope === 'week' ? `timestamp >= toDateTime64({since:String}, 3, 'UTC')` : '1 = 1';
+  const local = localTsExpr(boardUsers, now);
 
   const [events, metrics] = await Promise.all([
+    // Per local day first, so the ultrathink cap can be applied where it means
+    // something, then summed per user. The prompt and character totals are
+    // unaffected by the grouping — a sum of days is the same sum.
     query<Pick<FigureRow, 'user_id' | 'ultrathinks' | 'prompt_chars' | 'prompts'>>(
       `SELECT
          user_id,
-         toUInt64(countIf(${ULTRATHINK_EVENT_SQL})) AS ultrathinks,
-         toUInt64(sumIf(prompt_length, ${measured})) AS prompt_chars,
-         toUInt64(countIf(${PROMPT_EVENT_SQL})) AS prompts
-       FROM events_raw FINAL
-       WHERE ${window}
+         toUInt64(sum(day_ultrathinks)) AS ultrathinks,
+         toUInt64(sum(day_chars)) AS prompt_chars,
+         toUInt64(sum(day_prompts)) AS prompts
+       FROM (
+         SELECT
+           user_id,
+           ${CAPPED_ULTRATHINKS_SQL} AS day_ultrathinks,
+           sumIf(prompt_length, ${measured}) AS day_chars,
+           countIf(${PROMPT_EVENT_SQL}) AS day_prompts
+         FROM (
+           SELECT user_id, event_name, command_source, prompt_length, ${local.expr} AS ts_local
+           FROM events_raw FINAL
+           WHERE ${window}
+         )
+         GROUP BY user_id, toDate(ts_local)
+       )
        GROUP BY user_id`,
-      { since: chTimestamp(weekStartUtc(now)) }
+      { since: chTimestamp(weekStartUtc(now)), ...local.params }
     ),
     query<Pick<FigureRow, 'user_id' | 'value_usd' | 'output_tokens'>>(
       `SELECT
@@ -561,9 +635,10 @@ async function fetchClassEvidence(
   if (pageUsers.length === 0) return evidence;
 
   const { list, params } = idParams(pageUsers.map((u) => u.userId));
-  const localTs = `timestamp + toIntervalMinute(multiIf(${pageUsers
-    .map((u, index) => `user_id = {u${index}:String}, ${offsetMinutes(u.timezone, now)}`)
-    .join(', ')}, 0))`;
+  // Same parameter names on both sides — idParams and localTsExpr number users
+  // identically, which is what lets one params object serve the IN list and
+  // the offsets.
+  const localTs = localTsExpr(pageUsers, now).expr;
 
   // 70 days is "this local month, whatever day it is" with room to spare, and
   // it keeps the row count at users × 24 × 3 instead of users × 24 × forever.
@@ -731,6 +806,21 @@ export async function snapshotBoardRanks(
   return values.length;
 }
 
+export interface BoardMovement {
+  /**
+   * The snapshot day everything was compared against, or null when there is
+   * none to compare with. Null is the difference between "this user is new" and
+   * "this board has no history yet", and the page prints those differently.
+   */
+  previousDay: string | null;
+  /**
+   * Positions gained since that day, per user. ZERO IS A VALUE: it means the
+   * user was there and has not moved, which is "—" on the page. A user missing
+   * from the map was not in the snapshot at all, which is "new".
+   */
+  changes: Map<string, number>;
+}
+
 /**
  * ▲▼ per user for one board, against the most recent earlier snapshot.
  *
@@ -749,9 +839,9 @@ export async function boardRankChanges(
   currentRanks: Map<string, number>,
   now: Date = new Date(),
   database: AppDb = db
-): Promise<Map<string, number>> {
+): Promise<BoardMovement> {
   const changes = new Map<string, number>();
-  if (userIds.length === 0) return changes;
+  if (userIds.length === 0) return { previousDay: null, changes };
 
   const metric = boardMetricName(board, scope);
   const previous = await database
@@ -761,8 +851,10 @@ export async function boardRankChanges(
     .orderBy(desc(rankSnapshots.day))
     .limit(1)
     .get();
-  if (!previous) return changes;
-  if (scope === 'week' && previous.day < utcDay(weekStartUtc(now))) return changes;
+  if (!previous) return { previousDay: null, changes };
+  if (scope === 'week' && previous.day < utcDay(weekStartUtc(now))) {
+    return { previousDay: null, changes };
+  }
 
   const rows = await database
     .select({ userId: rankSnapshots.userId, rank: rankSnapshots.rank })
@@ -779,15 +871,52 @@ export async function boardRankChanges(
     const current = currentRanks.get(row.userId);
     if (current === undefined) continue;
     const change = rankChange(row.rank, current);
-    if (change !== undefined && change !== 0) changes.set(row.userId, change);
+    if (change !== undefined) changes.set(row.userId, change);
   }
 
-  return changes;
+  return { previousDay: previous.day, changes };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Assembling a page
 // ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * One row, with every part the owner took down left OUT.
+ *
+ * Absent and not zeroed, for the same reason the fingerprint omits a hidden
+ * section: a zero is a claim about the data ("no ultrathinks"), an absent
+ * figure is a claim about the owner's choice, and only one of them is true.
+ * The clock, the class and both side figures each hang off their own section,
+ * so hiding the rings takes away the dial and leaves the class.
+ */
+export function boardRowFor(
+  board: BoardKey,
+  entry: RankedEntry,
+  user: BoardUser,
+  figures: BoardFigures | undefined,
+  evidence: ClassEvidence | undefined,
+  change: number | undefined
+): BoardRow {
+  const figure = figures ?? emptyFigures(user.userId, user.streak);
+  const row: BoardRow = {
+    rank: entry.rank,
+    userId: entry.userId,
+    username: user.username,
+    avatarUrl: user.avatarUrl,
+    value: entry.value,
+    display: formatBoardValue(board, entry.value),
+  };
+  if (change !== undefined) row.change = change;
+  if (user.visibility.rings && evidence) row.hours = evidence.hours;
+  if (user.visibility.class) {
+    const label = classFromEvidence(evidence);
+    if (label) row.classLabel = label;
+  }
+  if (user.visibility.ultrathink) row.ultrathinks = figure.ultrathinks;
+  if (user.visibility.curve) row.streak = user.streak;
+  return row;
+}
 
 export interface BoardQuery {
   board: BoardKey;
@@ -841,7 +970,7 @@ async function buildBoardPage(options: BoardQuery): Promise<BoardPage> {
     figures = await fetchFigures(scope, boardUsers, now);
   } catch (error) {
     console.error('[boards] figures unavailable:', error);
-    return { ...base, rows: [], total: 0, complete: false };
+    return { ...base, rows: [], total: 0, comparedTo: null, complete: false };
   }
 
   const ranked = rankBoard(board, boardUsers, figures);
@@ -863,7 +992,7 @@ async function buildBoardPage(options: BoardQuery): Promise<BoardPage> {
     complete = false;
   }
 
-  const changes = await boardRankChanges(
+  const movement = await boardRankChanges(
     board,
     scope,
     slice.map((entry) => entry.userId),
@@ -871,27 +1000,18 @@ async function buildBoardPage(options: BoardQuery): Promise<BoardPage> {
     now
   );
 
-  const rows: BoardRow[] = slice.map((entry) => {
-    const user = usersById.get(entry.userId)!;
-    const figure = figures.get(entry.userId) ?? emptyFigures(entry.userId, user.streak);
-    const row: BoardRow = {
-      rank: entry.rank,
-      userId: entry.userId,
-      username: user.username,
-      avatarUrl: user.avatarUrl,
-      value: entry.value,
-      display: formatBoardValue(board, entry.value),
-    };
-    const change = changes.get(entry.userId);
-    if (change !== undefined) row.change = change;
-    if (user.visibility.rings) row.hours = evidence.get(entry.userId)?.hours;
-    if (user.visibility.class) row.classLabel = classFromEvidence(evidence.get(entry.userId));
-    if (user.visibility.ultrathink) row.ultrathinks = figure.ultrathinks;
-    if (user.visibility.curve) row.streak = user.streak;
-    return row;
-  });
+  const rows = slice.map((entry) =>
+    boardRowFor(
+      board,
+      entry,
+      usersById.get(entry.userId)!,
+      figures.get(entry.userId),
+      evidence.get(entry.userId),
+      movement.changes.get(entry.userId)
+    )
+  );
 
-  return { ...base, rows, total: ranked.length, complete };
+  return { ...base, rows, total: ranked.length, comparedTo: movement.previousDay, complete };
 }
 
 /**
@@ -912,15 +1032,17 @@ export async function getGlobalPulse(now: Date = new Date()): Promise<GlobalPuls
 async function buildGlobalPulse(now: Date): Promise<GlobalPulse> {
   const since = chTimestamp(weekStartUtc(now));
   const window = `timestamp >= toDateTime64({since:String}, 3, 'UTC')`;
+  // The strip's 🌈 total has to be the sum of the figures on the 🌈 board, so
+  // it is read through the same per-local-day cap — which needs the same
+  // per-user offsets, which is why the pulse loads the user list at all.
+  const local = localTsExpr(await loadBoardUsers(), now);
 
   try {
     const [events, value] = await Promise.all([
-      query<{ hour: number; prompts: number; devs: number; ultrathinks: number }>(
+      query<{ hour: number; prompts: number }>(
         `SELECT
            toUInt8(toHour(timestamp)) AS hour,
-           toUInt64(countIf(${PROMPT_EVENT_SQL})) AS prompts,
-           toUInt64(uniqExactIf(user_id, ${PROMPT_EVENT_SQL})) AS devs,
-           toUInt64(countIf(${ULTRATHINK_EVENT_SQL})) AS ultrathinks
+           toUInt64(countIf(${PROMPT_EVENT_SQL})) AS prompts
          FROM events_raw FINAL
          WHERE ${window}
            AND ${NO_LEGACY_SQL}
@@ -936,23 +1058,33 @@ async function buildGlobalPulse(now: Date): Promise<GlobalPulse> {
       ),
     ]);
 
-    // uniqExact is per hour, so the devs column cannot simply be summed — a
-    // user who worked at 09:00 and 14:00 is in two buckets. The honest figure
-    // needs its own pass, which is one more cheap query.
-    const devs = await query<{ devs: number }>(
-      `SELECT toUInt64(uniqExact(user_id)) AS devs
-       FROM events_raw FINAL
-       WHERE ${window}
-         AND ${PROMPT_EVENT_SQL}`,
-      { since }
+    // A count of people cannot be summed out of the hourly buckets — somebody
+    // who worked at 09:00 and at 14:00 is in two of them — so it gets its own
+    // pass, together with the capped ultrathink total.
+    const totals = await query<{ devs: number; ultrathinks: number }>(
+      `SELECT
+         toUInt64(uniqExact(user_id)) AS devs,
+         toUInt64(sum(day_ultrathinks)) AS ultrathinks
+       FROM (
+         SELECT
+           user_id,
+           ${CAPPED_ULTRATHINKS_SQL} AS day_ultrathinks,
+           countIf(${PROMPT_EVENT_SQL}) AS day_prompts
+         FROM (
+           SELECT user_id, event_name, command_source, ${local.expr} AS ts_local
+           FROM events_raw FINAL
+           WHERE ${window}
+         )
+         GROUP BY user_id, toDate(ts_local)
+         HAVING day_prompts > 0
+       )`,
+      { since, ...local.params }
     );
 
     let busiestHourUtc: number | null = null;
     let busiest = 0;
-    let ultrathinks = 0;
     for (const row of events) {
       const prompts = Number(row.prompts) || 0;
-      ultrathinks += Number(row.ultrathinks) || 0;
       if (prompts > busiest) {
         busiest = prompts;
         busiestHourUtc = Number(row.hour);
@@ -960,9 +1092,9 @@ async function buildGlobalPulse(now: Date): Promise<GlobalPulse> {
     }
 
     return {
-      devs: Number(devs[0]?.devs) || 0,
+      devs: Number(totals[0]?.devs) || 0,
       valueUsd: Number(value[0]?.value_usd) || 0,
-      ultrathinks,
+      ultrathinks: Number(totals[0]?.ultrathinks) || 0,
       busiestHourUtc,
       complete: true,
     };

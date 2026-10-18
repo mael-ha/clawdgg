@@ -50,18 +50,42 @@ const ASCII_LOGO = `
  ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═════╝    ╚═════╝  ╚═════╝
 `;
 
+/**
+ * The brand, in the only two places it is allowed to differ.
+ *
+ * TWO SPANS, TWO TONES — the name is `clawd` + `.gg` and the second half is
+ * green. Never one span with the whole string in it (and never a bulk rename
+ * through here).
+ *
+ * `ghost` adds ONE magenta layer at 35%, two pixels off, and only ever on the
+ * hero: that is the glitch. The old `.glitch-text` rule printed two animated
+ * ghosts off a `data-text` attribute, which at nav size landed on top of the
+ * word and read as a rendering bug rather than a signature — so small logos get
+ * no ghost at all, here or anywhere.
+ */
+export const Wordmark: FC<{ ghost?: boolean; class?: string }> = ({ ghost = false, class: cls }) => (
+  <span class={`relative inline-block ${cls ?? ''}`}>
+    {ghost && (
+      <span aria-hidden="true" class="absolute left-[2px] top-[1px] text-magenta-400/35">
+        clawd.gg
+      </span>
+    )}
+    <span class="relative">
+      <span class="text-gray-100">clawd</span>
+      <span class="text-cyan-400">.gg</span>
+    </span>
+  </span>
+);
+
 const NavBar: FC<{ user?: SessionUser | null }> = ({ user }) => (
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-cyan-500/20 bg-black/80 backdrop-blur-md">
     <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
       <div class="flex h-16 items-center justify-between">
         {/* Logo */}
         <a href="/" class="flex items-center gap-3 group">
-          {/* Brand: two spans, two tones. The glitch-text ghost layers belong
-              to hero type — at 20px they landed on top of the word and the
-              logo read as a rendering bug. */}
           <div class="font-mono text-xl font-bold tracking-tight">
             <span class="text-magenta-400">&gt;</span>{' '}
-            <span class="text-gray-100">clawd</span><span class="text-cyan-400">.gg</span>
+            <Wordmark />
           </div>
           <span class="hidden sm:inline-block text-xs text-gray-500 font-mono">
             // claude code leaderboard
