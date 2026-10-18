@@ -49,14 +49,18 @@ export const RankDelta: FC<{ row: BoardRow; comparedTo: string | null }> = ({
 /**
  * 🌈 ultrathinks · 🔥 streak, beside whichever board is being shown.
  *
- * Either half is ABSENT when its owner hid the section behind it, which is why
- * the separator is assembled rather than hardcoded: "🌈 312 · " with nothing
- * after it would read as a missing number instead of a private one.
+ * Either half is ABSENT when its owner hid the section behind it, or when the
+ * board already prints it, which is why the separator is assembled rather than
+ * hardcoded: "🌈 312 · " with nothing after it would read as a missing number
+ * instead of a private one.
+ *
+ * With neither half, the column is EMPTY. A lone separator is a mark with no
+ * meaning — it looks like a figure that failed to render rather than one that
+ * was never going to be there.
  */
 export const SideFigures: FC<{ row: BoardRow }> = ({ row }) => {
   const parts: string[] = [];
   if (row.ultrathinks !== undefined) parts.push(`🌈 ${row.ultrathinks.toLocaleString('en-US')}`);
   if (row.streak !== undefined) parts.push(`🔥 ${row.streak}`);
-  if (parts.length === 0) return <span class="text-[#3a4150]">·</span>;
   return <>{parts.join(' · ')}</>;
 };
