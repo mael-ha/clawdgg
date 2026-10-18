@@ -408,9 +408,35 @@ async function mapFile(file: string, args: Args): Promise<MappedRows> {
 // history.jsonl is the chronological log of every prompt the user typed in
 // the Claude Code REPL — slash commands and up-arrow repeats included, which
 // we filter / dedupe here.
+//
+// A day that already holds transcript-derived prompts is skipped WHOLE, flags
+// and all: the two sources describe the same prompts and disagree about the
+// millisecond, so the row identity cannot see the overlap. See transcriptDays.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const HISTORY_PATH = join(homedir(), ".claude", "history.jsonl");
+
+/**
+ * UTC days in the window that already hold transcript-derived prompts.
+ *
+ * `provenance = 'backfill'` only — the question is whether the TRANSCRIPT
+ * source has spoken for that day. A 'backfill-history' row is this mode's own
+ * earlier output, which the deterministic row_id already collapses, and a
+ * 'live' day is outside any window this mode is used for.
+ */
+async function transcriptDays(from: Date, to: Date): Promise<Set<string>> {
+  const rows = await query<{ day: string }>(
+    `SELECT DISTINCT toString(toDate(timestamp)) AS day
+     FROM events_raw
+     WHERE user_id = {userId:String}
+       AND provenance = 'backfill'
+       AND event_name = 'claude_code.user_prompt'
+       AND timestamp >= {from:DateTime64(3)}
+       AND timestamp < {to:DateTime64(3)}`,
+    { userId: USER_ID, from: fmtTs(from), to: fmtTs(to) }
+  );
+  return new Set(rows.map((row) => row.day).filter((day) => /^\d{4}-\d{2}-\d{2}$/.test(day)));
+}
 
 async function runFromHistory(args: Args): Promise<void> {
   if (!args.from) throw new Error("--from-history requires --from");
@@ -434,11 +460,37 @@ async function runFromHistory(args: Args): Promise<void> {
     from: args.from,
     to,
   });
-  const rows = mapped.events;
+
+  // ONE SOURCE OF PROMPTS AND FLAGS PER DAY, and the day is the unit.
+  //
+  // The transcript mode (--from) and this one describe the SAME prompts from two
+  // places, and they do not agree to the millisecond — history.jsonl records
+  // when enter was pressed, the transcript when the line was written — so the
+  // row identity cannot see the overlap and running both over a window inserts
+  // every prompt twice. mapHistoryText also emits an ultrathink flag per
+  // matching prompt, and so does mapJsonlText, so the flags double with them.
+  //
+  // fillPromptGapsFromHistory applies this rule when both sources are mapped in
+  // one process. This mode runs on its own, so the already-covered set comes
+  // from the table instead: a day that holds transcript-derived prompts is a day
+  // this mode must not touch, flags included.
+  const covered = await transcriptDays(args.from, to);
+  const rows = mapped.events.filter((row) => !covered.has(row.timestamp.slice(0, 10)));
+  const droppedCovered = mapped.events.length - rows.length;
 
   console.log(
-    `[from-history] parsed=${mapped.parsed}  in-window=${rows.length}  dropped: slash=${mapped.droppedSlash} empty=${mapped.droppedEmpty} out-of-window=${mapped.droppedOutOfWindow} dup=${mapped.droppedDuplicate}`
+    `[from-history] parsed=${mapped.parsed}  in-window=${mapped.events.length}  dropped: slash=${mapped.droppedSlash} empty=${mapped.droppedEmpty} out-of-window=${mapped.droppedOutOfWindow} dup=${mapped.droppedDuplicate} already-covered=${droppedCovered}`
   );
+  if (covered.size > 0) {
+    console.log(
+      `[from-history] ${covered.size} day(s) already hold transcript-derived prompts and were skipped whole:\n` +
+        `  ${[...covered].sort().join(" ")}`
+    );
+  }
+  if (rows.length === 0) {
+    console.log("[from-history] Nothing left to insert.");
+    return;
+  }
 
   // Daily breakdown for sanity.
   const byDay = new Map<string, number>();
