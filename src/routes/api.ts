@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { db } from '../db';
 import { users, planUsageSnapshots, profileSettings } from '../db/schema';
 import { eq, sql, desc, and, gte, inArray } from 'drizzle-orm';
-import { requireAuth, optionalAuth } from '../lib/auth-middleware';
+import { requireAuth, requireBearerAuth, optionalAuth } from '../lib/auth-middleware';
 import type { LeaderboardEntry, LeaderboardResponse } from '../types';
 import { normalizeEpochSeconds, parseRateLimits, shouldInsertSnapshot } from '../lib/plan-usage';
 import { getModelDisplayName } from '../lib/pricing';
@@ -579,6 +579,15 @@ api.put('/me/profile-settings', requireAuth, async (c) => {
 // the machine, and the settings UI posts whatever the user picks. requireAuth
 // takes either a bearer or the session cookie, so neither needs its own route.
 //
+// Keeping the cookie here is CSRF-safe, and the reason is the cookie's own
+// `SameSite=Lax` (src/lib/session.ts), not this handler: Lax sends the session
+// cookie on a cross-site TOP-LEVEL GET NAVIGATION and on nothing else, so a
+// cross-site PUT — form, fetch or XHR — arrives with no cookie at all and
+// requireAuth answers 401 before any of this runs. That reasoning covers every
+// cookie-accepting WRITE in this file (they are all POST or PUT) and fails for
+// exactly one shape: a state change on a GET. There is one of those, and it is
+// GET /auth/logout, which has its own defence in src/routes/auth.ts.
+//
 // An unknown zone is a 400 rather than a silent fallback to UTC: writing UTC
 // after being told 'Europe/Pariss' would leave the user looking at the wrong
 // peak hour with nothing to tell them why.
@@ -695,7 +704,14 @@ api.post('/otel/disable', requireAuth, async (c) => {
 //   - a payload with no usable window is a 200 no-op, never an error
 //   - a window is only written when it actually moved (see shouldInsertSnapshot)
 // sessionId is accepted but not stored — the table is keyed on user + window.
-api.post('/plan-usage', requireAuth, async (c) => {
+//
+// BEARER ONLY. The only caller is `clawdgg statusline`, which reads the rate
+// limits Claude Code hands it and posts them with the CLI's token. Accepting a
+// cookie session here let a logged-in browser write plan-usage snapshots, which
+// is not a thing a browser knows anything about — the numbers come from the
+// local process, and a page cannot have them. Narrowing it costs no caller and
+// removes a write path that could only ever be used by something lying.
+api.post('/plan-usage', requireBearerAuth, async (c) => {
   try {
     const user = c.get('user');
     if (!user) {

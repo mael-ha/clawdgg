@@ -1,31 +1,44 @@
+#!/usr/bin/env bun
 /**
- * Reset User Data Script
+ * Put one user back to never-having-used-it, to test the flow from scratch.
  *
- * Resets a user's data to test the full OTEL flow from scratch:
- * 1. Clears all dailyStats
- * 2. Resets all totals to 0
- * 3. Disables OTEL
- * 4. Clears legacy snapshot
+ *   bun src/scripts/reset-user-data.ts <github_username>          # dry run
+ *   bun src/scripts/reset-user-data.ts <github_username> --apply
  *
- * After running this:
- * 1. Run `clawdgg sync` to re-import historical data
- * 2. Run `clawdgg setup` to enable OTEL (will snapshot the data)
- * 3. Use Claude Code - OTEL data will flow
- * 4. Verify combined totals on profile
+ * WHAT IT USED TO DO, AND WHY THAT WAS WORSE THAN NOTHING. It deleted SQLite
+ * `daily_stats`, zeroed the `legacy_total_*` snapshot columns, and printed
+ * instructions ending in `clawdgg sync`. All three of those are gone:
+ * daily_stats is read by nothing, the legacy snapshot was retired in favour of
+ * asking ClickHouse per provenance, and there is no `sync` subcommand. So it
+ * reported a successful reset while leaving every number the site shows exactly
+ * where it was — the user's profile was unchanged, and the operator had been
+ * told it was clean.
  *
- * Run with: bun src/scripts/reset-user-data.ts <github_username>
+ * The data lives in ClickHouse, so that is what this deletes. `users.total_*`
+ * is a cache of those rows and is zeroed in the same pass; the next sync run
+ * recomputes it from what is left, which is nothing.
+ *
+ * DESTRUCTIVE AND NOT REVERSIBLE. There is no undo for the raw rows: a user's
+ * history is only in ClickHouse. Dry run by default for that reason.
  */
 
-import { db } from '../db';
-import { users, dailyStats } from '../db/schema';
 import { eq } from 'drizzle-orm';
+import { db } from '../db';
+import { users } from '../db/schema';
+import { query } from '../db/clickhouse';
 
-async function resetUserData(username: string) {
-  console.log('='.repeat(60));
-  console.log(`Resetting data for user: ${username}`);
-  console.log('='.repeat(60));
+/** Mutations take as long as they take; the 10s read budget would abort one. */
+const MUTATION_TIMEOUT_MS = 10 * 60 * 1000;
 
-  // Find the user
+async function countRows(table: 'events_raw' | 'metrics_raw', userId: string): Promise<number> {
+  const rows = await query<{ n: number }>(
+    `SELECT toUInt64(count()) AS n FROM ${table} FINAL WHERE user_id = {userId:String}`,
+    { userId }
+  );
+  return Number(rows[0]?.n) || 0;
+}
+
+async function resetUserData(username: string, apply: boolean): Promise<void> {
   const user = await db
     .select()
     .from(users)
@@ -37,50 +50,43 @@ async function resetUserData(username: string) {
     process.exit(1);
   }
 
-  console.log(`Found user: ${user.id} (${user.githubUsername})`);
+  const [events, metrics] = await Promise.all([
+    countRows('events_raw', user.id),
+    countRows('metrics_raw', user.id),
+  ]);
+
+  console.log(`${user.githubUsername} (${user.id})`);
+  console.log(`  OTEL enabled   : ${user.otelEnabled}`);
+  console.log(`  cached prompts : ${user.totalPrompts}`);
+  console.log(`  events_raw     : ${events.toLocaleString('en-US')} rows`);
+  console.log(`  metrics_raw    : ${metrics.toLocaleString('en-US')} rows`);
   console.log('');
+  console.log('This DELETES every one of those rows — every provenance, live');
+  console.log('included — and zeroes the cached totals. There is no undo.');
 
-  // Show current state
-  console.log('Current state:');
-  console.log(`  - OTEL enabled: ${user.otelEnabled}`);
-  console.log(`  - Total prompts: ${user.totalPrompts}`);
-  console.log(`  - Legacy prompts: ${user.legacyTotalPrompts}`);
-  console.log('');
+  if (!apply) {
+    console.log('\nDry run. Nothing was changed. Re-run with --apply.');
+    return;
+  }
 
-  // Count daily stats
-  const statsCount = await db
-    .select({ id: dailyStats.id })
-    .from(dailyStats)
-    .where(eq(dailyStats.userId, user.id));
+  // mutations_sync = 2 inside the statement: an ALTER ... DELETE is applied in
+  // the background otherwise, and the counts printed afterwards would be read
+  // against rows that are still there.
+  for (const table of ['events_raw', 'metrics_raw'] as const) {
+    console.log(`Deleting from ${table}…`);
+    await query(
+      `ALTER TABLE ${table} DELETE WHERE user_id = {userId:String} SETTINGS mutations_sync = 2`,
+      { userId: user.id },
+      { timeoutMs: MUTATION_TIMEOUT_MS }
+    );
+  }
 
-  console.log(`Daily stats entries: ${statsCount.length}`);
-
-  // Confirm reset
-  console.log('');
-  console.log('This will:');
-  console.log('  1. DELETE all daily_stats entries');
-  console.log('  2. Reset all total_* columns to 0');
-  console.log('  3. Disable OTEL');
-  console.log('  4. Clear legacy snapshot columns');
-  console.log('');
-
-  // Delete daily stats
-  const deleted = await db
-    .delete(dailyStats)
-    .where(eq(dailyStats.userId, user.id));
-
-  console.log(`Deleted ${statsCount.length} daily_stats entries`);
-
-  // Reset user totals
   await db
     .update(users)
     .set({
-      // Disable OTEL
       otelEnabled: false,
       otelSetupAt: null,
       otelSetupDate: null,
-
-      // Reset OTEL totals
       totalPrompts: 0,
       totalTokens: 0,
       totalInputTokens: 0,
@@ -93,61 +99,35 @@ async function resetUserData(username: string) {
       totalPrs: 0,
       totalActiveSeconds: 0,
       avgPromptLength: 0,
-
-      // Clear legacy snapshot
-      legacyTotalPrompts: 0,
-      legacyTotalTokens: 0,
-      legacyTotalInputTokens: 0,
-      legacyTotalOutputTokens: 0,
-      legacyTotalCacheReadTokens: 0,
-      legacyTotalCacheCreationTokens: 0,
-      legacyTotalCostUsdCents: 0,
-      legacyTotalLinesAdded: 0,
-      legacyTotalCommits: 0,
-      legacyTotalToolCalls: 0,
-
-      // Reset streaks and badges
       currentStreak: 0,
       longestStreak: 0,
+      firstSessionDate: null,
       badges: null,
       hourCounts: null,
-
       updatedAt: new Date(),
     })
     .where(eq(users.id, user.id));
 
-  console.log('Reset all user totals to 0');
-
+  const [eventsLeft, metricsLeft] = await Promise.all([
+    countRows('events_raw', user.id),
+    countRows('metrics_raw', user.id),
+  ]);
+  console.log(`\nLeft behind: ${eventsLeft} events, ${metricsLeft} metrics (both must be 0).`);
   console.log('');
-  console.log('='.repeat(60));
-  console.log('Reset complete!');
-  console.log('');
-  console.log('Next steps to test the flow:');
-  console.log('');
-  console.log('1. Run `clawdgg sync` to import your historical JSONL data');
-  console.log('   → This populates daily_stats');
-  console.log('   → You should see your stats on the leaderboard');
-  console.log('');
-  console.log('2. Run `clawdgg setup` to enable OTEL');
-  console.log('   → This snapshots daily_stats into legacy_total_*');
-  console.log('   → Configures OTEL streaming');
-  console.log('');
-  console.log('3. Use Claude Code (make some prompts)');
-  console.log('   → OTEL data flows to ClickHouse');
-  console.log('   → Sync job adds OTEL + legacy totals');
-  console.log('');
-  console.log('4. Check your profile - should show COMBINED totals');
-  console.log('='.repeat(60));
+  console.log('To test the flow from here:');
+  console.log('  1. `clawdgg setup`  — enables OTEL and records the cutoff');
+  console.log('  2. use Claude Code  — rows arrive over OTLP as provenance=live');
+  console.log('  3. `clawdgg import` — loads local history up to that cutoff');
+  console.log('  4. the sync job (or POST /api/admin/sync) refreshes users.total_*');
 }
 
-// Get username from args
 const username = process.argv[2];
-if (!username) {
-  console.error('Usage: bun src/scripts/reset-user-data.ts <github_username>');
+if (!username || username.startsWith('--')) {
+  console.error('Usage: bun src/scripts/reset-user-data.ts <github_username> [--apply]');
   process.exit(1);
 }
 
-resetUserData(username)
+resetUserData(username, process.argv.includes('--apply'))
   .then(() => process.exit(0))
   .catch((error) => {
     console.error('Reset failed:', error);

@@ -184,14 +184,50 @@ auth.get('/callback', async (c) => {
   }
 });
 
-// POST /auth/logout - Logout user (API)
+// POST /auth/logout — the canonical one. A logout is a state change, so it
+// gets the verb for a state change, and `SameSite=Lax` means a cross-site POST
+// carries no session cookie at all.
 auth.post('/logout', async (c) => {
   destroySession(c);
   return c.json({ success: true });
 });
 
-// GET /auth/logout - Logout user (browser redirect)
+/**
+ * GET /auth/logout — the browser redirect, with the one defence a GET can have.
+ *
+ * A state change on a GET is CSRF-able by construction, and `SameSite=Lax` is
+ * no help precisely here: Lax DOES send the session cookie on a cross-site
+ * top-level GET navigation, which is exactly what `<a href="https://clawd.gg/
+ * auth/logout">` or a redirect from anywhere else is. So any page could log our
+ * users out — not dangerous, but it is someone else deciding when a session
+ * ends.
+ *
+ * `Sec-Fetch-Site` is what closes it. Browsers set it themselves and a page
+ * cannot forge it:
+ *
+ *   same-origin  our own link or form            → allowed
+ *   none         address bar, bookmark, typed    → allowed (user-initiated)
+ *   same-site    another host on clawd.gg        → refused
+ *   cross-site   anybody else's page             → refused
+ *
+ * A client that sends no `Sec-Fetch-Site` at all (curl, an old browser) is
+ * allowed through: the header's absence is not evidence of anything, and
+ * refusing it would break logging out in a browser that cannot be attacked this
+ * way either. The POST above is the route with no caveats, and the markup
+ * should use it — see the hand-off note in the D2 report.
+ */
 auth.get('/logout', async (c) => {
+  const site = c.req.header('Sec-Fetch-Site');
+  if (site === 'cross-site' || site === 'same-site') {
+    return c.json(
+      {
+        error: 'Cross-site logout refused',
+        message: 'Log out from clawd.gg itself, or POST /auth/logout.',
+      },
+      403
+    );
+  }
+
   destroySession(c);
   return c.redirect('/');
 });
