@@ -161,12 +161,3 @@ export function getBadges(badgeIds: string[]): Badge[] {
     .filter((b): b is Badge => b !== undefined);
 }
 
-/**
- * Format badges for display (emoji only, for leaderboard)
- */
-export function formatBadgesCompact(badgeIds: string[]): string {
-  return getBadges(badgeIds)
-    .slice(0, 3) // Max 3 badges shown
-    .map((b) => b.emoji)
-    .join('');
-}

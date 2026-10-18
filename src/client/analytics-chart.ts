@@ -26,7 +26,7 @@ import {
   type ChartConfiguration,
 } from 'chart.js';
 import type { ChartData } from '../db/clickhouse';
-import { formatTokens } from '../lib/format';
+import { formatCost, formatNumber, formatTokens } from '../lib/format';
 
 Chart.register(
   BarController,
@@ -53,6 +53,33 @@ interface NoDataResponse {
 }
 
 type ChartResponse = ChartData | NoDataResponse | { error: string };
+
+/**
+ * Format a value the way its METRIC is measured.
+ *
+ * One formatter for every metric was wrong in both directions: a $10,918 cost
+ * total rendered as "11K" with no currency at all, and 23,304 prompts rendered
+ * as "23K" on the token scale, which rounds to the nearest thousand and so
+ * reads as a magnitude rather than a count. `formatNumber` keeps the decimal
+ * ("23.3K") precisely because a count is a claim.
+ *
+ * Cost arrives from the API in DOLLARS (the `claude_code.cost.usage` metric is
+ * USD); format.ts's formatCost takes CENTS, which is how cost is stored
+ * everywhere else, so it is converted here rather than given a second
+ * formatter.
+ */
+function formatMetric(metric: Metric, value: number): string {
+  switch (metric) {
+    case 'cost':
+      return formatCost(Math.round(value * 100));
+    case 'tokens':
+      return formatTokens(value);
+    case 'prompts':
+    case 'lines':
+    case 'commits':
+      return formatNumber(Math.round(value));
+  }
+}
 
 const MONO = { family: 'JetBrains Mono' } as const;
 const AXIS = { color: '#6b7280', font: { family: 'JetBrains Mono', size: 9 } } as const;
@@ -122,14 +149,14 @@ if (root && canvas) {
               callbacks: {
                 label: (context) => {
                   const raw = context.raw as number;
-                  return `${context.dataset.label}: ${raw >= 0 ? '+' : '-'}${formatTokens(Math.abs(raw))}`;
+                  return `${context.dataset.label}: ${raw >= 0 ? '+' : '-'}${formatMetric(metric, Math.abs(raw))}`;
                 },
               },
             },
           },
           scales: {
             x: { stacked: true, grid: GRID, ticks: AXIS },
-            y: { stacked: true, grid: GRID, ticks: { ...AXIS, callback: (v) => formatTokens(Number(v)) } },
+            y: { stacked: true, grid: GRID, ticks: { ...AXIS, callback: (v) => formatMetric(metric, Number(v)) } },
           },
         },
       };
@@ -156,7 +183,7 @@ if (root && canvas) {
           plugins: { legend: { display: false }, tooltip: TOOLTIP_BOX },
           scales: {
             x: { grid: GRID, ticks: AXIS },
-            y: { grid: GRID, ticks: { ...AXIS, callback: (v) => formatTokens(Number(v)) } },
+            y: { grid: GRID, ticks: { ...AXIS, callback: (v) => formatMetric(metric, Number(v)) } },
           },
         },
       };
@@ -204,7 +231,7 @@ if (root && canvas) {
         },
         scales: {
           x: { grid: GRID, ticks: AXIS },
-          y: { grid: GRID, ticks: { ...AXIS, callback: (v) => formatTokens(Number(v)) } },
+          y: { grid: GRID, ticks: { ...AXIS, callback: (v) => formatMetric(metric, Number(v)) } },
         },
       },
     };
@@ -218,8 +245,8 @@ if (root && canvas) {
   }
 
   function updateSummary(summary: ChartData['summary']) {
-    setText('summary-total', formatTokens(summary.total));
-    setText('summary-average', formatTokens(summary.average));
+    setText('summary-total', formatMetric(metric, summary.total));
+    setText('summary-average', formatMetric(metric, summary.average));
     setText('summary-average-label', `avg/${effectiveGroupBy()}`);
     setText('summary-peak', summary.peak ? summary.peak.date : '—');
 
