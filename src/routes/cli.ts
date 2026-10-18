@@ -8,6 +8,7 @@
  */
 
 import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import { eq } from 'drizzle-orm';
 import { db } from '../db';
 import { users } from '../db/schema';
@@ -26,9 +27,13 @@ import {
   query,
   type EventRow,
   type MetricRow,
-  type RowProvenance,
 } from '../db/clickhouse';
-import type { ImportEventRow, ImportMetricRow } from '../lib/session-import';
+import {
+  computeCostUsd,
+  isBuiltinSlashCommand,
+  type ImportEventRow,
+  type ImportMetricRow,
+} from '../lib/session-import';
 
 const cli = new Hono();
 
@@ -202,37 +207,61 @@ cli.post('/logout', requireBearerAuth, async (c) => {
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // `clawdgg import` maps the user's own ~/.claude JSONL files with the shared
-// mapper (src/lib/session-import.ts) and posts the resulting rows here. Five
-// rules, all enforced on this side because the client is the user's machine:
+// mapper (src/lib/session-import.ts) and posts the resulting rows here.
 //
-//   1. user_id is taken from the bearer token, never from the payload.
+// The client is the user's own machine, so nothing it says about a measurement
+// is taken on trust. What survives from the payload is timestamps, model ids
+// and token COUNTS; everything derived from them is computed here:
+//
+//   1. user_id comes from the bearer token, never from the payload.
 //   2. provenance is always 'import'.
-//   3. rows must predate the user's OTEL setup, or live data would be
-//      double-counted by an import that overlaps it.
-//   4. re-importing inserts nothing: rows whose ReplacingMergeTree key already
-//      exists are dropped before the insert.
-//   5. a user who still carries a legacy dailyStats snapshot is refused — that
-//      snapshot is already added on top of ClickHouse totals, so importing the
-//      same history would count it twice.
+//   3. cost_usd is RECOMPUTED from model + tokens with the shared pricing
+//      table. A client that claims $40,000 of Opus gets priced like everyone
+//      else — the leaderboard is ranked on this number.
+//   4. metrics are DERIVED from the sanitized api_request events. The client's
+//      metrics array is ignored outright: it is the same information twice,
+//      and accepting both lets one of them lie.
+//   5. token counts are clamped to what one request can plausibly hold, and
+//      timestamps outside [2025-02-01, cutoff) are refused.
+//   6. the cutoff is min(users.otel_setup_at, first live event), computed here.
+//   7. a UTC day that already holds rows of ANY provenance is skipped whole.
 
 export const MAX_IMPORT_BODY_SIZE = 8 * 1024 * 1024; // 8MB
 export const MAX_IMPORT_ROWS = 20_000;
+
+/**
+ * Claude Code did not exist before this, so a row claiming to predate it is
+ * either a clock problem or a forgery. Either way it is not history.
+ */
+export const EARLIEST_PLAUSIBLE_MS = Date.parse('2025-02-01T00:00:00.000Z');
+
+/**
+ * Per-request ceilings. A single api_request cannot exceed the context window
+ * (1M today) by any margin that matters, and the output cap is ~128K. These are
+ * generous multiples of both: the point is that one forged row cannot add a
+ * trillion tokens to a leaderboard, not to second-guess a real one.
+ */
+export const MAX_INPUT_TOKENS_PER_REQUEST = 2_000_000;
+export const MAX_OUTPUT_TOKENS_PER_REQUEST = 500_000;
+export const MAX_CACHE_TOKENS_PER_REQUEST = 2_000_000;
+export const MAX_PROMPT_LENGTH = 1_000_000;
 
 const ALLOWED_EVENT_NAMES = new Set([
   'claude_code.user_prompt',
   'claude_code.api_request',
   'claude_code.tool_result',
 ]);
-const ALLOWED_METRIC_NAMES = new Set(['claude_code.token.usage', 'claude_code.cost.usage']);
-const ALLOWED_TOKEN_TYPES = new Set(['input', 'output', 'cacheRead', 'cacheCreation']);
+
+/** Claude Code 2.1.117+ user_prompt attribution. */
+const ALLOWED_COMMAND_SOURCES = new Set(['builtin', 'custom', 'mcp']);
 
 const TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}$/;
 
 /**
- * Identifiers go into a ClickHouse tuple literal for the duplicate lookup, so
- * they are reduced to a charset that cannot carry a quote or a comment. Session
- * ids are UUIDs and tool/model names are identifiers, so nothing real is lost —
- * and the sanitized value is what gets inserted, so the keys still line up.
+ * Identifiers are reduced to a charset that cannot carry a quote or a comment.
+ * Session ids are UUIDs and tool/model names are identifiers, so nothing real
+ * is lost — and the sanitized value is what gets inserted, so the row identity
+ * is computed over exactly what is stored.
  */
 function safeIdentifier(value: unknown, maxLen: number): string {
   return String(value ?? '')
@@ -240,16 +269,18 @@ function safeIdentifier(value: unknown, maxLen: number): string {
     .slice(0, maxLen);
 }
 
-function safeCount(value: unknown, max: number): number {
-  const num = Number(value);
-  if (!Number.isFinite(num) || num < 0) return 0;
-  return Math.min(Math.floor(num), max);
+interface ClampResult {
+  value: number;
+  clamped: boolean;
 }
 
-function safeAmount(value: unknown, max: number): number {
+function safeCount(value: unknown, max: number): ClampResult {
   const num = Number(value);
-  if (!Number.isFinite(num) || num < 0) return 0;
-  return Math.min(num, max);
+  // Infinity and NaN are nonsense rather than "very large": they become 0,
+  // never a clamped maximum that would inflate someone's totals.
+  if (!Number.isFinite(num) || num < 0) return { value: 0, clamped: false };
+  const floored = Math.floor(num);
+  return floored > max ? { value: max, clamped: true } : { value: floored, clamped: false };
 }
 
 /** ms since epoch for a 'YYYY-MM-DD HH:MM:SS.sss' UTC literal, or null. */
@@ -264,63 +295,123 @@ export interface ImportCounts {
   inserted: number;
   rejected: number;
   skippedAfterCutoff: number;
+  /** Rows claiming to predate Claude Code. */
+  skippedBeforeEpoch: number;
+  /** Built-in slash commands, which are not prompts. */
+  skippedBuiltinCommand: number;
+  /** Rows dropped because that whole UTC day is already on record. */
+  skippedCoveredDay: number;
+  /** Rows identical to another row in the same batch. */
   skippedDuplicate: number;
+  /** Token counts that exceeded a per-request maximum and were capped. */
+  clamped: number;
+  /** Client-sent metric rows thrown away — we derive our own. */
+  ignoredClientMetrics: number;
 }
 
 export interface ImportResult extends ImportCounts {
   cutoff: string;
+  /** The UTC days we refused, so the CLI can say which and why. */
+  skippedDays: string[];
 }
 
 export interface ImportDeps {
   /** Rows at or after this instant are refused. */
   cutoffMs: number;
-  /** Which of these row_ids events_raw already holds. */
-  existingEventIds(ids: string[]): Promise<Set<string>>;
-  /** Which of these row_ids metrics_raw already holds. */
-  existingMetricIds(ids: string[]): Promise<Set<string>>;
+  /** UTC days (YYYY-MM-DD) that already hold rows of ANY provenance. */
+  coveredDays: Set<string>;
   insertEvents(rows: EventRow[]): Promise<void>;
   insertMetrics(rows: MetricRow[]): Promise<void>;
 }
 
 /**
- * Provenances an imported row could already exist under.
- *
- * `provenance` is part of the row identity, so the same JSONL line hashes to a
- * different row_id per provenance — and a user whose history was already put
- * in by the operator-run backfill, or by the daily_stats import, would get a
- * second copy of every row. Checking all three is what makes the import
- * idempotent across them instead of only against itself.
+ * ImportEventRow plus the two user_prompt attribution columns. Both exist on
+ * clickhouse.ts's EventRow and in the DDL, but not yet on the shared mapper's
+ * row type in src/lib/session-import.ts — widening here keeps the validation
+ * server-side without reaching into that file.
  */
-const IMPORT_EQUIVALENT_PROVENANCES: readonly RowProvenance[] = ['backfill', 'legacy'];
-
-/** Every row_id this row could already be stored under. */
-function candidateEventIds(row: ImportEventRow): string[] {
-  const base = row as unknown as EventRow;
-  return [
-    eventRowId(base),
-    ...IMPORT_EQUIVALENT_PROVENANCES.map((provenance) => eventRowId({ ...base, provenance })),
-  ];
-}
-
-function candidateMetricIds(row: ImportMetricRow): string[] {
-  const base = row as unknown as MetricRow;
-  return [
-    metricRowId(base),
-    ...IMPORT_EQUIVALENT_PROVENANCES.map((provenance) => metricRowId({ ...base, provenance })),
-  ];
-}
+type SanitizedEventRow = ImportEventRow & {
+  command_name?: string;
+  command_source?: string;
+};
 
 interface Sanitized {
-  events: ImportEventRow[];
+  events: SanitizedEventRow[];
+  /** Derived here from the events above — never taken from the payload. */
   metrics: ImportMetricRow[];
   rejected: number;
   skippedAfterCutoff: number;
+  skippedBeforeEpoch: number;
+  skippedBuiltinCommand: number;
+  clamped: number;
+  ignoredClientMetrics: number;
+}
+
+/**
+ * Metric rows for one api_request, byte-identical to what the shared mapper
+ * emits for the same line.
+ *
+ * They have to be: `metricRowId` hashes timestamp + session + metric + model +
+ * token_type + provenance, so a row derived here and the same row produced by
+ * the operator-run backfill collapse onto each other under ReplacingMergeTree
+ * instead of double-counting.
+ */
+function deriveMetrics(event: SanitizedEventRow): ImportMetricRow[] {
+  const base = {
+    timestamp: event.timestamp,
+    user_id: event.user_id,
+    session_id: event.session_id,
+    model: event.model ?? '',
+    provenance: event.provenance,
+  };
+  const metrics: ImportMetricRow[] = [];
+
+  const tokens: [string, number][] = [
+    ['input', event.input_tokens ?? 0],
+    ['output', event.output_tokens ?? 0],
+    ['cacheRead', event.cache_read_tokens ?? 0],
+    ['cacheCreation', event.cache_write_tokens ?? 0],
+  ];
+  for (const [tokenType, value] of tokens) {
+    if (value > 0) {
+      metrics.push({
+        ...base,
+        metric_name: 'claude_code.token.usage',
+        value,
+        token_type: tokenType,
+      });
+    }
+  }
+
+  if ((event.cost_usd ?? 0) > 0) {
+    metrics.push({
+      ...base,
+      metric_name: 'claude_code.cost.usage',
+      value: event.cost_usd!,
+      pricing_source: event.pricing_source,
+    });
+  }
+
+  return metrics;
 }
 
 /** Validate, clamp and re-stamp every row the client sent. Exported for tests. */
 export function sanitizeImportRows(userId: string, body: unknown, cutoffMs: number): Sanitized {
-  const out: Sanitized = { events: [], metrics: [], rejected: 0, skippedAfterCutoff: 0 };
+  const out: Sanitized = {
+    events: [],
+    metrics: [],
+    rejected: 0,
+    skippedAfterCutoff: 0,
+    skippedBeforeEpoch: 0,
+    skippedBuiltinCommand: 0,
+    clamped: 0,
+    ignoredClientMetrics: 0,
+  };
   const payload = (body ?? {}) as { events?: unknown; metrics?: unknown };
+
+  // Counted, then discarded. Everything they could carry is derived from the
+  // events, and two independent copies of one measurement is one copy too many.
+  out.ignoredClientMetrics = Array.isArray(payload.metrics) ? payload.metrics.length : 0;
 
   for (const raw of Array.isArray(payload.events) ? payload.events : []) {
     const row = (raw ?? {}) as Record<string, unknown>;
@@ -331,93 +422,146 @@ export function sanitizeImportRows(userId: string, body: unknown, cutoffMs: numb
       out.rejected++;
       continue;
     }
+    if (ms < EARLIEST_PLAUSIBLE_MS) {
+      out.skippedBeforeEpoch++;
+      continue;
+    }
     if (ms >= cutoffMs) {
       out.skippedAfterCutoff++;
       continue;
     }
 
-    const event: ImportEventRow = {
+    const event: SanitizedEventRow = {
       timestamp: row.timestamp as string,
       user_id: userId,
       session_id: safeIdentifier(row.session_id, 256),
       event_name: eventName,
       provenance: 'import',
     };
+
     if (eventName === 'claude_code.user_prompt') {
-      event.prompt_length = safeCount(row.prompt_length, 1_000_000);
+      // The client mapper drops built-in slash commands, but "the client
+      // dropped them" is not a guarantee — a built-in is session management,
+      // not a prompt, and the prompt count is a ranked metric.
+      const commandSource = row.command_source === undefined ? null : String(row.command_source);
+      if (commandSource !== null && !ALLOWED_COMMAND_SOURCES.has(commandSource)) {
+        out.rejected++;
+        continue;
+      }
+      const commandName = safeIdentifier(row.command_name, 100);
+      if (commandSource === 'builtin' || (commandName && isBuiltinSlashCommand(`/${commandName}`))) {
+        out.skippedBuiltinCommand++;
+        continue;
+      }
+      if (commandSource) event.command_source = commandSource;
+      if (commandName) event.command_name = commandName;
+
+      const prompt = safeCount(row.prompt_length, MAX_PROMPT_LENGTH);
+      if (prompt.clamped) out.clamped++;
+      event.prompt_length = prompt.value;
     }
+
     if (eventName === 'claude_code.tool_result') {
       event.tool_name = safeIdentifier(row.tool_name, 200);
       // Part of the row identity: without it, two calls to the same tool in
       // one assistant message hash alike and collapse into one row.
       event.tool_use_id = safeIdentifier(row.tool_use_id, 100);
     }
+
     if (eventName === 'claude_code.api_request') {
-      event.model = safeIdentifier(row.model, 100);
-      event.cost_usd = safeAmount(row.cost_usd, 10_000);
-      event.input_tokens = safeCount(row.input_tokens, 1e12);
-      event.output_tokens = safeCount(row.output_tokens, 1e12);
-      event.cache_read_tokens = safeCount(row.cache_read_tokens, 1e12);
-      event.cache_write_tokens = safeCount(row.cache_write_tokens, 1e12);
+      const model = safeIdentifier(row.model, 100);
+      const input = safeCount(row.input_tokens, MAX_INPUT_TOKENS_PER_REQUEST);
+      const output = safeCount(row.output_tokens, MAX_OUTPUT_TOKENS_PER_REQUEST);
+      const cacheRead = safeCount(row.cache_read_tokens, MAX_CACHE_TOKENS_PER_REQUEST);
+      const cacheWrite = safeCount(row.cache_write_tokens, MAX_CACHE_TOKENS_PER_REQUEST);
+      // Only ever used for pricing, and only as far as the flat total allows.
+      const cacheWrite1h = safeCount(row.cache_write_1h_tokens, cacheWrite.value);
+      if (input.clamped || output.clamped || cacheRead.clamped || cacheWrite.clamped) out.clamped++;
+
+      event.model = model;
+      event.input_tokens = input.value;
+      event.output_tokens = output.value;
+      event.cache_read_tokens = cacheRead.value;
+      event.cache_write_tokens = cacheWrite.value;
+
+      // The client's cost_usd is not read at all. Same table, same rules, same
+      // number as the operator-run backfill would compute for this row.
+      const estimate = computeCostUsd(model, {
+        input_tokens: input.value,
+        output_tokens: output.value,
+        cache_read_input_tokens: cacheRead.value,
+        cache_creation_input_tokens: cacheWrite.value,
+        cache_creation: {
+          ephemeral_1h_input_tokens: cacheWrite1h.value,
+          ephemeral_5m_input_tokens: cacheWrite.value - cacheWrite1h.value,
+        },
+      });
+      event.cost_usd = estimate.costUsd;
+      event.pricing_source = estimate.pricingSource;
+
+      out.metrics.push(...deriveMetrics(event));
     }
+
     out.events.push(event);
-  }
-
-  for (const raw of Array.isArray(payload.metrics) ? payload.metrics : []) {
-    const row = (raw ?? {}) as Record<string, unknown>;
-    const ms = parseRowTimestamp(row.timestamp);
-    const metricName = String(row.metric_name ?? '');
-
-    if (ms === null || !ALLOWED_METRIC_NAMES.has(metricName)) {
-      out.rejected++;
-      continue;
-    }
-    if (ms >= cutoffMs) {
-      out.skippedAfterCutoff++;
-      continue;
-    }
-
-    const tokenType = String(row.token_type ?? '');
-    const metric: ImportMetricRow = {
-      timestamp: row.timestamp as string,
-      user_id: userId,
-      session_id: safeIdentifier(row.session_id, 256),
-      metric_name: metricName,
-      value: safeAmount(row.value, 1e12),
-      model: safeIdentifier(row.model, 100),
-      provenance: 'import',
-    };
-    if (ALLOWED_TOKEN_TYPES.has(tokenType)) metric.token_type = tokenType;
-    out.metrics.push(metric);
   }
 
   return out;
 }
 
-/**
- * Drop rows already in ClickHouse under any equivalent provenance, and rows
- * duplicated inside this batch. The first candidate id is the row's own.
- */
+/** Drop rows duplicated inside this batch. The id is the row's own identity. */
 export function dropDuplicates<T>(
   rows: T[],
-  candidateIds: (row: T) => string[],
-  existing: Set<string>
+  rowId: (row: T) => string
 ): { kept: T[]; skipped: number } {
   const seen = new Set<string>();
   const kept: T[] = [];
   let skipped = 0;
 
   for (const row of rows) {
-    const ids = candidateIds(row);
-    if (ids.some((id) => existing.has(id)) || seen.has(ids[0]!)) {
+    const id = rowId(row);
+    if (seen.has(id)) {
       skipped++;
       continue;
     }
-    seen.add(ids[0]!);
+    seen.add(id);
     kept.push(row);
   }
 
   return { kept, skipped };
+}
+
+/**
+ * Drop every row falling on a UTC day that is already on record.
+ *
+ * Day granularity, and every provenance, because the alternatives do not work:
+ * `provenance` is part of the row identity, so the same JSONL line hashes
+ * differently as 'import' than as 'backfill' or 'legacy' — a row-id check
+ * cannot see that the operator backfill, the daily_stats import or live
+ * telemetry already counted this history. A day either has been counted or it
+ * has not, and that is a question the row identity can't answer but a date can.
+ *
+ * It also makes a re-import insert exactly nothing, which is the behaviour
+ * `clawdgg import` promises when it says it is safe to run again.
+ */
+export function dropCoveredDays<T extends { timestamp: string }>(
+  rows: T[],
+  coveredDays: Set<string>
+): { kept: T[]; skipped: number; days: string[] } {
+  const kept: T[] = [];
+  const days = new Set<string>();
+  let skipped = 0;
+
+  for (const row of rows) {
+    const day = row.timestamp.slice(0, 10);
+    if (coveredDays.has(day)) {
+      days.add(day);
+      skipped++;
+      continue;
+    }
+    kept.push(row);
+  }
+
+  return { kept, skipped, days: [...days].sort() };
 }
 
 /** The whole import, with its I/O injected so the tests can stub it. */
@@ -428,20 +572,18 @@ export async function runImport(
 ): Promise<ImportResult> {
   const sanitized = sanitizeImportRows(userId, body, deps.cutoffMs);
 
-  const events = dropDuplicates(
-    sanitized.events,
-    candidateEventIds,
-    await deps.existingEventIds(sanitized.events.flatMap(candidateEventIds))
-  );
-  const metrics = dropDuplicates(
-    sanitized.metrics,
-    candidateMetricIds,
-    await deps.existingMetricIds(sanitized.metrics.flatMap(candidateMetricIds))
-  );
+  const eventDays = dropCoveredDays(sanitized.events, deps.coveredDays);
+  const metricDays = dropCoveredDays(sanitized.metrics, deps.coveredDays);
 
-  // ImportEventRow widens clickhouse.ts's RowProvenance, which doesn't carry
-  // 'import' yet; the ClickHouse column is `String DEFAULT 'live'`, so the
-  // value itself is fine. insertEvents/insertMetrics fill row_id.
+  const events = dropDuplicates(eventDays.kept, (row) => eventRowId(row as unknown as EventRow));
+  const metrics = dropDuplicates(metricDays.kept, (row) => metricRowId(row as unknown as MetricRow));
+
+  // TODO(provenance): drop these casts once EventRow/MetricRow carry
+  // `pricing_source`. RowProvenance has since gained 'import', but the shared
+  // mapper's row types also hold pricing_source, which exists in the DDL and
+  // not in clickhouse.ts's interfaces — so the structural mismatch remains.
+  // Harmless meanwhile: the ClickHouse columns are a `String DEFAULT 'live'`
+  // and a LowCardinality(String), and insertEvents/insertMetrics fill row_id.
   if (events.kept.length > 0) await deps.insertEvents(events.kept as unknown as EventRow[]);
   if (metrics.kept.length > 0) await deps.insertMetrics(metrics.kept as unknown as MetricRow[]);
 
@@ -450,116 +592,215 @@ export async function runImport(
     inserted: events.kept.length + metrics.kept.length,
     rejected: sanitized.rejected,
     skippedAfterCutoff: sanitized.skippedAfterCutoff,
+    skippedBeforeEpoch: sanitized.skippedBeforeEpoch,
+    skippedBuiltinCommand: sanitized.skippedBuiltinCommand,
+    skippedCoveredDay: eventDays.skipped + metricDays.skipped,
     skippedDuplicate: events.skipped + metrics.skipped,
+    clamped: sanitized.clamped,
+    ignoredClientMetrics: sanitized.ignoredClientMetrics,
     cutoff: new Date(deps.cutoffMs).toISOString(),
+    skippedDays: [...new Set([...eventDays.days, ...metricDays.days])].sort(),
   };
 }
 
-/** How many row_ids one lookup query carries. 32 hex chars + quotes each. */
-const ID_LOOKUP_CHUNK = 5_000;
+// ───────────────────────────────────────────────────────────────────────────
+// Server-side inputs to the above
+// ───────────────────────────────────────────────────────────────────────────
 
-/**
- * Which of these row_ids the table already holds.
- *
- * row_id is a 32-char hex hash, so the literal list needs no escaping beyond
- * the shape check — anything that isn't hex never reaches the query.
- */
-async function lookupExistingIds(
-  table: 'events_raw' | 'metrics_raw',
-  userId: string,
-  ids: string[]
-): Promise<Set<string>> {
-  const hexIds = [...new Set(ids)].filter((id) => /^[0-9a-f]{32}$/.test(id));
-  const found = new Set<string>();
-
-  for (let i = 0; i < hexIds.length; i += ID_LOOKUP_CHUNK) {
-    const chunk = hexIds.slice(i, i + ID_LOOKUP_CHUNK);
-    const list = chunk.map((id) => `'${id}'`).join(',');
-    const rows = await query<{ row_id: string }>(
-      `SELECT DISTINCT row_id FROM ${table}
-       WHERE user_id = {userId:String} AND row_id IN (${list})`,
-      { userId }
-    );
-    for (const row of rows) found.add(row.row_id);
-  }
-
-  return found;
+/** 'YYYY-MM-DD' for a ClickHouse Date, whatever shape the driver returns. */
+function toDayString(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const day = value.slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : null;
 }
 
-cli.post('/import', requireBearerAuth, async (c) => {
-  const user = c.get('user');
-  if (!user) return c.json({ error: 'Unauthorized' }, 401);
+/** Every UTC day this user already has a raw row on, of any provenance. */
+async function fetchCoveredDays(userId: string): Promise<Set<string>> {
+  const days = new Set<string>();
 
-  const declaredSize = Number(c.req.header('Content-Length') ?? 0);
-  if (declaredSize > MAX_IMPORT_BODY_SIZE) {
-    return c.json({ error: 'Request body too large', maxBytes: MAX_IMPORT_BODY_SIZE }, 413);
-  }
-
-  const row = await db
-    .select({
-      otelSetupAt: users.otelSetupAt,
-      legacyTotalPrompts: users.legacyTotalPrompts,
-      legacyTotalTokens: users.legacyTotalTokens,
-    })
-    .from(users)
-    .where(eq(users.id, user.id))
-    .get();
-
-  // src/routes/api.ts still adds users.legacy_total_* on top of the ClickHouse
-  // totals for all-time views, so for a user who has that snapshot an import of
-  // the same history doubles every number — the same trap
-  // docker/clickhouse/migrations/2026-10-18_import_daily_stats.ts warns about.
-  // Refuse rather than inflate; this can be lifted with the legacy read paths.
-  if ((row?.legacyTotalPrompts ?? 0) > 0 || (row?.legacyTotalTokens ?? 0) > 0) {
-    return c.json(
-      {
-        error: 'Already counted',
-        reason: 'legacy-snapshot',
-        message:
-          'Your pre-OTEL history is already counted from an earlier `clawdgg sync`. ' +
-          'Importing it again would double every all-time total, so this import was refused.',
-      },
-      409
+  for (const table of ['events_raw', 'metrics_raw'] as const) {
+    const rows = await query<{ day: string }>(
+      `SELECT DISTINCT toString(toDate(timestamp)) AS day
+       FROM ${table}
+       WHERE user_id = {userId:String}`,
+      { userId }
     );
+    for (const row of rows) {
+      const day = toDayString(row.day);
+      if (day) days.add(day);
+    }
   }
 
-  // No setup timestamp yet means nothing live has arrived, so "now" is the
-  // cutoff: everything in the transcripts predates the first exported event.
-  const cutoffMs = row?.otelSetupAt ? new Date(row.otelSetupAt).getTime() : Date.now();
+  return days;
+}
 
-  let body: unknown;
-  try {
-    body = await c.req.json();
-  } catch {
-    return c.json({ error: 'Invalid JSON body' }, 400);
-  }
-
-  const payload = (body ?? {}) as { events?: unknown[]; metrics?: unknown[] };
-  const rowCount =
-    (Array.isArray(payload.events) ? payload.events.length : 0) +
-    (Array.isArray(payload.metrics) ? payload.metrics.length : 0);
-  if (rowCount > MAX_IMPORT_ROWS) {
-    return c.json({ error: 'Too many rows in one batch', maxRows: MAX_IMPORT_ROWS }, 413);
-  }
+/**
+ * The instant the import must stop at: whichever came first, the user's OTEL
+ * setup or the first event that actually arrived live.
+ *
+ * Both, not just otel_setup_at, because they can disagree. A user who set up,
+ * streamed for a week and then had otel_setup_at rewritten by a second `setup`
+ * would otherwise be allowed to import over a week of live data.
+ */
+async function computeImportCutoff(userId: string, otelSetupAt: Date | null): Promise<number> {
+  const candidates: number[] = [];
+  if (otelSetupAt) candidates.push(new Date(otelSetupAt).getTime());
 
   try {
-    const result = await runImport(user.id, body, {
-      cutoffMs,
-      existingEventIds: (ids) => lookupExistingIds('events_raw', user.id, ids),
-      existingMetricIds: (ids) => lookupExistingIds('metrics_raw', user.id, ids),
-      insertEvents,
-      insertMetrics,
-    });
-
-    console.log(
-      `[cli/import] ${user.githubUsername}: inserted ${result.inserted}, ` +
-        `dup ${result.skippedDuplicate}, after-cutoff ${result.skippedAfterCutoff}, rejected ${result.rejected}`
-    );
-    return c.json(result);
+    for (const table of ['events_raw', 'metrics_raw'] as const) {
+      const rows = await query<{ first_live: string }>(
+        `SELECT min(timestamp) AS first_live
+         FROM ${table}
+         WHERE user_id = {userId:String} AND provenance = 'live'`,
+        { userId }
+      );
+      const iso = toIsoOrNull(rows[0]?.first_live);
+      if (iso) candidates.push(new Date(iso).getTime());
+    }
   } catch (error) {
-    console.error('[cli/import] failed:', error);
-    return c.json({ error: 'Import failed' }, 500);
+    // A ClickHouse hiccup must not widen the window. Fall back to what SQLite
+    // knows, or to "now" — both are conservative.
+    console.error('[cli/import] first-live lookup failed:', error);
   }
-});
+
+  const valid = candidates.filter((ms) => Number.isFinite(ms));
+  return valid.length > 0 ? Math.min(...valid) : Date.now();
+}
+
+/**
+ * The covered-day set, cached for the life of one `clawdgg import` run.
+ *
+ * It has to be: a full history is more rows than one request carries, and the
+ * FIRST batch inserts rows that would make its own day "covered" for the
+ * second. The run id makes the snapshot stable across the batches of one run,
+ * while a later run recomputes it and so inserts nothing.
+ */
+const IMPORT_RUN_TTL_MS = 30 * 60 * 1000;
+const RUN_ID_RE = /^[0-9a-zA-Z-]{1,64}$/;
+
+const importRuns = new Map<string, { days: Set<string>; expiresAt: number }>();
+
+async function coveredDaysForRun(userId: string, runId: unknown): Promise<Set<string>> {
+  const now = Date.now();
+  for (const [key, entry] of importRuns) {
+    if (entry.expiresAt <= now) importRuns.delete(key);
+  }
+
+  if (typeof runId !== 'string' || !RUN_ID_RE.test(runId)) {
+    return fetchCoveredDays(userId);
+  }
+
+  const key = `${userId}:${runId}`;
+  const cached = importRuns.get(key);
+  if (cached) return cached.days;
+
+  const days = await fetchCoveredDays(userId);
+  importRuns.set(key, { days, expiresAt: now + IMPORT_RUN_TTL_MS });
+  return days;
+}
+
+/**
+ * A budget for /import on top of the global /api/* limiter.
+ *
+ * The global one (60/min) is what a browsing user hits; this one bounds how
+ * much history a single account can push at us in an afternoon. 300 requests
+ * per 10 minutes is ~1.5M rows — far more than any real transcript tree.
+ */
+const IMPORT_RATE_WINDOW_MS = 10 * 60 * 1000;
+const IMPORT_RATE_MAX = 300;
+
+const importRates = new Map<string, { count: number; windowEndsAt: number }>();
+
+export function checkImportRate(
+  userId: string,
+  now: number = Date.now()
+): { ok: boolean; retryAfterSeconds: number } {
+  for (const [key, entry] of importRates) {
+    if (entry.windowEndsAt <= now) importRates.delete(key);
+  }
+
+  const entry = importRates.get(userId);
+  if (!entry || entry.windowEndsAt <= now) {
+    importRates.set(userId, { count: 1, windowEndsAt: now + IMPORT_RATE_WINDOW_MS });
+    return { ok: true, retryAfterSeconds: 0 };
+  }
+
+  entry.count++;
+  if (entry.count > IMPORT_RATE_MAX) {
+    return { ok: false, retryAfterSeconds: Math.ceil((entry.windowEndsAt - now) / 1000) };
+  }
+  return { ok: true, retryAfterSeconds: 0 };
+}
+
+cli.post(
+  '/import',
+  requireBearerAuth,
+  // A declared Content-Length is a claim, not a limit: a chunked body has none.
+  // This counts the bytes as they arrive and aborts the stream.
+  bodyLimit({
+    maxSize: MAX_IMPORT_BODY_SIZE,
+    onError: (c) =>
+      c.json({ error: 'Request body too large', maxBytes: MAX_IMPORT_BODY_SIZE }, 413),
+  }),
+  async (c) => {
+    const user = c.get('user');
+    if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+    const rate = checkImportRate(user.id);
+    if (!rate.ok) {
+      c.header('Retry-After', String(rate.retryAfterSeconds));
+      return c.json(
+        { error: 'Too many import requests', retryAfter: rate.retryAfterSeconds },
+        429
+      );
+    }
+
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    const payload = (body ?? {}) as { events?: unknown[]; metrics?: unknown[]; runId?: unknown };
+    const rowCount =
+      (Array.isArray(payload.events) ? payload.events.length : 0) +
+      (Array.isArray(payload.metrics) ? payload.metrics.length : 0);
+    if (rowCount > MAX_IMPORT_ROWS) {
+      return c.json({ error: 'Too many rows in one batch', maxRows: MAX_IMPORT_ROWS }, 413);
+    }
+
+    const row = await db
+      .select({ otelSetupAt: users.otelSetupAt })
+      .from(users)
+      .where(eq(users.id, user.id))
+      .get();
+
+    try {
+      const [cutoffMs, coveredDays] = await Promise.all([
+        computeImportCutoff(user.id, row?.otelSetupAt ?? null),
+        coveredDaysForRun(user.id, payload.runId),
+      ]);
+
+      const result = await runImport(user.id, body, {
+        cutoffMs,
+        coveredDays,
+        insertEvents,
+        insertMetrics,
+      });
+
+
+      console.log(
+        `[cli/import] ${user.githubUsername}: inserted ${result.inserted}, ` +
+          `covered-day ${result.skippedCoveredDay}, dup ${result.skippedDuplicate}, ` +
+          `after-cutoff ${result.skippedAfterCutoff}, rejected ${result.rejected}`
+      );
+      return c.json(result);
+    } catch (error) {
+      console.error('[cli/import] failed:', error);
+      return c.json({ error: 'Import failed' }, 500);
+    }
+  }
+);
 
 export default cli;

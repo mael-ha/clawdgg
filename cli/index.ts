@@ -27,12 +27,12 @@ import {
   selfCommand,
 } from "./paths";
 import {
+  computeCostUsd,
   describeTranscriptPath,
   fillPromptGapsFromHistory,
   mapHistoryText,
   mapJsonlText,
   type ImportEventRow,
-  type ImportMetricRow,
 } from "../src/lib/session-import";
 import {
   applyOtelSettings,
@@ -1382,6 +1382,10 @@ async function cmdDoctor(): Promise<void> {
 // mapping is the same code the server-side backfill script uses
 // (src/lib/session-import.ts), so imported history and live data are counted
 // the same way. Prompt text never leaves the machine — only its length.
+//
+// Only events go up. The server derives the token and cost metrics from them
+// and prices every row itself, so nothing we compute about money is trusted —
+// which is also why the preview above uses the server's formula, not ours.
 
 /** Rows per request. The server caps at 20k; this leaves room for growth. */
 const IMPORT_BATCH_ROWS = 5_000;
@@ -1391,8 +1395,36 @@ interface ImportBatchResult {
   inserted: number;
   rejected: number;
   skippedAfterCutoff: number;
+  skippedBeforeEpoch: number;
+  skippedBuiltinCommand: number;
+  skippedCoveredDay: number;
   skippedDuplicate: number;
+  clamped: number;
   cutoff: string;
+  skippedDays: string[];
+}
+
+/**
+ * The cost the server will compute for these rows.
+ *
+ * Deliberately NOT the mapper's own `cost_usd`: the server recomputes cost from
+ * model + token counts (it does not trust a client's arithmetic about money),
+ * and it only has the flat cache-creation total to work from. Pricing the
+ * preview the same way is what keeps "we'll upload $X" and "clawd.gg says $X"
+ * the same number.
+ */
+function previewCostUsd(events: ImportEventRow[]): number {
+  let total = 0;
+  for (const event of events) {
+    if (event.event_name !== "claude_code.api_request") continue;
+    total += computeCostUsd(event.model ?? "", {
+      input_tokens: event.input_tokens ?? 0,
+      output_tokens: event.output_tokens ?? 0,
+      cache_read_input_tokens: event.cache_read_tokens ?? 0,
+      cache_creation_input_tokens: event.cache_write_tokens ?? 0,
+    }).costUsd;
+  }
+  return total;
 }
 
 async function findTranscripts(dir: string): Promise<string[]> {
@@ -1431,7 +1463,7 @@ async function fetchImportCutoff(token: string): Promise<Date> {
 
 async function postImportBatch(
   token: string,
-  batch: { events: unknown[]; metrics: unknown[] }
+  batch: { events: unknown[]; runId: string }
 ): Promise<ImportBatchResult> {
   for (let attempt = 1; attempt <= 5; attempt++) {
     const response = await apiFetch("/api/cli/import", {
@@ -1451,16 +1483,11 @@ async function postImportBatch(
       continue;
     }
 
-    const detail = await response.text();
-    if (response.status === 409) throw new ImportRefused(detail);
-    throw new Error(`Import rejected (HTTP ${response.status}): ${detail}`);
+    throw new Error(`Import rejected (HTTP ${response.status}): ${await response.text()}`);
   }
 
   throw new Error("Gave up after repeated rate limiting — try again later.");
 }
-
-/** The server declined for a reason the user needs to read, not a failure. */
-class ImportRefused extends Error {}
 
 async function runLocalImport(config: Config, assumeYes: boolean): Promise<boolean> {
   const token = config.token;
@@ -1485,9 +1512,10 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
     to: cutoff,
   };
 
+  // Only events are uploaded. The server derives the token and cost metrics
+  // from them, so sending the mapper's metrics too would be the same numbers
+  // twice — and one of two copies can disagree with the other.
   const events: ImportEventRow[] = [];
-  const metrics: ImportMetricRow[] = [];
-  let flatCacheFallbacks = 0;
 
   for (const file of transcripts) {
     let raw: string;
@@ -1498,8 +1526,6 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
     }
     const mapped = mapJsonlText(raw, { ...mapOptions, ...describeTranscriptPath(file) });
     events.push(...mapped.events);
-    metrics.push(...mapped.metrics);
-    flatCacheFallbacks += mapped.flatCacheFallbacks;
   }
 
   // history.jsonl outlives the transcripts (which rotate at ~60 days), so it
@@ -1525,10 +1551,14 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
     }
   }
 
+  // Chronological, so one UTC day lands in as few batches as possible: the
+  // server's double-count guard works a whole day at a time.
+  events.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
   const prompts = events.filter((e) => e.event_name === "claude_code.user_prompt").length;
   const apiRequests = events.filter((e) => e.event_name === "claude_code.api_request").length;
-  const costUsd = events.reduce((sum, e) => sum + (e.cost_usd ?? 0), 0);
-  const total = events.length + metrics.length;
+  const costUsd = previewCostUsd(events);
+  const total = events.length;
 
   if (total === 0) {
     log.info("Nothing to import — your local history is all after telemetry started.");
@@ -1538,10 +1568,8 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
   console.log();
   console.log(`  ${colors.bright}${prompts.toLocaleString()}${colors.reset} prompts  ${colors.dim}·${colors.reset}  ${colors.bright}${apiRequests.toLocaleString()}${colors.reset} API calls  ${colors.dim}·${colors.reset}  ${colors.bright}$${costUsd.toFixed(2)}${colors.reset} ${colors.dim}(estimated)${colors.reset}`);
   if (historyKept > 0) log.dim(`  ${historyKept.toLocaleString()} of those prompts come from history.jsonl`);
-  if (flatCacheFallbacks > 0) {
-    log.dim(`  ${flatCacheFallbacks.toLocaleString()} rows had no 1h/5m cache split — their cache cost is understated`);
-  }
-  log.dim(`  ${total.toLocaleString()} rows to upload. Timestamps, counts and costs only — no prompt text.`);
+  log.dim(`  cache writes are priced at the 5-minute rate, so that cost is a floor`);
+  log.dim(`  ${total.toLocaleString()} rows to upload. Timestamps and counts only — no prompt text.`);
   console.log();
 
   if (!(await confirm("Upload this to clawd.gg?", assumeYes))) {
@@ -1549,32 +1577,46 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
     return true;
   }
 
-  const totals = { accepted: 0, inserted: 0, rejected: 0, skippedAfterCutoff: 0, skippedDuplicate: 0 };
+  const totals = {
+    inserted: 0,
+    rejected: 0,
+    skippedAfterCutoff: 0,
+    skippedCoveredDay: 0,
+    skippedDuplicate: 0,
+  };
+  const skippedDays = new Set<string>();
   let sentRows = 0;
 
-  // Events and metrics are batched separately so a batch never splits the rows
-  // that belong to one API call across two requests.
-  for (const [kind, rows] of [["events", events], ["metrics", metrics]] as const) {
-    for (let i = 0; i < rows.length; i += IMPORT_BATCH_ROWS) {
-      const slice = rows.slice(i, i + IMPORT_BATCH_ROWS);
-      const batch = kind === "events" ? { events: slice, metrics: [] } : { events: [], metrics: slice };
+  // One id for the whole run. The server snapshots which days it already holds
+  // when the first batch arrives and reuses that snapshot for the rest — the
+  // alternative is batch 1 making its own day look "already counted" to batch 2.
+  const runId = crypto.randomUUID();
 
-      const result = await postImportBatch(token, batch);
-      totals.accepted += result.accepted;
-      totals.inserted += result.inserted;
-      totals.rejected += result.rejected;
-      totals.skippedAfterCutoff += result.skippedAfterCutoff;
-      totals.skippedDuplicate += result.skippedDuplicate;
+  for (let i = 0; i < events.length; i += IMPORT_BATCH_ROWS) {
+    const slice = events.slice(i, i + IMPORT_BATCH_ROWS);
+    const result = await postImportBatch(token, { events: slice, runId });
 
-      sentRows += slice.length;
-      process.stdout.write(`\r  uploading… ${sentRows.toLocaleString()}/${total.toLocaleString()} rows`);
-    }
+    totals.inserted += result.inserted;
+    totals.rejected += result.rejected;
+    totals.skippedAfterCutoff += result.skippedAfterCutoff;
+    totals.skippedCoveredDay += result.skippedCoveredDay;
+    totals.skippedDuplicate += result.skippedDuplicate;
+    for (const day of result.skippedDays ?? []) skippedDays.add(day);
+
+    sentRows += slice.length;
+    process.stdout.write(`\r  uploading… ${sentRows.toLocaleString()}/${total.toLocaleString()} rows`);
   }
   process.stdout.write("\r\x1b[K");
 
   log.success(`Imported ${totals.inserted.toLocaleString()} rows.`);
+  if (totals.skippedCoveredDay > 0) {
+    log.dim(`  ${totals.skippedCoveredDay.toLocaleString()} rows fell on ${skippedDays.size} day(s) already on record:`);
+    const shown = [...skippedDays].sort();
+    log.dim(`    ${shown.slice(0, 8).join(", ")}${shown.length > 8 ? ` … +${shown.length - 8} more` : ""}`);
+    log.dim("    Those days were already counted, so importing them would double them.");
+  }
   if (totals.skippedDuplicate > 0) {
-    log.dim(`  ${totals.skippedDuplicate.toLocaleString()} were already on record (import is safe to re-run).`);
+    log.dim(`  ${totals.skippedDuplicate.toLocaleString()} were duplicates inside the upload itself.`);
   }
   if (totals.skippedAfterCutoff > 0) {
     log.dim(`  ${totals.skippedAfterCutoff.toLocaleString()} were after telemetry started — live data already has them.`);
@@ -1596,14 +1638,9 @@ async function offerImport(config: Config, assumeYes: boolean): Promise<void> {
   try {
     await runLocalImport(config, assumeYes);
   } catch (error) {
-    if (error instanceof ImportRefused) {
-      log.warn("History import declined by the server:");
-      log.dim(`    ${error.message}`);
-    } else {
-      // Streaming is already configured; a failed import must not undo that.
-      log.warn(`History import failed (${error instanceof Error ? error.message : error}).`);
-      log.dim("    Streaming is on regardless. Retry any time with `clawdgg import`.");
-    }
+    // Streaming is already configured; a failed import must not undo that.
+    log.warn(`History import failed (${error instanceof Error ? error.message : error}).`);
+    log.dim("    Streaming is on regardless. Retry any time with `clawdgg import`.");
   }
 }
 
@@ -1619,12 +1656,7 @@ async function cmdImport(assumeYes: boolean): Promise<void> {
   try {
     if (!(await runLocalImport(config, assumeYes))) process.exit(1);
   } catch (error) {
-    if (error instanceof ImportRefused) {
-      log.error("The server declined this import:");
-      log.dim(`    ${error.message}`);
-    } else {
-      log.error(`${error instanceof Error ? error.message : error}`);
-    }
+    log.error(`${error instanceof Error ? error.message : error}`);
     process.exit(1);
   }
   console.log();
