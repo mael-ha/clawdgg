@@ -245,6 +245,21 @@ export function buildStatusLineCommand(argv: readonly string[]): string {
   return shellJoin([...argv, "statusline"]);
 }
 
+/**
+ * The `statusLine.command` value that RUNS SOMEONE ELSE'S status line.
+ *
+ * `<us> statusline --wrap '<their command string>'` — their whole command is
+ * one shell-quoted argv element, so a status line of their own with quotes,
+ * spaces or a `$` in it survives the round trip through settings.json and back
+ * out of our argv unchanged.
+ */
+export function buildStatusLineWrapCommand(
+  argv: readonly string[],
+  original: string
+): string {
+  return shellJoin([...argv, "statusline", "--wrap", original]);
+}
+
 /** The `hooks.UserPromptSubmit[].hooks[].command` value. Same quoting rules. */
 export function buildPromptHookCommand(argv: readonly string[]): string {
   return shellJoin([...argv, "prompt-hook"]);
@@ -257,21 +272,51 @@ export function buildPromptHookCommand(argv: readonly string[]): string {
  * subcommand, and some earlier word has to name us. `my-wrapper --log
  * otel-headers.log` does not qualify.
  */
+function namesUs(word: string): boolean {
+  return word === "clawdgg" || /(^|[\/\\])clawdgg([.\-]|$)/.test(word) || word.includes("clawdgg");
+}
+
 function isOurSubcommand(command: unknown, subcommand: string): boolean {
   if (typeof command !== "string") return false;
   const argv = shellSplit(command);
   if (argv.length < 2 || argv[argv.length - 1] !== subcommand) return false;
-  return argv
-    .slice(0, -1)
-    .some((word) => word === "clawdgg" || /(^|[\/\\])clawdgg([.\-]|$)/.test(word) || word.includes("clawdgg"));
+  return argv.slice(0, -1).some(namesUs);
 }
 
 export function isOurHelperCommand(command: unknown): boolean {
   return isOurSubcommand(command, "otel-headers");
 }
 
+export interface StatusLineCommandShape {
+  /** We wrote this command. */
+  ours: boolean;
+  /** The command string we are wrapping, if this is a `--wrap` form. */
+  wrapped?: string;
+}
+
+/**
+ * Read a `statusLine.command`: is it ours, and whose status line does it run?
+ *
+ * Ours means some word names us AND a later word is exactly `statusline` —
+ * the same argv test as every other subcommand, except that `statusline` need
+ * not be the last word, because the wrapper form carries two more. Anything
+ * past `statusline` that is not `--wrap <command>` still counts as ours (we
+ * are the only thing that writes that argv) but has no original to recover.
+ */
+export function readStatusLineCommand(command: unknown): StatusLineCommandShape {
+  if (typeof command !== "string") return { ours: false };
+  const argv = shellSplit(command);
+  const at = argv.lastIndexOf("statusline");
+  if (at < 1) return { ours: false };
+  if (!argv.slice(0, at).some(namesUs)) return { ours: false };
+
+  const rest = argv.slice(at + 1);
+  if (rest.length === 2 && rest[0] === "--wrap") return { ours: true, wrapped: rest[1] };
+  return { ours: true };
+}
+
 export function isOurStatusLineCommand(command: unknown): boolean {
-  return isOurSubcommand(command, "statusline");
+  return readStatusLineCommand(command).ours;
 }
 
 export function isOurPromptHookCommand(command: unknown): boolean {

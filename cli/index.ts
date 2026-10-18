@@ -43,6 +43,8 @@ import {
   buildHelperCommand,
   buildPromptHookCommand,
   buildStatusLineCommand,
+  buildStatusLineWrapCommand,
+  readStatusLineCommand,
   desiredOtelEnv,
   detectManagedSettings,
   isOurHelperCommand,
@@ -57,10 +59,12 @@ import {
 } from "./settings";
 import {
   applyStatusLineSetting,
+  wrapStatusLineSetting,
   cmdStatusline,
   cmdStatuslineReport,
   removeStatusLineSetting,
   type StatusLineMergeResult,
+  type StatusLineWrapResult,
 } from "./statusline";
 import {
   applyPromptHookSetting,
@@ -126,6 +130,11 @@ interface Config {
   settingsBackup?: string;
   /** ISO timestamp of the last successful history import. */
   importedAt?: string;
+  /**
+   * The `statusLine` value setup wrapped, stored verbatim so `disable` can put
+   * it back byte for byte — padding, key order and all.
+   */
+  statusLineOriginal?: unknown;
   // Celebration detection for `status`
   lastKnownBadges?: string[];
   lastKnownRank?: number;
@@ -437,6 +446,8 @@ interface SettingsWriteResult {
   originals: OtelOriginals;
   backup: string | null;
   statusLine: StatusLineMergeResult;
+  /** Set when we ran someone else's status line through ours instead. */
+  statusLineWrap?: StatusLineWrapResult;
   promptHook: PromptHookMergeResult;
   removedStaticHeaders: string[];
   unchanged: boolean;
@@ -449,7 +460,8 @@ interface SettingsWriteResult {
  */
 async function writeOtelSettings(
   argv: string[],
-  assumeYes: boolean
+  assumeYes: boolean,
+  wrapStatusLine: boolean | "ask" = "ask"
 ): Promise<SettingsWriteResult | null> {
   const helperCommand = buildHelperCommand(argv);
   const desired = desiredOtelEnv(API_BASE_URL);
@@ -519,6 +531,33 @@ async function writeOtelSettings(
     replaceForeign: plan.conflicts.length > 0,
   });
   const statusLine = applyStatusLineSetting(loaded.settings, buildStatusLineCommand(argv));
+
+  // A status line of their own used to end the matter: we left it alone, and
+  // `rate_limits` reaches no other hook, so their plan usage never reported.
+  // Offer to run theirs through ours instead — asked, never assumed, because
+  // it rewrites a line they see on every prompt.
+  let statusLineWrap: StatusLineWrapResult | undefined;
+  if (statusLine.action === "conflict" && wrapStatusLine !== false) {
+    const wrapper = (original: string) => buildStatusLineWrapCommand(argv, original);
+    if (wrapStatusLine === true) {
+      statusLineWrap = wrapStatusLineSetting(loaded.settings, wrapper);
+    } else if (!assumeYes) {
+      console.log();
+      log.warn("You already have a status line:");
+      log.dim(`    ${statusLine.existing}`);
+      console.log();
+      log.dim("We can run it THROUGH ours: yours prints exactly what it prints now,");
+      log.dim("and your plan limits (5h / 7d) report alongside it. `clawdgg disable`");
+      log.dim("puts your original back exactly as it is.");
+      console.log();
+      if (await confirm("Run your status line through clawdgg?", false)) {
+        statusLineWrap = wrapStatusLineSetting(loaded.settings, wrapper);
+      }
+    }
+    // --yes with no explicit --wrap-statusline keeps the old behaviour: a
+    // scripted run must not rewrite a status line nobody was asked about.
+  }
+
   const promptHook = applyPromptHookSetting(loaded.settings, buildPromptHookCommand(argv));
 
   await mkdir(settingsDir(loaded.path), { recursive: true });
@@ -528,6 +567,7 @@ async function writeOtelSettings(
     originals,
     backup,
     statusLine,
+    statusLineWrap,
     promptHook,
     removedStaticHeaders: plan.staticHeaders,
     unchanged: plan.unchanged,
@@ -542,7 +582,8 @@ async function writeOtelSettings(
  * Backs up first — every write does — and reports what it chose to leave.
  */
 async function removeOtelSettings(
-  originals: OtelOriginals | undefined
+  originals: OtelOriginals | undefined,
+  statusLineOriginal?: unknown
 ): Promise<{
   existed: boolean;
   outcome: ReturnType<typeof restoreOtelSettings>;
@@ -559,7 +600,7 @@ async function removeOtelSettings(
     };
   }
 
-  const statusLine = removeStatusLineSetting(loaded.settings);
+  const statusLine = removeStatusLineSetting(loaded.settings, statusLineOriginal);
   const promptHook = removePromptHookSetting(loaded.settings);
   const outcome = restoreOtelSettings(loaded.settings, originals, {
     apiBaseUrl: API_BASE_URL,
@@ -573,6 +614,7 @@ async function removeOtelSettings(
     outcome.removed.length === 0 &&
     outcome.restored.length === 0 &&
     statusLine !== "removed" &&
+    statusLine !== "restored" &&
     promptHook !== "removed"
   ) {
     return { existed: true, outcome, statusLine, promptHook };
@@ -585,7 +627,11 @@ async function removeOtelSettings(
 
 // Report what happened to the user's statusLine. We never replace one we
 // didn't write, so a conflict gets instructions instead of a silent overwrite.
-function reportStatusLineMerge(result: StatusLineMergeResult, command: string): void {
+function reportStatusLineMerge(
+  result: StatusLineMergeResult,
+  command: string,
+  wrap?: StatusLineWrapResult
+): void {
   if (result.action === "already-ours") return;
 
   if (result.action === "added") {
@@ -593,10 +639,18 @@ function reportStatusLineMerge(result: StatusLineMergeResult, command: string): 
     return;
   }
 
+  if (wrap?.action === "wrapped") {
+    log.success("Your status line now runs through ours — it prints what it always did.");
+    log.dim(`    wrapping: ${wrap.originalCommand}`);
+    log.dim("    `clawdgg disable` puts your original back exactly as it was.");
+    return;
+  }
+
   log.warn("You already have a status line configured, so we left it alone:");
   log.dim(`    ${result.existing}`);
   console.log();
-  console.log(`  ${colors.dim}To sync plan usage too, call${colors.reset} ${colors.cyan}${command} statusline${colors.reset} ${colors.dim}from your own`);
+  console.log(`  ${colors.dim}To sync plan usage too, re-run${colors.reset} ${colors.cyan}clawdgg setup --wrap-statusline${colors.reset}${colors.dim} — which runs`);
+  console.log(`  ${colors.dim}yours through ours, unchanged. Or call${colors.reset} ${colors.cyan}${command} statusline${colors.reset} ${colors.dim}from your own`);
   console.log(`  status line, or set${colors.reset} ${colors.cyan}"statusLine": { "type": "command", "command": "${command} statusline" }${colors.reset}`);
   console.log(`  ${colors.dim}in ${CLAUDE_SETTINGS_PATH}.${colors.reset}`);
   console.log();
@@ -714,6 +768,8 @@ interface SetupFlags {
   skipImport: boolean;
   /** Re-register this machine's timezone even if the server already has one. */
   forceTimezone: boolean;
+  /** Wrap a foreign status line without asking (for --yes runs). */
+  wrapStatusLine: boolean;
 }
 
 async function cmdSetup(flags: SetupFlags): Promise<void> {
@@ -739,7 +795,11 @@ async function cmdSetup(flags: SetupFlags): Promise<void> {
   // 3. settings.json
   const argv = selfArgv();
   const binaryCommand = selfCommand();
-  const written = await writeOtelSettings(argv, flags.assumeYes);
+  const written = await writeOtelSettings(
+    argv,
+    flags.assumeYes,
+    flags.wrapStatusLine ? true : "ask"
+  );
   if (!written) process.exit(1);
 
   // First-recorded wins: a second `setup` would otherwise "remember" the
@@ -749,6 +809,11 @@ async function cmdSetup(flags: SetupFlags): Promise<void> {
     ...config,
     consentAt: new Date().toISOString(),
     otelOriginals: config.otelOriginals ?? written.originals,
+    // First-recorded wins here too: a second setup sees our own wrapper, not
+    // their status line, and must not overwrite the real original with it.
+    ...(written.statusLineWrap?.action === "wrapped" && config.statusLineOriginal === undefined
+      ? { statusLineOriginal: written.statusLineWrap.original }
+      : {}),
     ...(written.backup ? { settingsBackup: written.backup } : {}),
   });
 
@@ -759,7 +824,7 @@ async function cmdSetup(flags: SetupFlags): Promise<void> {
     log.dim("    shows up as a Claude Code warning instead of silence.");
   }
   log.success(`Exporter configured → ${API_BASE_URL}/otel`);
-  reportStatusLineMerge(written.statusLine, binaryCommand);
+  reportStatusLineMerge(written.statusLine, binaryCommand, written.statusLineWrap);
   reportPromptHookMerge(written.promptHook, binaryCommand);
 
   if (argv[0] !== INSTALLED_BINARY && !argv[0]?.startsWith("/")) {
@@ -820,12 +885,13 @@ async function cmdDisable(purge: boolean): Promise<void> {
   const config = await loadConfig();
 
   try {
-    const result = await removeOtelSettings(config.otelOriginals);
+    const result = await removeOtelSettings(config.otelOriginals, config.statusLineOriginal);
     if (!result?.existed) {
       log.info("No ~/.claude/settings.json — nothing to undo there.");
     } else {
       reportRestore(result.outcome);
       if (result.statusLine === "removed") log.success("Status line hook removed.");
+      if (result.statusLine === "restored") log.success("Your own status line is back, exactly as it was.");
       if (result.statusLine === "not-ours") log.dim("Left your own status line alone.");
       if (result.promptHook === "removed") log.success("Ultrathink prompt hook removed.");
     }
@@ -850,7 +916,7 @@ async function cmdDisable(purge: boolean): Promise<void> {
     await rm(CONFIG_DIR, { recursive: true, force: true });
     log.success(`Deleted ${CONFIG_DIR}.`);
   } else {
-    const { otelOriginals, settingsBackup, consentAt, ...keep } = config;
+    const { otelOriginals, settingsBackup, consentAt, statusLineOriginal, ...keep } = config;
     await saveConfig(keep);
     log.dim(`Kept your login in ${CONFIG_FILE} (clawdgg disable --purge removes it).`);
   }
@@ -900,8 +966,9 @@ async function cmdLogout(): Promise<void> {
   // that isn't ours stays — including on a machine we never set up, where this
   // must not touch the user's own collector at all.
   try {
-    const result = await removeOtelSettings(config.otelOriginals);
+    const result = await removeOtelSettings(config.otelOriginals, config.statusLineOriginal);
     if (result?.existed) reportRestore(result.outcome);
+    if (result?.statusLine === "restored") log.success("Your own status line is back, exactly as it was.");
   } catch (error) {
     if (error instanceof SettingsParseError) {
       log.warn(`Left ~/.claude/settings.json alone: ${error.message}`);
@@ -1500,12 +1567,22 @@ async function cmdDoctor(): Promise<void> {
 
     const statusLineProbe = applyStatusLineSetting({ statusLine: settings.statusLine });
     if (statusLineProbe.action === "already-ours") {
-      checks.push({ status: "ok", label: "Status line reports plan usage (5h / 7d)" });
+      // Ours either way; say which, because "wrapping: <their command>" is the
+      // one line that explains why their own status line is still on screen.
+      const shape = readStatusLineCommand(
+        typeof settings.statusLine === "string" ? settings.statusLine : settings.statusLine?.command
+      );
+      checks.push({
+        status: "ok",
+        label: "Status line reports plan usage (5h / 7d)",
+        ...(shape.wrapped !== undefined ? { detail: `wrapping: ${shape.wrapped}` } : {}),
+      });
     } else if (statusLineProbe.action === "conflict") {
       checks.push({
         status: "warn",
         label: "Status line is someone else's — plan usage isn't reporting",
         detail: statusLineProbe.existing,
+        fix: "clawdgg setup --wrap-statusline",
       });
     } else {
       checks.push({ status: "warn", label: "No status line — plan usage isn't reporting", fix: "clawdgg setup" });
@@ -1949,6 +2026,7 @@ ${colors.bright}Flags:${colors.reset}
   ${colors.dim}--yes${colors.reset}           Assume yes for every prompt (scripts, CI)
   ${colors.dim}--no-import${colors.reset}     Skip the history import during setup
   ${colors.dim}--timezone${colors.reset}      Re-register this machine's timezone, replacing the one on file
+  ${colors.dim}--wrap-statusline${colors.reset}  Run an existing status line through ours (implies consent)
   ${colors.dim}--purge${colors.reset}         With ${colors.dim}disable${colors.reset}: remove ~/.config/clawdgg too
 
 ${colors.dim}Run by Claude Code, not by you:${colors.reset}
@@ -1973,6 +2051,7 @@ async function main() {
         assumeYes,
         skipImport: args.includes("--no-import"),
         forceTimezone: args.includes("--timezone"),
+        wrapStatusLine: args.includes("--wrap-statusline"),
       });
       break;
     case "import":
@@ -1997,8 +2076,10 @@ async function main() {
       await cmdDisable(args.includes("--purge"));
       break;
     // Run by Claude Code, not by hand.
+    // `--wrap <command>` runs the user's own status line through ours; see
+    // cli/statusline.ts. Claude Code only ever passes what we wrote there.
     case "statusline":
-      await cmdStatusline();
+      await cmdStatusline(args[1] === "--wrap" ? args[2] : undefined);
       break;
     // Run by `statusline` itself, detached, so the prompt never waits on a POST.
     // The report travels on the argv — see cli/reporter.ts.
