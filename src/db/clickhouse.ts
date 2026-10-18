@@ -131,13 +131,19 @@ export async function healthCheck(): Promise<boolean> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Where a raw row came from.
- *   live     — received over OTLP from a running Claude Code (default)
- *   backfill — reconstructed from local Claude Code JSONL transcripts
- *   legacy   — imported from the pre-OTEL SQLite `daily_stats` table by
- *              docker/clickhouse/migrations/2026-10-18_import_daily_stats.ts
+ * Where a raw row came from. Part of the row identity, so a reconstructed row
+ * can never collapse onto a measured one.
+ *   live             — received over OTLP from a running Claude Code (default)
+ *   backfill         — reconstructed from local Claude Code JSONL transcripts
+ *                      by src/scripts/backfill-jsonl.ts (operator-run)
+ *   backfill-history — prompt counts recovered from ~/.claude/history.jsonl for
+ *                      windows whose transcripts have rotated away
+ *   legacy           — imported from the pre-OTEL SQLite `daily_stats` table by
+ *                      docker/clickhouse/migrations/2026-10-18_import_daily_stats.ts
+ *   import           — reconstructed from the user's own transcripts by
+ *                      `clawdgg import` (user-run, src/routes/cli.ts)
  */
-export type RowProvenance = 'live' | 'backfill' | 'legacy';
+export type RowProvenance = 'live' | 'backfill' | 'backfill-history' | 'legacy' | 'import';
 
 export interface MetricRow {
   timestamp: string;
@@ -148,6 +154,7 @@ export interface MetricRow {
   model?: string;
   token_type?: string;
   line_type?: string;
+  time_type?: string;  // active_time.total: user (keyboard) | cli (tools + responses)
   terminal_type?: string;
   app_version?: string;
   account_uuid?: string;
@@ -164,6 +171,7 @@ export interface MetricRow {
   agent_name?: string;
   skill_name?: string;
   plugin_name?: string;
+  marketplace_name?: string; // where plugin_name's plugin was installed from
   mcp_server_name?: string;
   mcp_tool_name?: string;
   start_type?: string;       // session.count: fresh | resume | continue | agents_view
@@ -190,22 +198,33 @@ export interface EventRow {
   output_tokens?: number;
   cache_read_tokens?: number;
   cache_write_tokens?: number;
+  /** Absolute paths are stripped at ingest — see redactAbsolutePaths(). */
   error_message?: string;
+  error_type?: string;      // tool_result: "Error:ENOENT", "ShellError", …
   status_code?: number;
   duration_ms?: number;
   // tool_result / tool_decision attributes
   decision?: string;        // accept, reject (OTEL `decision_type` on tool_result)
   source?: string;          // config, user_permanent, … (OTEL `decision_source` on tool_result)
-  tool_parameters?: string; // JSON string with tool-specific params
   tool_use_id?: string;
+  tool_source?: string;     // tool_decision: builtin | mcp | sdk_host_builtin_mcp
   // Correlation + attribution
   prompt_id?: string;       // OTEL `prompt.id` — joins a prompt to its api_request calls
   request_id?: string;
+  client_request_id?: string; // present even when the server never answered
+  message_uuid?: string;      // OTEL `message.uuid` — the user message behind a prompt
+  /**
+   * OTEL `event.sequence`: 0-based per-process counter, the documented
+   * tie-breaker for events sharing a timestamp. -1 when absent — see
+   * NO_EVENT_SEQUENCE in src/routes/otel.ts.
+   */
+  event_sequence?: number;
   query_source?: string;    // main | subagent | auxiliary
   speed?: string;
   effort?: string;
   agent_name?: string;
   skill_name?: string;
+  marketplace_name?: string;
   // user_prompt slash-command attribution (Claude Code 2.1.117+)
   command_name?: string;
   command_source?: string;  // builtin | custom | mcp
@@ -281,11 +300,16 @@ export interface HourlyActivity {
  *   metrics_raw (user_id, metric_name, token_type, line_type, timestamp)
  *   events_raw  (user_id, session_id, event_name, timestamp, tool_name)
  * but Claude Code emits several datapoints with the SAME timestamp that differ
- * only by model, query_source, speed, effort, agent/skill/plugin/mcp name, or
- * tool/decision/language. Those collapsed into one row and their values were
- * lost — main-thread and subagent token usage at the same instant became a
- * single number. Hashing every identifying attribute into the key keeps them
- * apart.
+ * only by model, query_source, speed, effort, agent/skill/plugin/mcp name,
+ * tool/decision/language, or `type` (active_time.total splits into user and
+ * cli). Those collapsed into one row and their values were lost — main-thread
+ * and subagent token usage at the same instant became a single number. Hashing
+ * every identifying attribute into the key keeps them apart.
+ *
+ * `event_sequence` (OTEL `event.sequence`) is the general case of the same
+ * problem on events: the docs name it as the tie-breaker for records sharing a
+ * timestamp, so it separates even the event types this schema has no dedicated
+ * columns for. It is -1, not 0, when a record carries none.
  *
  * Why the value is excluded: an OTLP retry re-sends the identical datapoint, so
  * it must hash identically for the dedup to still work. Values can legitimately
@@ -314,6 +338,7 @@ export const METRIC_IDENTITY_COLUMNS = [
   'model',
   'token_type',
   'line_type',
+  'time_type',
   'tool',
   'decision',
   'language',
@@ -324,6 +349,7 @@ export const METRIC_IDENTITY_COLUMNS = [
   'agent_name',
   'skill_name',
   'plugin_name',
+  'marketplace_name',
   'mcp_server_name',
   'mcp_tool_name',
   'start_type',
@@ -339,13 +365,17 @@ export const EVENT_IDENTITY_COLUMNS = [
   'user_id',
   'session_id',
   'event_name',
+  'event_sequence',
   'tool_name',
   'tool_use_id',
+  'tool_source',
   'model',
   'decision',
   'source',
   'request_id',
+  'client_request_id',
   'prompt_id',
+  'message_uuid',
   'command_name',
   'command_source',
   'query_source',
@@ -353,10 +383,23 @@ export const EVENT_IDENTITY_COLUMNS = [
   'effort',
   'agent_name',
   'skill_name',
+  'marketplace_name',
   'status_code',
+  'error_type',
   'error_message',
   'provenance',
 ] as const;
+
+/**
+ * Identity columns that are NUMERIC in ClickHouse, with the value TS must hash
+ * when the row leaves one unset. The SQL side hashes toString(column), which
+ * renders the column DEFAULT — so an omitted field has to hash as that exact
+ * default here or the two sides disagree on every row that omits it.
+ */
+const EVENT_IDENTITY_NUMERIC_DEFAULTS: Record<string, number> = {
+  status_code: 0,
+  event_sequence: -1,
+};
 
 // Unit separator: cannot appear in an OTLP attribute value we keep, so
 // ('a', 'bc') and ('ab', 'c') can never hash alike.
@@ -393,7 +436,8 @@ export function eventRowId(row: EventRow): string {
   return identityHash(
     EVENT_IDENTITY_COLUMNS.map(c => {
       if (c === 'provenance') return String(row.provenance ?? 'live');
-      if (c === 'status_code') return String(row.status_code ?? 0);
+      const numericDefault = EVENT_IDENTITY_NUMERIC_DEFAULTS[c];
+      if (numericDefault !== undefined) return String(r[c] ?? numericDefault);
       return String(r[c] ?? '');
     })
   );
@@ -870,24 +914,39 @@ export interface CacheStats {
  * matches no model, times a hardcoded 0.9 that assumed cacheRead is always
  * 0.1x input. Both are wrong: Fable 5.1 reads at 0.025x, and input rates run
  * from $0.25 to $10. Savings per model are cacheRead tokens x (input - cacheRead).
+ *
+ * Rows with no model are EXCLUDED rather than priced: the pre-OTEL daily_stats
+ * import never recorded a model, so pricing those rows would mean inventing a
+ * saving from DEFAULT_PRICING and presenting the guess as a dollar figure.
  */
 export async function getUserCacheStats(userId: string, days?: number): Promise<CacheStats | null> {
   const dateFilter = days ? `AND toDate(timestamp) >= today() - ${days}` : '';
 
+  // Grouped by speed as well as model: Opus fast mode bills input at 2x, so a
+  // cache read against a fast-mode prompt saves twice as much. Haiku 5.5's
+  // over-100K tier is NOT applied here and cannot be — it is decided per
+  // request, and these are sums over many.
   const sql = `
     SELECT
       model,
+      speed,
       toUInt64(sumIf(value, token_type = 'cacheRead')) as cacheReadTokens,
       toUInt64(sumIf(value, token_type = 'input')) as inputTokens
     FROM metrics_raw FINAL
     WHERE user_id = {userId:String}
       AND metric_name = 'claude_code.token.usage'
       AND token_type IN ('input', 'cacheRead')
+      AND model != ''
       ${dateFilter}
-    GROUP BY model
+    GROUP BY model, speed
   `;
 
-  const rows = await query<{ model: string; cacheReadTokens: number; inputTokens: number }>(sql, { userId });
+  const rows = await query<{
+    model: string;
+    speed: string;
+    cacheReadTokens: number;
+    inputTokens: number;
+  }>(sql, { userId });
 
   let totalCacheReadTokens = 0;
   let totalInputTokens = 0;
@@ -897,7 +956,7 @@ export async function getUserCacheStats(userId: string, days?: number): Promise<
     const input = Number(row.inputTokens) || 0;
     totalCacheReadTokens += cacheRead;
     totalInputTokens += input;
-    const pricing = getModelPricing(row.model || '');
+    const pricing = getModelPricing(row.model, { speed: row.speed });
     estimatedSavingsUsd += (cacheRead * (pricing.input - pricing.cacheRead)) / 1_000_000;
   }
 

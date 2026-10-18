@@ -56,6 +56,13 @@ export interface ImportEventRow {
   output_tokens?: number;
   cache_read_tokens?: number;
   cache_write_tokens?: number;
+  /**
+   * `message.usage.speed` as the transcript records it ('standard' | 'fast').
+   * Stored, not just used: a row billed at Opus fast-mode rates has to say so
+   * for its cost to be reconcilable, and it is part of the row identity, so a
+   * fast and a standard call in the same millisecond stay two rows.
+   */
+  speed?: string;
   provenance: Provenance;
   pricing_source?: PricingMatchQuality;
 }
@@ -68,6 +75,7 @@ export interface ImportMetricRow {
   value: number;
   model?: string;
   token_type?: string;
+  speed?: string;
   provenance: Provenance;
   pricing_source?: PricingMatchQuality;
 }
@@ -192,13 +200,25 @@ export interface CostEstimate {
  * Cache creation is billed per TTL: 1h costs 2x input, 5m costs 1.25x. Pricing
  * everything at 5m understates cache-write cost by ~22% on the current corpus,
  * where 37% of cache-creation tokens are 1h.
+ *
+ * Two prices depend on the request rather than the model id, and both are
+ * decidable from this one usage block:
+ *   - `usage.speed === 'fast'` is Opus fast mode, billed at 2x.
+ *   - a prompt over 100K tokens pays Haiku 5.5's higher tier. "Prompt length"
+ *     is every input token including cache reads and cache writes, which is
+ *     what promptTokens sums below.
  */
 export function computeCostUsd(model: string, usage: any): CostEstimate {
-  const { pricing: p, matchQuality } = getModelPricingDetailed(model || "");
   const input = Number(usage?.input_tokens ?? 0);
   const output = Number(usage?.output_tokens ?? 0);
   const cacheRead = Number(usage?.cache_read_input_tokens ?? 0);
   const { tokens5m, tokens1h, fromFlatFallback } = splitCacheCreationTokens(usage);
+
+  const { pricing: p, matchQuality } = getModelPricingDetailed(model || "", {
+    speed: typeof usage?.speed === "string" ? usage.speed : undefined,
+    promptTokens: input + cacheRead + tokens5m + tokens1h,
+  });
+
   return {
     costUsd:
       (input * p.input +
@@ -270,11 +290,13 @@ export function mapLine(line: any, opts: MapOptions): MapLineResult {
       const cacheWrite = Number(usage.cache_creation_input_tokens ?? 0);
       const { costUsd, pricingSource, usedFlatCacheFallback } = computeCostUsd(model, usage);
       if (usedFlatCacheFallback) out.flatCacheFallbacks++;
+      const speed = typeof usage.speed === "string" ? usage.speed : "";
 
       out.events.push({
         ...base,
         event_name: "claude_code.api_request",
         model,
+        speed,
         cost_usd: costUsd,
         pricing_source: pricingSource,
         input_tokens: inputTokens,
@@ -283,7 +305,7 @@ export function mapLine(line: any, opts: MapOptions): MapLineResult {
         cache_write_tokens: cacheWrite,
       });
 
-      const tokenMetricBase = { ...base, metric_name: "claude_code.token.usage", model };
+      const tokenMetricBase = { ...base, metric_name: "claude_code.token.usage", model, speed };
       if (inputTokens > 0)
         out.metrics.push({ ...tokenMetricBase, value: inputTokens, token_type: "input" });
       if (outputTokens > 0)
@@ -302,6 +324,7 @@ export function mapLine(line: any, opts: MapOptions): MapLineResult {
           metric_name: "claude_code.cost.usage",
           value: costUsd,
           model,
+          speed,
           pricing_source: pricingSource,
         });
       }

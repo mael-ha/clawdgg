@@ -2,6 +2,7 @@ import { describe, expect, it, spyOn } from 'bun:test';
 import {
   calculateModelCost,
   getModelDisplayName,
+  getModelPricing,
   getModelPricingDetailed,
   splitCacheCreationTokens,
   type TokenUsage,
@@ -412,5 +413,117 @@ describe('model id coverage', () => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+describe('getModelDisplayName — label matches the tier that was priced', () => {
+  // The regression this guards: a bare family id priced from a FAMILY_RULE but
+  // labelled by an unrelated if-chain. The label and the price now come from
+  // one resolution, so the pair below can never disagree again.
+  it.each([
+    'claude-opus',
+    'claude-sonnet',
+    'claude-haiku',
+    'claude-fable',
+    'claude-mythos',
+    'claude-opus-4',
+    'claude-sonnet-4',
+    'claude-opus-4-9',
+    'claude-sonnet-5-5',
+    'claude-opus-5-5[1m]',
+    'us.anthropic.claude-sonnet-5-v1:0',
+  ])('%s is labelled as the key it is priced from', id => {
+    const priced = getModelPricingDetailed(id);
+    expect(getModelDisplayName(id)).toBe(getModelDisplayName(priced.modelId));
+  });
+
+  it.each([
+    // bare family ids point at the CURRENT generation, and now say so
+    ['claude-opus', 'Opus 5.5'],
+    ['claude-sonnet', 'Sonnet 5.5'],
+    ['claude-haiku', 'Haiku 5.5'],
+    ['claude-fable', 'Fable 5.1'],
+    ['claude-mythos', 'Mythos 5.1'],
+    // an unlisted minor release inherits its family's current tier
+    ['claude-opus-4', 'Opus 4.8'],
+    ['claude-opus-4-9', 'Opus 4.8'],
+    ['claude-sonnet-4', 'Sonnet 4.6'],
+    // genuine legacy dated ids still land on their own labels
+    ['claude-opus-4-20250514', 'Opus 4'],
+    ['claude-3-opus-20240229', 'Opus 3'],
+    ['claude-3-sonnet-20240229', 'Sonnet 3'],
+    ['claude-3-haiku-20240307', 'Haiku 3'],
+  ] as const)('labels %s as %s', (id, label) => {
+    expect(getModelDisplayName(id)).toBe(label);
+  });
+
+  it('shows an unresolvable id verbatim rather than guessing', () => {
+    expect(getModelDisplayName('gpt-4o')).toBe('gpt-4o');
+    expect(getModelDisplayName('')).toBe('');
+  });
+});
+
+describe('fast mode pricing', () => {
+  it('bills Opus 5.5 fast mode at $8/$40 with cache multipliers on top', () => {
+    const fast = getModelPricing('claude-opus-5-5', { speed: 'fast' });
+    expect(fast).toEqual({
+      input: 8,
+      output: 40,
+      cacheRead: 0.40,      // 0.05x the fast input price
+      cacheWrite5m: 10,     // 1.25x
+      cacheWrite1h: 16,     // 2x
+    });
+  });
+
+  it('bills Opus 5 and Opus 4.8 fast mode at $10/$50', () => {
+    for (const id of ['claude-opus-5', 'claude-opus-4-8']) {
+      expect(getModelPricing(id, { speed: 'fast' })).toMatchObject({ input: 10, output: 50 });
+    }
+  });
+
+  it('leaves speed=standard and an absent speed on the standard tier', () => {
+    const standard = getModelPricing('claude-opus-5-5');
+    expect(getModelPricing('claude-opus-5-5', { speed: 'standard' })).toEqual(standard);
+    expect(getModelPricing('claude-opus-5-5', {})).toEqual(standard);
+    expect(standard.input).toBe(4);
+  });
+
+  it('has no fast tier for models without one', () => {
+    expect(getModelPricing('claude-sonnet-5-5', { speed: 'fast' })).toEqual(
+      getModelPricing('claude-sonnet-5-5')
+    );
+  });
+
+  it('reaches fast pricing through a family rule too', () => {
+    // `claude-opus-5-5-20260301` normalizes onto claude-opus-5-5.
+    expect(getModelPricing('claude-opus-5-5-20260301', { speed: 'fast' }).input).toBe(8);
+  });
+});
+
+describe('Haiku 5.5 prompt-length tiers', () => {
+  it('uses the standard tier at or below 100K prompt tokens', () => {
+    expect(getModelPricing('claude-haiku-5-5', { promptTokens: 100_000 })).toMatchObject({
+      input: 0.10,
+      output: 0.50,
+      cacheRead: 0.01,
+      cacheWrite5m: 0.125,
+      cacheWrite1h: 0.20,
+    });
+  });
+
+  it('uses the 5x tier above 100K prompt tokens', () => {
+    expect(getModelPricing('claude-haiku-5-5', { promptTokens: 100_001 })).toEqual({
+      input: 0.50,
+      output: 2.50,
+      cacheRead: 0.05,
+      cacheWrite5m: 0.625,
+      cacheWrite1h: 1,
+    });
+  });
+
+  it('does not apply a long-prompt tier to models that have none', () => {
+    expect(getModelPricing('claude-sonnet-5-5', { promptTokens: 900_000 })).toEqual(
+      getModelPricing('claude-sonnet-5-5')
+    );
   });
 });

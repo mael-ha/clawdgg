@@ -87,8 +87,25 @@ describe('metricRowId', () => {
     ['session_id', { session_id: 'sess-b' }],
     ['timestamp', { timestamp: '2026-10-18 09:30:00.124' }],
     ['organization_id', { organization_id: 'org-2' }],
+    ['marketplace_name', { marketplace_name: 'anthropic' }],
   ] as const)('a different %s is a different row', (_name, patch) => {
     expect(metricRowId({ ...METRIC, ...patch })).not.toBe(metricRowId(METRIC));
+  });
+
+  // active_time.total reports keyboard time and tool/response time as two
+  // datapoints on ONE timestamp. Before time_type they were a single row and
+  // half the active time was lost.
+  it('separates active_time user and cli datapoints at the same instant', () => {
+    const activeTime: MetricRow = {
+      timestamp: '2026-10-18 09:30:00.123',
+      user_id: 'github_1',
+      session_id: 'sess-a',
+      metric_name: 'claude_code.active_time.total',
+      value: 42,
+    };
+    expect(metricRowId({ ...activeTime, time_type: 'user' })).not.toBe(
+      metricRowId({ ...activeTime, time_type: 'cli' })
+    );
   });
 
   it('keeps a backfill estimate off a live measured row', () => {
@@ -139,6 +156,12 @@ describe('eventRowId', () => {
     ['skill_name', { skill_name: 'claude-api' }],
     ['status_code', { status_code: 529 }],
     ['error_message', { error_message: 'overloaded' }],
+    ['error_type', { error_type: 'Error:ENOENT' }],
+    ['tool_source', { tool_source: 'mcp' }],
+    ['client_request_id', { client_request_id: 'creq_1' }],
+    ['message_uuid', { message_uuid: 'msg-1' }],
+    ['marketplace_name', { marketplace_name: 'anthropic' }],
+    ['event_sequence', { event_sequence: 7 }],
   ] as const)('a different %s is a different row', (_name, patch) => {
     expect(eventRowId({ ...EVENT, ...patch })).not.toBe(eventRowId(EVENT));
   });
@@ -146,14 +169,47 @@ describe('eventRowId', () => {
   it('treats an omitted status_code as 0', () => {
     expect(eventRowId({ ...EVENT, status_code: 0 })).toBe(eventRowId(EVENT));
   });
+
+  // -1, not 0: a record that carried no event.sequence and the genuine first
+  // record of a process must not collapse into one row.
+  it('treats an omitted event_sequence as -1, distinct from sequence 0', () => {
+    expect(eventRowId({ ...EVENT, event_sequence: -1 })).toBe(eventRowId(EVENT));
+    expect(eventRowId({ ...EVENT, event_sequence: 0 })).not.toBe(eventRowId(EVENT));
+  });
+
+  // The general case: two records of ANY event type in one millisecond are kept
+  // apart by the sequence alone, including event types with no other columns.
+  it('separates two same-millisecond records by event.sequence alone', () => {
+    const compaction: EventRow = {
+      timestamp: '2026-10-18 09:30:00.123',
+      user_id: 'github_1',
+      session_id: 'sess-a',
+      event_name: 'claude_code.compaction',
+    };
+    expect(eventRowId({ ...compaction, event_sequence: 11 })).not.toBe(
+      eventRowId({ ...compaction, event_sequence: 12 })
+    );
+  });
 });
 
 // The hash is a stored dedup key: changing the algorithm orphans every row
 // already in ClickHouse (old rows keep a hash the app will never reproduce, so
-// retries stop collapsing). These golden values pin it. Both are reproducible
-// from a shell, which is how to re-derive them if the field list ever changes:
-//   printf '2026-10-18 09:30:00.123\x1fu\x1fs\x1fclaude_code.token.usage%.0s\x1f' $(seq 21) \
-//     | sed 's/$/live/' | shasum -a 256 | cut -c1-32
+// retries stop collapsing). These golden values pin it.
+//
+// Both are reproducible from a shell with no TypeScript involved, which is how
+// to re-derive them when the field list changes. 27 fields, so 26 separators;
+// the unset ones are empty strings and the two numeric ones hash as their
+// column DEFAULT ('-1' for event_sequence, '0' for status_code). Verified
+// against these exact values on 2026-10-18:
+//
+//   S=$(printf '\037')
+//   M="2026-10-18 09:30:00.123${S}u${S}s${S}claude_code.token.usage"
+//   for i in $(seq 23); do M="${M}${S}"; done; M="${M}live"
+//   printf '%s' "$M" | shasum -a 256 | cut -c1-32   # metric
+//
+//   E="2026-10-18 09:30:00.123${S}u${S}s${S}claude_code.user_prompt${S}-1"
+//   for i in $(seq 18); do E="${E}${S}"; done; E="${E}${S}0${S}${S}${S}live"
+//   printf '%s' "$E" | shasum -a 256 | cut -c1-32   # event
 describe('identity hash golden values', () => {
   it('hashes a minimal metric row to a known digest', () => {
     expect(
@@ -164,7 +220,7 @@ describe('identity hash golden values', () => {
         metric_name: 'claude_code.token.usage',
         value: 1,
       })
-    ).toBe('2b5f13ec6e94f564b39eaec87f613a43');
+    ).toBe('272b0cecffadd10df0b7ed9e274f55de');
   });
 
   it('hashes a minimal event row to a known digest', () => {
@@ -175,7 +231,7 @@ describe('identity hash golden values', () => {
         session_id: 's',
         event_name: 'claude_code.user_prompt',
       })
-    ).toBe('75a3aa2aae4b37acbf24a3b8f56abe66');
+    ).toBe('e8b59a7f17330ebfa4ad75d11c0efa6c');
   });
 });
 
@@ -284,6 +340,14 @@ describe('schema and migrations stay in sync', () => {
       if (column === 'timestamp') continue;
       expect(schema).toContain(`    ${column} `);
     }
+  });
+
+  // "Store less": a tool's arguments are the user's content. The column is
+  // gone from a fresh volume and dropped by omission from the v2 copy, which
+  // is what physically removes the values prod already holds.
+  it('has no tool_parameters column and never copies one', () => {
+    expect(schema).not.toContain('tool_parameters String');
+    expect(migration).not.toContain('tool_parameters');
   });
 
   it('copies the old tables without FINAL — FINAL would re-apply the broken key', () => {

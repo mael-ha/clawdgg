@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS metrics_raw (
     model String DEFAULT '',
     token_type String DEFAULT '',
     line_type String DEFAULT '',
+    -- active_time.total splits by `type` too: 'user' is keyboard time, 'cli' is
+    -- tool execution and model responses. Both land on the same timestamp.
+    time_type String DEFAULT '',
     -- code_edit_tool.decision attributes
     tool String DEFAULT '',       -- Edit, Write, NotebookEdit (OTEL attr `tool_name`)
     decision String DEFAULT '',   -- accept, reject
@@ -51,6 +54,7 @@ CREATE TABLE IF NOT EXISTS metrics_raw (
     agent_name String DEFAULT '',       -- OTEL attr `agent.name`
     skill_name String DEFAULT '',       -- OTEL attr `skill.name`
     plugin_name String DEFAULT '',      -- OTEL attr `plugin.name`
+    marketplace_name String DEFAULT '', -- OTEL attr `marketplace.name`
     mcp_server_name String DEFAULT '',  -- OTEL attr `mcp_server.name`
     mcp_tool_name String DEFAULT '',    -- OTEL attr `mcp_tool.name`
     -- session.count attribute
@@ -98,7 +102,11 @@ CREATE TABLE IF NOT EXISTS events_raw (
     output_tokens UInt32 DEFAULT 0,
     cache_read_tokens UInt32 DEFAULT 0,
     cache_write_tokens UInt32 DEFAULT 0,
+    -- Error text with absolute filesystem paths replaced by '<path>' at ingest
+    -- (src/routes/otel.ts redactAbsolutePaths). A path names the person, their
+    -- employer and their project layout, none of which is usage data.
     error_message String DEFAULT '',
+    error_type String DEFAULT '',      -- tool_result: 'Error:ENOENT', 'ShellError', …
     status_code UInt16 DEFAULT 0,
     duration_ms UInt32 DEFAULT 0,
     -- tool_result / tool_decision attributes. tool_result renamed these to
@@ -106,17 +114,28 @@ CREATE TABLE IF NOT EXISTS events_raw (
     -- names. src/routes/otel.ts reads new-then-old into these columns.
     decision String DEFAULT '',        -- accept, reject
     source String DEFAULT '',          -- config, user_permanent, user_temporary, user_abort, user_reject
-    tool_parameters String DEFAULT '', -- JSON string with tool-specific params (bash_command, etc.)
     tool_use_id String DEFAULT '',
+    tool_source String DEFAULT '',     -- builtin | mcp | sdk_host_builtin_mcp
+    -- NO tool_parameters COLUMN, deliberately. Claude Code can send a tool's
+    -- full arguments (OTEL_LOG_TOOL_DETAILS=1) and we never want them: a Bash
+    -- command line or an Edit payload is the user's content, not their usage.
+    -- src/routes/otel.ts never reads `tool_parameters` or `tool_input`.
     -- Correlation + attribution. prompt_id (OTEL `prompt.id`) joins a prompt to
     -- the api_request calls it caused.
     prompt_id String DEFAULT '',
     request_id String DEFAULT '',
+    client_request_id String DEFAULT '', -- set even when the server never answered
+    message_uuid String DEFAULT '',      -- OTEL attr `message.uuid`
+    -- OTEL `event.sequence`: 0-based per-process counter, the documented
+    -- tie-breaker for two records sharing a timestamp. -1 means the record
+    -- carried none — distinct from a genuine sequence 0.
+    event_sequence Int64 DEFAULT -1,
     query_source String DEFAULT '',    -- main | subagent | auxiliary
     speed String DEFAULT '',
     effort String DEFAULT '',
     agent_name String DEFAULT '',      -- OTEL attr `agent.name`
     skill_name String DEFAULT '',      -- OTEL attr `skill.name`
+    marketplace_name String DEFAULT '', -- OTEL attr `marketplace.name`
     -- user_prompt slash-command attribution (Claude Code 2.1.117+).
     -- command_source = 'builtin' (/clear, /compact, /model, …) is a UI action,
     -- not a prompt — excluded from prompt counts (see PROMPT_EVENT_SQL).

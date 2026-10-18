@@ -118,12 +118,9 @@ export const MODEL_PRICING: Record<string, ModelPricing> = {
     cacheWrite5m: 3.75,
     cacheWrite1h: 6,
   },
-  // Claude Haiku 5.5 is priced by PROMPT LENGTH, not by a long-context flag:
-  // a request whose prompt exceeds 100K tokens pays 5x on every category
-  // ($0.50/$2.50 out, $0.625/$1 writes, $0.05 read). Neither an OTEL token
-  // metric nor a JSONL usage block carries the prompt length that decides it,
-  // so we price the standard (<=100K) tier and under-report cost on any
-  // long-prompt Haiku 5.5 traffic. Same compromise as Sonnet 4.5 below.
+  // Claude Haiku 5.5 is priced by PROMPT LENGTH, not by a long-context flag.
+  // This is the standard (<=100K) tier; MODEL_PRICING_LONG_PROMPT holds the
+  // other one and getModelPricingDetailed picks between them.
   'claude-haiku-5-5': {
     input: 0.10,
     output: 0.50,
@@ -228,6 +225,67 @@ export const MODEL_PRICING: Record<string, ModelPricing> = {
     cacheRead: 0.025,
     cacheWrite5m: 0.3125,
     cacheWrite1h: 0.5,
+  },
+};
+
+// ───────────────────────────────────────────────────────────────────────────
+// Price VARIANTS of a model already in MODEL_PRICING
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Fast mode (`speed=fast`) buys faster output at a premium, for the Opus
+ * family only. The page lists input and output; "prompt caching multipliers
+ * apply on top of fast mode pricing", so the cache rates below are the normal
+ * multiples of the fast INPUT price:
+ *   Opus 5.5  $8  in -> read 0.05x = $0.40, 5m 1.25x = $10, 1h 2x = $16
+ *   Opus 5    $10 in -> read 0.1x  = $1.00, 5m 1.25x = $12.50, 1h 2x = $20
+ *   Opus 4.8  same as Opus 5
+ * Read off the pricing page's "Fast mode pricing" table on 2026-10-18.
+ */
+export const MODEL_PRICING_FAST: Record<string, ModelPricing> = {
+  'claude-opus-5-5': {
+    input: 8,
+    output: 40,
+    cacheRead: 0.40,
+    cacheWrite5m: 10,
+    cacheWrite1h: 16,
+  },
+  'claude-opus-5': {
+    input: 10,
+    output: 50,
+    cacheRead: 1.00,
+    cacheWrite5m: 12.50,
+    cacheWrite1h: 20,
+  },
+  'claude-opus-4-8': {
+    input: 10,
+    output: 50,
+    cacheRead: 1.00,
+    cacheWrite5m: 12.50,
+    cacheWrite1h: 20,
+  },
+};
+
+/**
+ * Haiku 5.5's over-100K tier, verbatim from the pricing page (2026-10-18):
+ * input $0.50, 5m writes $0.625, 1h writes $1, cache hits $0.05, output $2.50.
+ *
+ * The threshold, also verbatim: "A request's prompt length counts all of its
+ * input tokens, including cache reads and cache writes. Each request is priced
+ * on its own." So it is decidable from a single request's usage block — which
+ * is exactly what the JSONL import has — and NOT from an aggregate. Callers
+ * that only have summed tokens (the ClickHouse cache-savings query) cannot
+ * apply it and get the standard tier.
+ */
+export const HAIKU_LONG_PROMPT_TOKENS = 100_000;
+
+export const MODEL_PRICING_LONG_PROMPT: Record<string, ModelPricing> = {
+  'claude-haiku-5-5': {
+    input: 0.50,
+    output: 2.50,
+    cacheRead: 0.05,
+    cacheWrite5m: 0.625,
+    cacheWrite1h: 1,
   },
 };
 
@@ -394,61 +452,105 @@ function normalizeModelId(modelId: string): string {
 }
 
 /**
+ * Which MODEL_PRICING key a model id resolves to, and how confidently.
+ * Resolution only — no warning, no variant selection — so that
+ * getModelDisplayName can label a model by the very key its price came from
+ * without logging anything.
+ */
+function resolveModelKey(modelId: string): { key: string; matchQuality: PricingMatchQuality } | null {
+  if (MODEL_PRICING[modelId]) return { key: modelId, matchQuality: 'exact' };
+
+  // Decorations only (keeps the date snapshot), then the fully bare form.
+  const strippedId = stripModelDecorations(modelId);
+  if (MODEL_PRICING[strippedId]) return { key: strippedId, matchQuality: 'normalized' };
+
+  const normalizedId = normalizeModelId(modelId);
+  if (MODEL_PRICING[normalizedId]) return { key: normalizedId, matchQuality: 'normalized' };
+
+  for (const [needles, key] of FAMILY_RULES) {
+    if (needles.some(n => strippedId.includes(n)) && MODEL_PRICING[key]) {
+      return { key, matchQuality: 'family' };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * What the request was, for the price variants that depend on it rather than on
+ * the model id alone. Optional everywhere: a caller with neither piece of
+ * information gets the standard tier, which is what the table lists.
+ */
+export interface PricingContext {
+  /** `speed` as Claude Code reports it — 'fast' selects Opus fast-mode rates. */
+  speed?: string;
+  /**
+   * The request's prompt length: input + cache read + cache creation tokens,
+   * per the pricing page's definition. Selects Haiku 5.5's over-100K tier.
+   * Only meaningful PER REQUEST — never pass a sum over many requests.
+   */
+  promptTokens?: number;
+}
+
+/** The variant price for a resolved key, or undefined for the standard tier. */
+function variantPricing(key: string, ctx?: PricingContext): ModelPricing | undefined {
+  if (ctx?.speed === 'fast' && MODEL_PRICING_FAST[key]) {
+    return MODEL_PRICING_FAST[key];
+  }
+  if (
+    ctx?.promptTokens !== undefined &&
+    ctx.promptTokens > HAIKU_LONG_PROMPT_TOKENS &&
+    MODEL_PRICING_LONG_PROMPT[key]
+  ) {
+    return MODEL_PRICING_LONG_PROMPT[key];
+  }
+  return undefined;
+}
+
+/**
  * Price a model id, reporting how the match was made so callers can record
  * estimate quality. An id that matches nothing is logged with its exact text —
  * there is no silent substitution.
  */
-export function getModelPricingDetailed(modelId: string): ModelPricingMatch {
-  const exact = MODEL_PRICING[modelId];
-  if (exact) return { pricing: exact, matchQuality: 'exact', modelId };
+export function getModelPricingDetailed(modelId: string, ctx?: PricingContext): ModelPricingMatch {
+  const resolved = resolveModelKey(modelId);
 
-  // Decorations only (keeps the date snapshot), then the fully bare form.
-  const strippedId = stripModelDecorations(modelId);
-  const stripped = MODEL_PRICING[strippedId];
-  if (stripped) {
-    return { pricing: stripped, matchQuality: 'normalized', modelId: strippedId };
+  if (!resolved) {
+    warnOncePerModel(
+      modelId,
+      `[pricing] No price match for model "${modelId}" — falling back to DEFAULT_PRICING ` +
+      `($${DEFAULT_PRICING.input}/$${DEFAULT_PRICING.output} per MTok). ` +
+      `Add it to MODEL_PRICING in src/lib/pricing.ts (table version ${PRICING_VERSION}).`
+    );
+    return { pricing: DEFAULT_PRICING, matchQuality: 'fallback', modelId };
   }
 
-  const normalizedId = normalizeModelId(modelId);
-  const normalized = MODEL_PRICING[normalizedId];
-  if (normalized) {
-    return { pricing: normalized, matchQuality: 'normalized', modelId: normalizedId };
+  const { key, matchQuality } = resolved;
+  const pricing = variantPricing(key, ctx) ?? MODEL_PRICING[key]!;
+
+  if (matchQuality === 'family') {
+    // A family match is a guess — the id is not in the table. Surface it so a
+    // new minor release gets real prices instead of quietly inheriting a
+    // sibling's. Exact and normalized matches stay silent.
+    warnOncePerModel(
+      modelId,
+      `[pricing] Model "${modelId}" is not in the price table — priced from the ` +
+      `"${key}" family rule ($${pricing.input}/$${pricing.output} per MTok). ` +
+      `Add it to MODEL_PRICING in src/lib/pricing.ts (table version ${PRICING_VERSION}).`
+    );
   }
 
-  for (const [needles, key] of FAMILY_RULES) {
-    if (needles.some(n => strippedId.includes(n))) {
-      const pricing = MODEL_PRICING[key];
-      if (!pricing) continue;
-      // A family match is a guess — the id is not in the table. Surface it so a
-      // new minor release gets real prices instead of quietly inheriting a
-      // sibling's. Exact and normalized matches stay silent.
-      warnOncePerModel(
-        modelId,
-        `[pricing] Model "${modelId}" is not in the price table — priced from the ` +
-        `"${key}" family rule ($${pricing.input}/$${pricing.output} per MTok). ` +
-        `Add it to MODEL_PRICING in src/lib/pricing.ts (table version ${PRICING_VERSION}).`
-      );
-      return { pricing, matchQuality: 'family', modelId: key };
-    }
-  }
-
-  warnOncePerModel(
-    modelId,
-    `[pricing] No price match for model "${modelId}" — falling back to DEFAULT_PRICING ` +
-    `($${DEFAULT_PRICING.input}/$${DEFAULT_PRICING.output} per MTok). ` +
-    `Add it to MODEL_PRICING in src/lib/pricing.ts (table version ${PRICING_VERSION}).`
-  );
-  return { pricing: DEFAULT_PRICING, matchQuality: 'fallback', modelId };
+  return { pricing, matchQuality, modelId: key };
 }
 
 /** Thin wrapper for callers that only need the numbers. */
-export function getModelPricing(modelId: string): ModelPricing {
-  return getModelPricingDetailed(modelId).pricing;
+export function getModelPricing(modelId: string, ctx?: PricingContext): ModelPricing {
+  return getModelPricingDetailed(modelId, ctx).pricing;
 }
 
 // Calculate cost for token usage with a specific model
-export function calculateModelCost(usage: TokenUsage, modelId: string): number {
-  const pricing = getModelPricing(modelId);
+export function calculateModelCost(usage: TokenUsage, modelId: string, ctx?: PricingContext): number {
+  const pricing = getModelPricing(modelId, ctx);
   return (
     (usage.inputTokens * pricing.input / 1_000_000) +
     (usage.outputTokens * pricing.output / 1_000_000) +
@@ -467,52 +569,54 @@ export function calculateTotalCost(usageByModel: Record<string, TokenUsage>): nu
   return total;
 }
 
-// Format cost for display
-export function formatCost(cost: number): string {
-  if (cost >= 1000) {
-    return `$${(cost / 1000).toFixed(1)}K`;
-  }
-  if (cost >= 100) {
-    return `$${Math.round(cost)}`;
-  }
-  if (cost >= 10) {
-    return `$${cost.toFixed(1)}`;
-  }
-  return `$${cost.toFixed(2)}`;
-}
+/**
+ * The friendly label for every price-table key, so a model is never DISPLAYED
+ * as one tier and PRICED as another.
+ *
+ * That is exactly what the old hand-rolled if-chain did on bare family ids: a
+ * `claude-opus` with no version priced from the `['opus']` family rule (Opus
+ * 5.5, $4/$20) and displayed as "Opus 3"; `claude-sonnet` priced as Sonnet 5.5
+ * and displayed as "Sonnet 3"; `claude-opus-4` priced as Opus 4.8 and
+ * displayed as "Opus 4". Deriving the label from the resolved key instead
+ * makes the two agree by construction — the label now names the tier whose
+ * numbers were actually used, which is the only label that can be reconciled
+ * against a cost.
+ */
+const MODEL_DISPLAY_NAMES: Record<string, string> = {
+  'claude-fable-5-1': 'Fable 5.1',
+  'claude-mythos-5-1': 'Mythos 5.1',
+  'claude-fable-5': 'Fable 5',
+  'claude-opus-5-5': 'Opus 5.5',
+  'claude-opus-5': 'Opus 5',
+  'claude-opus-4-8': 'Opus 4.8',
+  'claude-opus-4-7': 'Opus 4.7',
+  'claude-opus-4-6': 'Opus 4.6',
+  'claude-opus-4-5-20251101': 'Opus 4.5',
+  'claude-opus-4-1-20250414': 'Opus 4.1',
+  'claude-opus-4-20250514': 'Opus 4',
+  'claude-3-opus-20240229': 'Opus 3',
+  'claude-sonnet-5-5': 'Sonnet 5.5',
+  'claude-sonnet-5': 'Sonnet 5',
+  'claude-sonnet-4-6': 'Sonnet 4.6',
+  'claude-sonnet-4-5-20250929': 'Sonnet 4.5',
+  'claude-sonnet-4-20250514': 'Sonnet 4',
+  'claude-3-7-sonnet-20250219': 'Sonnet 3.7',
+  'claude-3-5-sonnet-20241022': 'Sonnet 3.5',
+  'claude-3-5-sonnet-20240620': 'Sonnet 3.5',
+  'claude-3-sonnet-20240229': 'Sonnet 3',
+  'claude-haiku-5-5': 'Haiku 5.5',
+  'claude-haiku-4-5': 'Haiku 4.5',
+  'claude-3-5-haiku-20241022': 'Haiku 3.5',
+  'claude-3-haiku-20240307': 'Haiku 3',
+};
 
-// Get model display name (shorter, friendlier)
-// Order is load-bearing: 'opus-5-5' must be tested before 'opus-5', which also
-// matches it. Decorations are stripped first so `claude-opus-5-5[1m]` and the
-// Bedrock/Vertex spellings land on the same label as the bare id.
+/**
+ * Get model display name (shorter, friendlier). Resolved through the same path
+ * as the price, so the label always names the tier that was charged. An id
+ * that resolves to nothing is shown verbatim rather than guessed at.
+ */
 export function getModelDisplayName(modelId: string): string {
-  const lowerModelId = stripModelDecorations(modelId);
-
-  if (lowerModelId.includes('fable-5-1') || lowerModelId.includes('fable-5.1')) return 'Fable 5.1';
-  if (lowerModelId.includes('mythos-5-1') || lowerModelId.includes('mythos-5.1')) return 'Mythos 5.1';
-  if (lowerModelId.includes('fable')) return 'Fable 5';
-  if (lowerModelId.includes('mythos')) return 'Mythos';
-  if (lowerModelId.includes('opus-5-5') || lowerModelId.includes('opus-5.5')) return 'Opus 5.5';
-  if (lowerModelId.includes('opus-5')) return 'Opus 5';
-  if (lowerModelId.includes('opus-4-8') || lowerModelId.includes('opus-4.8')) return 'Opus 4.8';
-  if (lowerModelId.includes('opus-4-7') || lowerModelId.includes('opus-4.7')) return 'Opus 4.7';
-  if (lowerModelId.includes('opus-4-6') || lowerModelId.includes('opus-4.6')) return 'Opus 4.6';
-  if (lowerModelId.includes('opus-4-5') || lowerModelId.includes('opus-4.5')) return 'Opus 4.5';
-  if (lowerModelId.includes('opus-4-1') || lowerModelId.includes('opus-4.1')) return 'Opus 4.1';
-  if (lowerModelId.includes('opus-4')) return 'Opus 4';
-  if (lowerModelId.includes('opus')) return 'Opus 3';
-  if (lowerModelId.includes('sonnet-5-5') || lowerModelId.includes('sonnet-5.5')) return 'Sonnet 5.5';
-  if (lowerModelId.includes('sonnet-5')) return 'Sonnet 5';
-  if (lowerModelId.includes('sonnet-4-6') || lowerModelId.includes('sonnet-4.6')) return 'Sonnet 4.6';
-  if (lowerModelId.includes('sonnet-4-5') || lowerModelId.includes('sonnet-4.5')) return 'Sonnet 4.5';
-  if (lowerModelId.includes('sonnet-4')) return 'Sonnet 4';
-  if (lowerModelId.includes('3-7-sonnet') || lowerModelId.includes('sonnet-3-7')) return 'Sonnet 3.7';
-  if (lowerModelId.includes('3-5-sonnet') || lowerModelId.includes('sonnet-3.5')) return 'Sonnet 3.5';
-  if (lowerModelId.includes('sonnet')) return 'Sonnet 3';
-  if (lowerModelId.includes('haiku-5-5') || lowerModelId.includes('haiku-5.5')) return 'Haiku 5.5';
-  if (lowerModelId.includes('haiku-4-5') || lowerModelId.includes('haiku-4.5')) return 'Haiku 4.5';
-  if (lowerModelId.includes('3-5-haiku') || lowerModelId.includes('haiku-3.5')) return 'Haiku 3.5';
-  if (lowerModelId.includes('haiku')) return 'Haiku 3';
-
-  return modelId;
+  const resolved = resolveModelKey(modelId);
+  if (!resolved) return modelId;
+  return MODEL_DISPLAY_NAMES[resolved.key] ?? resolved.key;
 }
