@@ -17,7 +17,8 @@
 import { readFile, appendFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { API_BASE_URL, CONFIG_DIR, CONFIG_FILE, selfArgv, tokenIsForThisOrigin } from "./paths";
+import { API_BASE_URL, CONFIG_DIR, CONFIG_FILE, tokenIsForThisOrigin } from "./paths";
+import { parseReportArgv, spawnDetachedReporter } from "./reporter";
 import { isOurStatusLineCommand } from "./settings";
 import { markTokenRevoked, mergeState, readState } from "./token-state";
 import { parseRateLimits } from "../src/lib/plan-usage";
@@ -169,8 +170,32 @@ async function readTokenQuietly(): Promise<string | null> {
   return null;
 }
 
+/**
+ * What travels to the child, and what the server is sent — the plan-usage
+ * windows and nothing else.
+ *
+ * Deliberately NOT the raw stdin blob, which also carries `cwd` and
+ * `transcript_path`: this payload goes on an argv that `ps` shows to everyone
+ * on the machine, so it holds only what the server is getting anyway.
+ * `capturedAt` is stamped here, in the parent, because that is when the
+ * snapshot was true.
+ */
+export interface PlanUsageReport {
+  rate_limits: unknown;
+  sessionId?: string;
+  capturedAt: number;
+}
+
+export function buildPlanUsageReport(input: StatusLineInput, now: Date = new Date()): PlanUsageReport {
+  return {
+    rate_limits: input?.rate_limits,
+    sessionId: typeof input?.session_id === "string" ? input.session_id : undefined,
+    capturedAt: Math.floor(now.getTime() / 1000),
+  };
+}
+
 /** The POST itself. Only ever runs in the detached child (or as its fallback). */
-async function postPlanUsage(input: StatusLineInput, token: string): Promise<void> {
+async function postPlanUsage(report: PlanUsageReport, token: string): Promise<void> {
   try {
     const response = await fetch(`${API_BASE_URL}/api/plan-usage`, {
       method: "POST",
@@ -178,11 +203,7 @@ async function postPlanUsage(input: StatusLineInput, token: string): Promise<voi
         "Content-Type": "application/json",
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({
-        rate_limits: input?.rate_limits,
-        sessionId: input?.session_id,
-        capturedAt: Math.floor(Date.now() / 1000),
-      }),
+      body: JSON.stringify(report),
       signal: AbortSignal.timeout(POST_TIMEOUT_MS),
     });
 
@@ -200,8 +221,13 @@ async function postPlanUsage(input: StatusLineInput, token: string): Promise<voi
 /**
  * Worth sending? Decided in the parent, because the throttle is what keeps us
  * from spawning a process per prompt re-render.
+ *
+ * Returns the token and the fingerprint to record, or null when nothing is
+ * due. It does NOT write the throttle: see recordPostAttempt.
  */
-async function planUsageIsDue(input: StatusLineInput): Promise<string | null> {
+async function planUsageIsDue(
+  input: StatusLineInput
+): Promise<{ token: string; fingerprint: string } | null> {
   try {
     const rateLimits = input?.rate_limits;
     if (!rateLimits || typeof rateLimits !== "object") return null;
@@ -221,35 +247,25 @@ async function planUsageIsDue(input: StatusLineInput): Promise<string | null> {
       return null;
     }
 
-    // Record the attempt before it happens: a server that's down shouldn't get
-    // hammered on every prompt either.
-    await mergeState({ lastPostAt: nowSeconds, fingerprint });
-    return token;
+    return { token, fingerprint };
   } catch {
     return null;
   }
 }
 
 /**
- * Hand the report to a detached copy of ourselves.
+ * Close the throttle window — AFTER the report has been handed off or sent.
  *
- * Claude Code waits for the statusLine process to exit before it draws the
- * prompt, so anything this process awaits is latency the user feels on every
- * render. The child inherits nothing but the payload on stdin, and this
- * process returns without waiting for it.
+ * It used to be written before, which meant a handoff that silently failed
+ * also silenced itself for the next five minutes: nothing arrived, and nothing
+ * tried again. It still records on a failed POST, which is the property that
+ * kept it there — a server that is down must not be hammered on every prompt.
  */
-function spawnReporter(raw: string): boolean {
+async function recordPostAttempt(fingerprint: string): Promise<void> {
   try {
-    const child = Bun.spawn([...selfArgv(), "statusline-report"], {
-      stdin: new TextEncoder().encode(raw),
-      stdout: "ignore",
-      stderr: "ignore",
-    });
-    // Let this process exit while the child keeps going.
-    child.unref();
-    return true;
+    await mergeState({ lastPostAt: Math.floor(Date.now() / 1000), fingerprint });
   } catch {
-    return false;
+    // A throttle we could not write is a report sent slightly too often.
   }
 }
 
@@ -267,29 +283,36 @@ export async function cmdStatusline(): Promise<void> {
   // Print first, always: the prompt gets its line whatever happens below.
   process.stdout.write(`${formatStatusLine(input)}\n`);
 
-  const token = await planUsageIsDue(input);
-  if (!token) return;
+  const due = await planUsageIsDue(input);
+  if (!due) return;
 
-  // If we can't spawn (a platform or a sandbox that refuses), fall back to the
-  // in-process POST rather than dropping plan usage altogether — that is the
-  // pre-2.0 behaviour, bounded by POST_TIMEOUT_MS.
-  if (!spawnReporter(raw)) await postPlanUsage(input, token);
+  // Claude Code waits for this process to exit before it draws the prompt, so
+  // the POST goes to a detached child — see cli/reporter.ts for why the payload
+  // travels on its argv and not down a pipe.
+  const report = buildPlanUsageReport(input);
+  if (!spawnDetachedReporter("statusline-report", report)) {
+    // A platform or a sandbox that refuses to spawn: send it here rather than
+    // drop plan usage altogether, bounded by POST_TIMEOUT_MS.
+    await postPlanUsage(report, due.token);
+  }
+  await recordPostAttempt(due.fingerprint);
 }
 
 /**
  * `clawdgg statusline-report` — the detached half of the above. Not in the
  * help: Claude Code never calls it, we do.
+ *
+ * Takes the report as its one argument. It used to read stdin, which is how a
+ * report arrives empty; cli/reporter.ts has the measurement.
  */
-export async function cmdStatuslineReport(): Promise<void> {
-  const raw = await readStdinSafely();
-  let input: StatusLineInput = {};
-  try {
-    if (raw.trim()) input = JSON.parse(raw);
-  } catch {
-    return;
-  }
+export async function cmdStatuslineReport(raw: string | undefined): Promise<void> {
+  const report = parseReportArgv<PlanUsageReport>(raw);
+  // No windows means nothing to record — and it is the shape an empty payload
+  // would take, so refusing it is also the guard against a lost handoff
+  // turning into a row of nulls on the server.
+  if (!report || parseRateLimits(report.rate_limits).windows.length === 0) return;
 
   const token = await readTokenQuietly();
   if (!token) return;
-  await postPlanUsage(input, token);
+  await postPlanUsage(report, token);
 }

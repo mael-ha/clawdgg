@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import {
   applyStatusLineSetting,
+  buildPlanUsageReport,
   formatStatusLine,
   removeStatusLineSetting,
   STATUSLINE_COMMAND,
@@ -130,5 +131,43 @@ describe('formatStatusLine', () => {
         rate_limits: { seven_day: { used_percentage: 'unknown' } },
       })
     ).toBe('Opus 5');
+  });
+});
+
+describe('buildPlanUsageReport', () => {
+  const now = new Date('2026-10-18T09:00:00.000Z');
+
+  // The report rides on an argv, which `ps` shows to every user on the box.
+  // The raw status line blob carries the user's cwd and transcript path; this
+  // carries the windows the server is getting anyway, and nothing else.
+  it('carries the windows and the session, never the paths around them', () => {
+    const report = buildPlanUsageReport(
+      {
+        model: { display_name: 'Opus 5' },
+        session_id: 'sess-1',
+        cwd: '/Users/mael/code/secret-client',
+        transcript_path: '/Users/mael/.claude/projects/secret-client/t.jsonl',
+        rate_limits: { seven_day: { used_percentage: 41.6, resets_at: 1790400000 } },
+      } as any,
+      now
+    );
+
+    expect(report).toEqual({
+      rate_limits: { seven_day: { used_percentage: 41.6, resets_at: 1790400000 } },
+      sessionId: 'sess-1',
+      capturedAt: 1792314000,
+    });
+
+    const json = JSON.stringify(report);
+    expect(json).not.toContain('secret-client');
+    expect(json).not.toContain('transcript');
+  });
+
+  it('stamps the capture time in the parent, where the snapshot was true', () => {
+    expect(buildPlanUsageReport({ rate_limits: {} }, now).capturedAt).toBe(1792314000);
+  });
+
+  it('leaves the session out rather than sending a non-string', () => {
+    expect(buildPlanUsageReport({ rate_limits: {}, session_id: 42 } as any, now).sessionId).toBeUndefined();
   });
 });

@@ -1921,8 +1921,9 @@ async function main() {
       await cmdStatusline();
       break;
     // Run by `statusline` itself, detached, so the prompt never waits on a POST.
+    // The report travels on the argv — see cli/reporter.ts.
     case "statusline-report":
-      await cmdStatuslineReport();
+      await cmdStatuslineReport(args[1]);
       break;
     // Claude Code's UserPromptSubmit hook. Prints NOTHING: on this event
     // anything on stdout is injected into Claude's context.
@@ -1930,8 +1931,8 @@ async function main() {
       await cmdPromptHook();
       break;
     // Run by `prompt-hook` itself, detached, for the same reason as above. The
-    // report travels on the argv, not stdin — see spawnReporter in
-    // cli/prompt-hook.ts for the measurement behind that.
+    // report travels on the argv, not stdin — cli/reporter.ts has the
+    // measurement behind that.
     case "prompt-hook-report":
       await cmdPromptHookReport(args[1]);
       break;

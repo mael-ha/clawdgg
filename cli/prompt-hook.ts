@@ -24,7 +24,8 @@
 
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { API_BASE_URL, CONFIG_FILE, selfArgv, tokenIsForThisOrigin } from "./paths";
+import { API_BASE_URL, CONFIG_FILE, tokenIsForThisOrigin } from "./paths";
+import { parseReportArgv, spawnDetachedReporter } from "./reporter";
 import { isOurPromptHookCommand } from "./settings";
 import { markTokenRevoked } from "./token-state";
 import { containsUltrathink } from "../src/lib/ultrathink";
@@ -229,32 +230,15 @@ async function postUltrathink(report: UltrathinkReport, token: string): Promise<
  *
  * The payload is the REPORT, not the raw stdin: the child has no reason to see
  * the prompt, and a prompt that never enters a second process cannot be logged
- * by one.
- *
- * It goes on the ARGV rather than down a stdin pipe, which is what
- * cli/statusline.ts does. Measured, not assumed: a stdin pipe arrives EMPTY
- * here, every time. This process writes nothing to stdout — that is the whole
- * point of the hook — so it exits before Bun flushes the pipe, and the child
- * reads nothing. (The statusline's pipe survives only because that command
- * prints a status line first, which is an accident of its output, not a
- * guarantee.) An argv needs no flush.
+ * by one. It goes on the argv, through the shared channel in cli/reporter.ts —
+ * which is also where the measurement behind that choice lives.
  *
  * Safe on the argv precisely because of what the report is: a session id, a
  * timestamp and a boolean. No prompt, no length, nothing anyone's `ps` should
  * not see.
  */
 function spawnReporter(report: UltrathinkReport): boolean {
-  try {
-    const child = Bun.spawn([...selfArgv(), "prompt-hook-report", JSON.stringify(report)], {
-      stdin: "ignore",
-      stdout: "ignore",
-      stderr: "ignore",
-    });
-    child.unref();
-    return true;
-  } catch {
-    return false;
-  }
+  return spawnDetachedReporter("prompt-hook-report", report);
 }
 
 /**
@@ -296,14 +280,7 @@ export async function cmdPromptHook(): Promise<void> {
  * Takes the report as its one argument; see spawnReporter for why not stdin.
  */
 export async function cmdPromptHookReport(raw: string | undefined): Promise<void> {
-  if (!raw) return;
-
-  let report: UltrathinkReport;
-  try {
-    report = JSON.parse(raw);
-  } catch {
-    return;
-  }
+  const report = parseReportArgv<UltrathinkReport>(raw);
   if (report?.ultrathink !== true) return;
 
   const token = await readTokenQuietly();
