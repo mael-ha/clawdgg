@@ -134,8 +134,10 @@ export async function healthCheck(): Promise<boolean> {
  * Where a raw row came from.
  *   live     — received over OTLP from a running Claude Code (default)
  *   backfill — reconstructed from local Claude Code JSONL transcripts
+ *   legacy   — imported from the pre-OTEL SQLite `daily_stats` table by
+ *              docker/clickhouse/migrations/2026-10-18_import_daily_stats.ts
  */
-export type RowProvenance = 'live' | 'backfill';
+export type RowProvenance = 'live' | 'backfill' | 'legacy';
 
 export interface MetricRow {
   timestamp: string;
