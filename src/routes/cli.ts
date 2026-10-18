@@ -227,6 +227,7 @@ cli.post('/logout', requireBearerAuth, async (c) => {
 //      timestamps outside [2025-02-01, cutoff) are refused.
 //   6. the cutoff is min(users.otel_setup_at, first live event), computed here.
 //   7. a UTC day that already holds rows of ANY provenance is skipped whole.
+//   8. ULTRATHINK FLAGS ANSWER TO A DIFFERENT CUTOFF — see ImportDeps.flagCutoffMs.
 
 export const MAX_IMPORT_BODY_SIZE = 8 * 1024 * 1024; // 8MB
 export const MAX_IMPORT_ROWS = 20_000;
@@ -301,6 +302,8 @@ export interface ImportCounts {
   inserted: number;
   rejected: number;
   skippedAfterCutoff: number;
+  /** Flags past the flag cutoff — the hook was already recording them. */
+  skippedAfterFlagCutoff: number;
   /** Rows claiming to predate Claude Code. */
   skippedBeforeEpoch: number;
   /** Built-in slash commands, which are not prompts. */
@@ -317,13 +320,39 @@ export interface ImportCounts {
 
 export interface ImportResult extends ImportCounts {
   cutoff: string;
+  /** The separate boundary the ultrathink flags answered to. */
+  flagCutoff: string;
   /** The UTC days we refused, so the CLI can say which and why. */
   skippedDays: string[];
 }
 
 export interface ImportDeps {
-  /** Rows at or after this instant are refused. */
+  /** Measured rows at or after this instant are refused. */
   cutoffMs: number;
+  /**
+   * Ultrathink flags at or after this instant are refused, and it is
+   * deliberately NOT `cutoffMs`.
+   *
+   * `cutoffMs` is where LIVE TELEMETRY starts, because from there on the server
+   * has Claude Code's own measurement and an import would be a second opinion
+   * about the same requests. That reasoning does not transfer to the flag:
+   * there is no OTEL event for "the prompt said ultrathink", so live telemetry
+   * never carried one. Judging flags by the prompt cutoff meant the window
+   * between a user's first live event and the day they installed the hook could
+   * NEVER be recorded — for the owner, four months of it.
+   *
+   * So the boundary is where the HOOK starts instead: the user's first
+   * 'hook'-provenance flag, or now if they have never run it. Before that
+   * instant nothing was recording flags and the import is the only source;
+   * after it the hook is, and the import must not add a second one.
+   *
+   * Widening it is safe because a flag carries no measurement — no token, no
+   * dollar, only a count — and the READ side caps that count at the number of
+   * prompts the same local day actually holds (CAPPED_ULTRATHINKS_SQL in
+   * src/db/clickhouse.ts). A client that sent a flag every millisecond for a
+   * year still could not push its ultrathink share over 100%.
+   */
+  flagCutoffMs: number;
   /** UTC days (YYYY-MM-DD) that already hold rows of ANY provenance. */
   coveredDays: Set<string>;
   /**
@@ -357,6 +386,7 @@ interface Sanitized {
   metrics: ImportMetricRow[];
   rejected: number;
   skippedAfterCutoff: number;
+  skippedAfterFlagCutoff: number;
   skippedBeforeEpoch: number;
   skippedBuiltinCommand: number;
   clamped: number;
@@ -411,13 +441,26 @@ function deriveMetrics(event: SanitizedEventRow): ImportMetricRow[] {
   return metrics;
 }
 
-/** Validate, clamp and re-stamp every row the client sent. Exported for tests. */
-export function sanitizeImportRows(userId: string, body: unknown, cutoffMs: number): Sanitized {
+/**
+ * Validate, clamp and re-stamp every row the client sent. Exported for tests.
+ *
+ * TWO cutoffs, because the two kinds of row are bounded by different facts —
+ * see ImportDeps.flagCutoffMs. It defaults to `cutoffMs`, which is the old
+ * behaviour, so a caller that has not been taught the difference cannot
+ * accidentally widen the window.
+ */
+export function sanitizeImportRows(
+  userId: string,
+  body: unknown,
+  cutoffMs: number,
+  flagCutoffMs: number = cutoffMs
+): Sanitized {
   const out: Sanitized = {
     events: [],
     metrics: [],
     rejected: 0,
     skippedAfterCutoff: 0,
+    skippedAfterFlagCutoff: 0,
     skippedBeforeEpoch: 0,
     skippedBuiltinCommand: 0,
     clamped: 0,
@@ -442,7 +485,12 @@ export function sanitizeImportRows(userId: string, body: unknown, cutoffMs: numb
       out.skippedBeforeEpoch++;
       continue;
     }
-    if (ms >= cutoffMs) {
+    if (eventName === ULTRATHINK_EVENT_NAME) {
+      if (ms >= flagCutoffMs) {
+        out.skippedAfterFlagCutoff++;
+        continue;
+      }
+    } else if (ms >= cutoffMs) {
       out.skippedAfterCutoff++;
       continue;
     }
@@ -588,7 +636,7 @@ export async function runImport(
   body: unknown,
   deps: ImportDeps
 ): Promise<ImportResult> {
-  const sanitized = sanitizeImportRows(userId, body, deps.cutoffMs);
+  const sanitized = sanitizeImportRows(userId, body, deps.cutoffMs, deps.flagCutoffMs);
 
   // The two kinds of row answer to different coverage sets — see ImportDeps.
   const flags = sanitized.events.filter((row) => row.event_name === ULTRATHINK_EVENT_NAME);
@@ -609,6 +657,7 @@ export async function runImport(
     inserted: events.kept.length + metrics.kept.length,
     rejected: sanitized.rejected,
     skippedAfterCutoff: sanitized.skippedAfterCutoff,
+    skippedAfterFlagCutoff: sanitized.skippedAfterFlagCutoff,
     skippedBeforeEpoch: sanitized.skippedBeforeEpoch,
     skippedBuiltinCommand: sanitized.skippedBuiltinCommand,
     skippedCoveredDay: eventDays.skipped + flagDays.skipped + metricDays.skipped,
@@ -616,6 +665,7 @@ export async function runImport(
     clamped: sanitized.clamped,
     ignoredClientMetrics: sanitized.ignoredClientMetrics,
     cutoff: new Date(deps.cutoffMs).toISOString(),
+    flagCutoff: new Date(deps.flagCutoffMs).toISOString(),
     skippedDays: [...new Set([...eventDays.days, ...metricDays.days])].sort(),
   };
 }
@@ -631,16 +681,31 @@ function toDayString(value: unknown): string | null {
   return /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : null;
 }
 
-/** Every UTC day this user already has a raw row on, of any provenance. */
+/**
+ * Every UTC day this user already has a MEASURED row on, of any provenance.
+ *
+ * Ultrathink flags are excluded, and have to be: a flag is a synthetic row with
+ * no prompt, no token and no dollar in it, so a day whose only row is one has
+ * not been counted — but it used to land in this set and make the import refuse
+ * that day's real prompts. The hook runs on every prompt from the day it is
+ * installed, so for anyone who installed it before importing, that was most of
+ * their history.
+ */
 async function fetchCoveredDays(userId: string): Promise<Set<string>> {
   const days = new Set<string>();
+
+  const notAFlag = {
+    events_raw: `AND event_name != {flagEvent:String}`,
+    metrics_raw: '',
+  } as const;
 
   for (const table of ['events_raw', 'metrics_raw'] as const) {
     const rows = await query<{ day: string }>(
       `SELECT DISTINCT toString(toDate(timestamp)) AS day
        FROM ${table}
-       WHERE user_id = {userId:String}`,
-      { userId }
+       WHERE user_id = {userId:String}
+         ${notAFlag[table]}`,
+      { userId, flagEvent: ULTRATHINK_EVENT_NAME }
     );
     for (const row of rows) {
       const day = toDayString(row.day);
@@ -682,6 +747,37 @@ async function computeImportCutoff(userId: string, otelSetupAt: Date | null): Pr
 
   const valid = candidates.filter((ms) => Number.isFinite(ms));
   return valid.length > 0 ? Math.min(...valid) : Date.now();
+}
+
+/**
+ * The instant the HOOK took over recording flags, or now.
+ *
+ * Deliberately 'hook' only. An 'import' flag is a flag this endpoint accepted
+ * on an earlier run, so counting those would ratchet the boundary backwards to
+ * the oldest thing ever imported and freeze the gap shut after the first run.
+ * 'hook' is the only provenance that means "something was watching live".
+ */
+async function computeFlagCutoff(userId: string): Promise<number> {
+  try {
+    const rows = await query<{ first_hook: string }>(
+      `SELECT min(timestamp) AS first_hook
+       FROM events_raw
+       WHERE user_id = {userId:String}
+         AND event_name = {eventName:String}
+         AND provenance = 'hook'`,
+      { userId, eventName: ULTRATHINK_EVENT_NAME }
+    );
+    const iso = toIsoOrNull(rows[0]?.first_hook);
+    const ms = iso ? new Date(iso).getTime() : NaN;
+    if (Number.isFinite(ms)) return ms;
+  } catch (error) {
+    // A hiccup must not WIDEN the window past what the hook already covers.
+    // 'now' is the open end of the gap, so falling back to it would let an
+    // import write over days the hook has recorded. Nothing, then.
+    console.error('[cli/import] flag-cutoff lookup failed:', error);
+    return 0;
+  }
+  return Date.now();
 }
 
 /** Every UTC day this user already holds an ultrathink flag on. */
@@ -823,13 +919,15 @@ cli.post(
       .get();
 
     try {
-      const [cutoffMs, coverage] = await Promise.all([
+      const [cutoffMs, flagCutoffMs, coverage] = await Promise.all([
         computeImportCutoff(user.id, row?.otelSetupAt ?? null),
+        computeFlagCutoff(user.id),
         coveredDaysForRun(user.id, payload.runId),
       ]);
 
       const result = await runImport(user.id, body, {
         cutoffMs,
+        flagCutoffMs,
         coveredDays: coverage.days,
         ultrathinkDays: coverage.ultrathinkDays,
         insertEvents,
@@ -840,7 +938,8 @@ cli.post(
       console.log(
         `[cli/import] ${user.githubUsername}: inserted ${result.inserted}, ` +
           `covered-day ${result.skippedCoveredDay}, dup ${result.skippedDuplicate}, ` +
-          `after-cutoff ${result.skippedAfterCutoff}, rejected ${result.rejected}`
+          `after-cutoff ${result.skippedAfterCutoff}, ` +
+          `after-flag-cutoff ${result.skippedAfterFlagCutoff}, rejected ${result.rejected}`
       );
       return c.json(result);
     } catch (error) {
@@ -869,8 +968,23 @@ cli.post(
 
 const ULTRATHINK_BODY_LIMIT = 2 * 1024;
 
-/** A report may be this far ahead of our clock before we call it nonsense. */
-const ULTRATHINK_FUTURE_SLACK_MS = 10 * 60 * 1000;
+/**
+ * How far from OUR clock a hook report may sit, in either direction.
+ *
+ * This endpoint is for a hook firing on a prompt that is being typed right now,
+ * and nothing else. It used to accept any timestamp back to 2025-02-01, which
+ * made it a HISTORY endpoint with no coverage check: a client could post a flag
+ * onto every day of the past year, and because the row's identity is its
+ * timestamp + session + name, varying the millisecond produced unlimited
+ * distinct rows. The import endpoint is where history belongs — it dedupes
+ * against the days already covered and answers to its own boundary.
+ *
+ * Five minutes each way covers a machine with a sloppy clock and a request that
+ * sat in a retry, and nothing else. Both a slow clock and a fast one are
+ * bounded: a flag dated an hour ago is as wrong as one dated an hour ahead,
+ * because the hook posts as it fires.
+ */
+const ULTRATHINK_CLOCK_SLACK_MS = 5 * 60 * 1000;
 
 /**
  * One prompt a second, sustained, per user. A fast typist sends a few hundred
@@ -906,9 +1020,11 @@ export function checkUltrathinkRate(
 /**
  * Validate one report into a row, or explain why not. Exported for the tests.
  *
- * The timestamp is the client's, bounded on both sides: a row predating Claude
- * Code is a clock problem or a forgery, and one in the future would park a flag
- * in a week that has not happened and move the header figure when it arrives.
+ * The timestamp is the client's and is held to NOW, within five minutes either
+ * way — see ULTRATHINK_CLOCK_SLACK_MS. A flag in the future would park itself
+ * in a week that has not happened and move the header figure when it arrives; a
+ * flag in the past is history, and history comes in through /import, which
+ * checks what is already covered.
  */
 export function buildUltrathinkRow(
   userId: string,
@@ -921,8 +1037,13 @@ export function buildUltrathinkRow(
   const raw = payload.timestamp;
   const ms = typeof raw === 'string' ? Date.parse(raw) : NaN;
   if (!Number.isFinite(ms)) return { error: 'Invalid timestamp' };
-  if (ms < EARLIEST_PLAUSIBLE_MS) return { error: 'Timestamp predates Claude Code' };
-  if (ms > now + ULTRATHINK_FUTURE_SLACK_MS) return { error: 'Timestamp is in the future' };
+  if (Math.abs(ms - now) > ULTRATHINK_CLOCK_SLACK_MS) {
+    return {
+      error:
+        'Timestamp is not now. This endpoint records a prompt as it happens; ' +
+        'use `clawdgg import` for history.',
+    };
+  }
 
   return {
     row: {

@@ -25,6 +25,13 @@ const USER = 'github_1';
 const CUTOFF = Date.parse('2026-05-06T00:00:00.000Z');
 
 /**
+ * The flag cutoff is LATER than the measured one, which is the whole point: the
+ * window between them is the gap the hook never recorded and live telemetry
+ * never could — see ImportDeps.flagCutoffMs.
+ */
+const FLAG_CUTOFF = Date.parse('2026-09-01T00:00:00.000Z');
+
+/**
  * A ClickHouse stand-in. The two day-coverage sets are what the real endpoint
  * computes from the raw tables before the batch is processed.
  */
@@ -34,6 +41,7 @@ function stubStore(coveredDays: string[] = [], ultrathinkDays: string[] = []) {
 
   const deps: ImportDeps = {
     cutoffMs: CUTOFF,
+    flagCutoffMs: FLAG_CUTOFF,
     coveredDays: new Set(coveredDays),
     ultrathinkDays: new Set(ultrathinkDays),
     insertEvents: async (rows) => { events.push(...rows); },
@@ -482,6 +490,7 @@ describe('runImport', () => {
     let called = 0;
     const result = await runImport(USER, { events: [], metrics: [] }, {
       cutoffMs: CUTOFF,
+      flagCutoffMs: FLAG_CUTOFF,
       coveredDays: new Set(),
       ultrathinkDays: new Set(),
       insertEvents: async () => { called++; },
@@ -640,20 +649,61 @@ describe('sanitizeImportRows — ultrathink flags', () => {
     expect(metrics).toEqual([]);
   });
 
-  it('refuses a flag outside the same window as every other row', () => {
+  it('still refuses a flag predating Claude Code', () => {
     const early = sanitizeImportRows(
       USER,
       { events: [ultrathinkEvent({ timestamp: '2024-01-01 10:00:00.000' })] },
-      CUTOFF
+      CUTOFF,
+      FLAG_CUTOFF
     );
     expect(early.skippedBeforeEpoch).toBe(1);
+  });
 
+  /**
+   * THE COVERAGE GAP. A flag between the measured cutoff and the flag cutoff is
+   * in the window live telemetry never carried a flag for and the hook was not
+   * installed yet — the import is the only source there is, and judging it by
+   * the prompt cutoff made that window permanently unrecordable.
+   */
+  it('accepts a flag past the measured cutoff but before the flag cutoff', () => {
+    const inGap = sanitizeImportRows(
+      USER,
+      {
+        events: [
+          ultrathinkEvent({ timestamp: '2026-06-01 10:00:00.000' }),
+          event({ timestamp: '2026-06-01 10:00:00.000' }),
+        ],
+      },
+      CUTOFF,
+      FLAG_CUTOFF
+    );
+    // The flag is in; the PROMPT beside it, on the same day, is not.
+    expect(inGap.events.map((row) => row.event_name)).toEqual([ULTRATHINK_EVENT_NAME]);
+    expect(inGap.skippedAfterCutoff).toBe(1);
+    expect(inGap.skippedAfterFlagCutoff).toBe(0);
+  });
+
+  it('refuses a flag past the flag cutoff, where the hook was already running', () => {
+    const late = sanitizeImportRows(
+      USER,
+      { events: [ultrathinkEvent({ timestamp: '2026-10-01 10:00:00.000' })] },
+      CUTOFF,
+      FLAG_CUTOFF
+    );
+    expect(late.events).toEqual([]);
+    expect(late.skippedAfterFlagCutoff).toBe(1);
+    expect(late.skippedAfterCutoff).toBe(0);
+  });
+
+  it('falls back to the measured cutoff when told nothing else', () => {
+    // The default exists so a caller that has not been taught the difference
+    // cannot widen the window by forgetting an argument.
     const late = sanitizeImportRows(
       USER,
       { events: [ultrathinkEvent({ timestamp: '2026-06-01 10:00:00.000' })] },
       CUTOFF
     );
-    expect(late.skippedAfterCutoff).toBe(1);
+    expect(late.skippedAfterFlagCutoff).toBe(1);
   });
 });
 
@@ -761,10 +811,32 @@ describe('buildUltrathinkRow', () => {
     ).toHaveProperty('error');
   });
 
-  it('allows a small amount of clock skew', () => {
+  it('allows a small amount of clock skew, in either direction', () => {
     expect(
       buildUltrathinkRow(USER, { timestamp: '2026-10-18T09:05:00.000Z', ultrathink: true }, NOW)
     ).toHaveProperty('row');
+    expect(
+      buildUltrathinkRow(USER, { timestamp: '2026-10-18T08:55:00.000Z', ultrathink: true }, NOW)
+    ).toHaveProperty('row');
+  });
+
+  /**
+   * The endpoint is for a prompt being typed NOW. It used to accept anything
+   * back to 2025-02-01, which made it a history endpoint with no coverage
+   * check — and since a row's identity is its timestamp, varying the
+   * millisecond produced unlimited distinct flags on any day of the past year.
+   * History goes through /import, which dedupes against what is covered.
+   */
+  it('refuses history, however plausible the date', () => {
+    for (const timestamp of [
+      '2026-10-18T08:00:00.000Z', // an hour ago
+      '2026-10-17T09:00:00.000Z', // yesterday
+      '2026-06-01T09:00:00.000Z', // in the coverage gap, where /import belongs
+    ]) {
+      const built = buildUltrathinkRow(USER, { timestamp, ultrathink: true }, NOW);
+      expect(built).toHaveProperty('error');
+      if ('error' in built) expect(built.error).toContain('import');
+    }
   });
 
   it('never takes the user id from the payload', () => {
