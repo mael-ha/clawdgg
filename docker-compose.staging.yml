@@ -50,6 +50,11 @@ services:
       - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:?set it in /opt/clawdgg/.env}
       - APP_URL=${APP_URL:?set it in /opt/clawdgg/.env, e.g. https://clawd.gg}
       - SESSION_SECRET=${SESSION_SECRET:?set it in /opt/clawdgg/.env}
+      # Optional, and empty is OFF: POST /api/admin/sync answers 403 "Admin
+      # endpoint disabled" when ADMIN_TOKEN is falsy, which an empty string is
+      # — so a server with no value set has no admin endpoint, rather than one
+      # that accepts `Bearer ` from anybody.
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
     volumes:
       - sqlite_data:/data
     restart: unless-stopped
