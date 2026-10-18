@@ -611,83 +611,83 @@ app.get('/', optionalAuth, async (c) => {
       islands={hasMore && entries.length > 0 ? ['leaderboard-more'] : []}
     >
       <div class="relative z-10">
-          <Header user={user} />
-          <SmallHero
-            totalUsers={heroStats.totalUsers}
-            totalPrompts={heroStats.totalPrompts}
-            totalTokens={heroStats.totalTokens}
-          />
+        <Header user={user} />
+        <SmallHero
+          totalUsers={heroStats.totalUsers}
+          totalPrompts={heroStats.totalPrompts}
+          totalTokens={heroStats.totalTokens}
+        />
 
-          <section class="px-4 pb-8">
-            <div class="max-w-5xl mx-auto">
-              {/* Filters row */}
-              <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6">
-                <div class="flex gap-1 border-b border-gray-800">
-                  <PeriodTab period="today" currentPeriod={period} currentSort={sort} label="Today" />
-                  <PeriodTab period="week" currentPeriod={period} currentSort={sort} label="Week" />
-                  <PeriodTab period="month" currentPeriod={period} currentSort={sort} label="Month" />
-                  <PeriodTab period="all" currentPeriod={period} currentSort={sort} label="All" />
-                </div>
-
-                <div class="relative group">
-                  <button class="flex items-center gap-2 px-3 py-1.5 bg-gray-900 border border-gray-700 rounded font-mono text-sm text-gray-400 hover:border-gray-600 transition-colors">
-                    Sort: {sortConfig.label}
-                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
-                    </svg>
-                  </button>
-                  <div class="absolute right-0 mt-1 w-36 bg-gray-900 border border-gray-700 rounded overflow-hidden opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all z-50">
-                    <SortOption sort="prompts" currentSort={sort} currentPeriod={period} label="Prompts" />
-                    <SortOption sort="tokens" currentSort={sort} currentPeriod={period} label="Tokens" />
-                    <SortOption sort="lines" currentSort={sort} currentPeriod={period} label="Lines" />
-                  </div>
-                </div>
+        <section class="px-4 pb-8">
+          <div class="max-w-5xl mx-auto">
+            {/* Filters row */}
+            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6">
+              <div class="flex gap-1 border-b border-gray-800">
+                <PeriodTab period="today" currentPeriod={period} currentSort={sort} label="Today" />
+                <PeriodTab period="week" currentPeriod={period} currentSort={sort} label="Week" />
+                <PeriodTab period="month" currentPeriod={period} currentSort={sort} label="Month" />
+                <PeriodTab period="all" currentPeriod={period} currentSort={sort} label="All" />
               </div>
 
-              {/* Your rank pill */}
-              {showYourRankPill && (
-                <YourRankPill rank={currentUserRank!} total={total} />
-              )}
-
-              {/* Leaderboard */}
-              <div id="leaderboard-rows" class="space-y-1.5">
-                {entries.length > 0 ? (
-                  entries.map((entry) => (
-                    <LeaderboardRow
-                      key={entry.userId}
-                      entry={entry}
-                      isCurrentUser={user?.id === entry.userId}
-                    />
-                  ))
-                ) : (
-                  <EmptyState isLoggedIn={!!user} />
-                )}
+              <div class="relative group">
+                <button class="flex items-center gap-2 px-3 py-1.5 bg-gray-900 border border-gray-700 rounded font-mono text-sm text-gray-400 hover:border-gray-600 transition-colors">
+                  Sort: {sortConfig.label}
+                  <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+                  </svg>
+                </button>
+                <div class="absolute right-0 mt-1 w-36 bg-gray-900 border border-gray-700 rounded overflow-hidden opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all z-50">
+                  <SortOption sort="prompts" currentSort={sort} currentPeriod={period} label="Prompts" />
+                  <SortOption sort="tokens" currentSort={sort} currentPeriod={period} label="Tokens" />
+                  <SortOption sort="lines" currentSort={sort} currentPeriod={period} label="Lines" />
+                </div>
               </div>
+            </div>
 
-              {/* Load more (leaderboard-more island) */}
-              {hasMore && entries.length > 0 && (
-                <div class="text-center mt-6">
-                  <button
-                    data-load-more={`/rows?period=${period}&sort=${sort}&offset=${initialSize}`}
-                    class="px-6 py-3 text-cyan-400 hover:text-cyan-300 border border-cyan-500/30 hover:border-cyan-500/50 rounded-lg font-mono text-sm transition-all hover:shadow-lg hover:shadow-cyan-500/10"
-                  >
-                    Load More ({total - initialSize} remaining)
-                  </button>
-                </div>
-              )}
+            {/* Your rank pill */}
+            {showYourRankPill && (
+              <YourRankPill rank={currentUserRank!} total={total} />
+            )}
 
-              {/* Stats footer */}
-              {entries.length > 0 && (
-                <div class="mt-6 pt-4 border-t border-gray-800 flex justify-center gap-6 text-gray-500 text-xs font-mono">
-                  <span>{total.toLocaleString()} users total</span>
-                </div>
+            {/* Leaderboard */}
+            <div id="leaderboard-rows" class="space-y-1.5">
+              {entries.length > 0 ? (
+                entries.map((entry) => (
+                  <LeaderboardRow
+                    key={entry.userId}
+                    entry={entry}
+                    isCurrentUser={user?.id === entry.userId}
+                  />
+                ))
+              ) : (
+                <EmptyState isLoggedIn={!!user} />
               )}
             </div>
-          </section>
 
-          <HowItWorks />
-          <Footer />
-        </div>
+            {/* Load more (leaderboard-more island) */}
+            {hasMore && entries.length > 0 && (
+              <div class="text-center mt-6">
+                <button
+                  data-load-more={`/rows?period=${period}&sort=${sort}&offset=${initialSize}`}
+                  class="px-6 py-3 text-cyan-400 hover:text-cyan-300 border border-cyan-500/30 hover:border-cyan-500/50 rounded-lg font-mono text-sm transition-all hover:shadow-lg hover:shadow-cyan-500/10"
+                >
+                  Load More ({total - initialSize} remaining)
+                </button>
+              </div>
+            )}
+
+            {/* Stats footer */}
+            {entries.length > 0 && (
+              <div class="mt-6 pt-4 border-t border-gray-800 flex justify-center gap-6 text-gray-500 text-xs font-mono">
+                <span>{total.toLocaleString()} users total</span>
+              </div>
+            )}
+          </div>
+        </section>
+
+        <HowItWorks />
+        <Footer />
+      </div>
     </Layout>
   );
 });
