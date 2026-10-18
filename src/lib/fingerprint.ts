@@ -28,7 +28,6 @@ import {
   MODEL_ID_SQL,
   NO_LEGACY_SQL,
   PROMPT_EVENT_SQL,
-  ULTRATHINK_EVENT_SQL,
   query,
 } from '../db/clickhouse';
 import { getModelDisplayName } from './pricing';
