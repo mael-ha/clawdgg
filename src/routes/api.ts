@@ -1,13 +1,19 @@
 import { Hono } from 'hono';
 import { db } from '../db';
-import { users, planUsageSnapshots } from '../db/schema';
+import { users, planUsageSnapshots, profileSettings } from '../db/schema';
 import { eq, sql, desc, and, gte, inArray } from 'drizzle-orm';
 import { requireAuth, optionalAuth } from '../lib/auth-middleware';
 import type { LeaderboardEntry, LeaderboardResponse } from '../types';
 import { normalizeEpochSeconds, parseRateLimits, shouldInsertSnapshot } from '../lib/plan-usage';
 import { getModelDisplayName } from '../lib/pricing';
 import { isValidTimezone, normalizeTimezone } from '../lib/timezone';
-import { getFingerprint, type FingerprintData, type FingerprintSection } from '../lib/fingerprint';
+import { getFingerprint, type FingerprintData } from '../lib/fingerprint';
+import {
+  getVisibility,
+  hiddenSections,
+  parseVisibilityPatch,
+  setVisibility,
+} from '../lib/profile-settings';
 import { TtlCache } from '../lib/ttl-cache';
 import { rankChangesFor, type RankMetric } from '../lib/rank-snapshots';
 
@@ -454,25 +460,72 @@ api.get('/u/:username/fingerprint', optionalAuth, async (c) => {
   const isOwner = c.get('user')?.githubUsername === row.githubUsername;
 
   try {
-    // F6 replaces the empty list with the owner's profile_settings. Until the
-    // settings exist there is nothing anyone can have hidden, so an empty list
-    // is the truth rather than a placeholder.
-    const hidden: FingerprintSection[] = isOwner ? [] : [];
+    const settings = await db
+      .select()
+      .from(profileSettings)
+      .where(eq(profileSettings.userId, row.id))
+      .get();
+    const hiddenFromOthers = hiddenSections(settings);
 
     const data = await fingerprintCache.remember(
+      // The owner's payload is a different payload, so it is a different key.
       `${row.id}|${isOwner ? 'owner' : 'public'}`,
       () =>
         getFingerprint(row.id, {
           username: row.githubUsername,
           timezone: row.timezone,
-          hidden,
+          // The owner always sees everything, including what they have hidden.
+          hidden: isOwner ? [] : hiddenFromOthers,
         })
     );
-    return c.json(data);
+
+    // `hidden` says what is missing from THIS payload; `hiddenFromOthers` says
+    // what a visitor would not get. For a visitor they are the same list, and
+    // saying so twice is worth less than the owner being able to render their
+    // own profile and its toggles from one response.
+    return c.json(isOwner ? { ...data, hiddenFromOthers } : data);
   } catch (error) {
     console.error(`[fingerprint] ${username}:`, error);
     return c.json({ error: 'Failed to build fingerprint' }, 503);
   }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET/PUT /api/me/profile-settings — the owner's section toggles
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Owner-only, and there is no username in the path: these settings are read
+// and written for whoever is authenticated, so there is no way to address
+// somebody else's.
+api.get('/me/profile-settings', requireAuth, async (c) => {
+  const user = c.get('user');
+  if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+  return c.json({ sections: await getVisibility(user.id) });
+});
+
+api.put('/me/profile-settings', requireAuth, async (c) => {
+  const user = c.get('user');
+  if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  const parsed = parseVisibilityPatch(body);
+  if ('error' in parsed) return c.json({ error: parsed.error }, 400);
+
+  const sections = await setVisibility(user.id, parsed.patch);
+
+  // Both payloads for this user are now stale. Evicting beats waiting out the
+  // TTL: a toggle that takes a minute to take effect reads as a failed save.
+  fingerprintCache.delete(`${user.id}|owner`);
+  fingerprintCache.delete(`${user.id}|public`);
+
+  return c.json({ success: true, sections });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

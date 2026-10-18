@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'bun:test';
 import {
   AUTOPILOT_TOOL_CALLS_PER_PROMPT,
+  BUILT_SECTIONS,
+  FINGERPRINT_SECTIONS,
   MIN_PROMPTS_FOR_CLASS,
   MIN_USERS_FOR_RARITY,
   ORCHESTRATOR_SUBAGENT_SHARE_PCT,
   RHYTHM_BUCKETS,
+  assembleFingerprint,
   attachRarity,
   buildClassHistory,
   buildRings,
@@ -511,5 +514,69 @@ describe('buildClassHistory', () => {
       monthlyValue
     );
     expect(verdict.history.map((h) => h.month)).toEqual(['2026-09', '2026-08']);
+  });
+});
+
+
+describe('assembleFingerprint', () => {
+  /**
+   * The real assembly, which is where the hide/show decision lives. A section
+   * must be ABSENT, not zeroed: a zero is a claim about the data.
+   */
+  const parts = {
+    value: { thisWeek: 10, lastWeek: 5, deltaPct: 100, allTime: 99, weekStart: '2026-10-12T00:00:00.000Z' },
+    anatomy: {
+      allTime: { prompts: 1, medianPromptChars: 170, toolCallsPerPrompt: 9.6, linesPerPrompt: 36, valuePerPrompt: 1.13 },
+      last30d: { prompts: 1, medianPromptChars: 170, toolCallsPerPrompt: 9.6, linesPerPrompt: 36, valuePerPrompt: 1.13 },
+    },
+    conversation: { charsTyped: 100, outputTokens: 50, approxOutputChars: 200, ratio: 2 },
+    rings: buildRings([], [], []),
+    class: buildClassHistory('2026-10', [], [], []),
+    milestones: [],
+    ultrathink: { count: 7, sharePct: 50, firstSeen: '2026-10-01' },
+  };
+  const meta = {
+    username: 'ann',
+    timezone: 'Europe/Paris',
+    generatedAt: '2026-10-18T09:00:00.000Z',
+  };
+
+  it('lists every built section when nothing is hidden', () => {
+    const data = assembleFingerprint(parts, { ...meta, hidden: [] });
+    expect(data.sections).toEqual([...BUILT_SECTIONS]);
+    expect(data.hidden).toEqual([]);
+    expect(data.value?.allTime).toBe(99);
+    expect(data.ultrathink?.count).toBe(7);
+  });
+
+  it('omits a hidden section entirely rather than zeroing it', () => {
+    const data = assembleFingerprint(parts, { ...meta, hidden: ['value', 'ultrathink'] });
+
+    expect('value' in data).toBe(false);
+    expect('ultrathink' in data).toBe(false);
+    expect(data.sections).not.toContain('value');
+    expect(data.hidden).toEqual(['value', 'ultrathink']);
+    // Everything else is untouched.
+    expect(data.conversation?.charsTyped).toBe(100);
+    expect(data.anatomy?.allTime.medianPromptChars).toBe(170);
+  });
+
+  it('can hide every section at once', () => {
+    const data = assembleFingerprint(parts, { ...meta, hidden: [...FINGERPRINT_SECTIONS] });
+    expect(data.sections).toEqual([]);
+    for (const section of BUILT_SECTIONS) {
+      expect(section in data).toBe(false);
+    }
+    // The identity of the profile survives; only its contents are withheld.
+    expect(data.username).toBe('ann');
+    expect(data.timezone).toBe('Europe/Paris');
+  });
+
+  // `curve`, `year` and `plan` are toggleable sections this payload does not
+  // carry yet. Hiding one must not disturb the sections it does carry.
+  it('tolerates hiding a section it does not build', () => {
+    const data = assembleFingerprint(parts, { ...meta, hidden: ['curve', 'year', 'plan'] });
+    expect(data.sections).toEqual([...BUILT_SECTIONS]);
+    expect(data.hidden).toEqual(['curve', 'year', 'plan']);
   });
 });

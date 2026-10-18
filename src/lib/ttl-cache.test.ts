@@ -119,3 +119,26 @@ describe('remember(shouldCache)', () => {
     expect(builds).toBe(1);
   });
 });
+
+describe('delete', () => {
+  // A settings toggle evicts its own keys, so the change is visible at once
+  // rather than after the TTL — a minute of staleness reads as "it didn't save".
+  it('forgets one key and leaves the others', () => {
+    const cache = new TtlCache<string>(60_000);
+    cache.set('a', 'one');
+    cache.set('b', 'two');
+
+    cache.delete('a');
+
+    expect(cache.get('a')).toBeUndefined();
+    expect(cache.get('b')).toBe('two');
+    expect(cache.size).toBe(1);
+  });
+
+  it('is a no-op for a key that is not there', () => {
+    const cache = new TtlCache<string>(60_000);
+    cache.set('a', 'one');
+    cache.delete('nope');
+    expect(cache.get('a')).toBe('one');
+  });
+});

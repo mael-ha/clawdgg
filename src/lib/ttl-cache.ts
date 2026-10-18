@@ -81,6 +81,15 @@ export class TtlCache<T> {
     return promise;
   }
 
+  /**
+   * Forget one key, for when the thing it caches has just been changed by the
+   * person looking at it. Without it a 60-second cache makes a settings toggle
+   * look broken for a minute — which reads as "it didn't save".
+   */
+  delete(key: string): void {
+    this.#entries.delete(key);
+  }
+
   clear(): void {
     this.#entries.clear();
   }

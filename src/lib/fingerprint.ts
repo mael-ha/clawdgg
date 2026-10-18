@@ -1149,8 +1149,7 @@ export async function getFingerprint(
     milestones = attachRarity(milestones, peers, counted);
   }
 
-  const full: Required<Pick<FingerprintData,
-    'value' | 'anatomy' | 'conversation' | 'rings' | 'class' | 'milestones' | 'ultrathink'>> = {
+  const full: BuiltSections = {
     value: {
       thisWeek: Number(metricTotals?.value_this_week) || 0,
       lastWeek: Number(metricTotals?.value_last_week) || 0,
@@ -1183,24 +1182,64 @@ export async function getFingerprint(
     },
   };
 
-  // Hidden sections are left OUT rather than zeroed: a zero is a claim about
-  // the data, and "hidden" is a claim about the owner's choice. `sections`
-  // names what is present so the UI never has to tell the two apart.
-  const built = ['value', 'anatomy', 'conversation', 'rings', 'class', 'milestones', 'ultrathink'] as const;
-  const show = (key: FingerprintSection) => !hidden.includes(key);
-
-  return {
+  return assembleFingerprint(full, {
     username: options.username,
     timezone: tz,
     generatedAt: now.toISOString(),
-    sections: built.filter(show),
-    hidden: [...hidden],
-    ...(show('value') && { value: full.value }),
-    ...(show('anatomy') && { anatomy: full.anatomy }),
-    ...(show('conversation') && { conversation: full.conversation }),
-    ...(show('rings') && { rings: full.rings }),
-    ...(show('class') && { class: full.class }),
-    ...(show('milestones') && { milestones: full.milestones }),
-    ...(show('ultrathink') && { ultrathink: full.ultrathink }),
+    hidden,
+  });
+}
+
+/** Every section the fingerprint builds, in the order the payload lists them. */
+export const BUILT_SECTIONS = [
+  'value',
+  'anatomy',
+  'conversation',
+  'rings',
+  'class',
+  'milestones',
+  'ultrathink',
+] as const;
+
+export type BuiltSections = {
+  [K in (typeof BUILT_SECTIONS)[number]]: NonNullable<FingerprintData[K]>;
+};
+
+/**
+ * The parts, minus what the owner has hidden.
+ *
+ * Hidden sections are left OUT rather than zeroed: a zero is a claim about the
+ * DATA ("this person has written no code"), and hidden is a claim about the
+ * owner's CHOICE. `sections` and `hidden` are what let a reader tell those
+ * apart without guessing.
+ *
+ * Split out from getFingerprint so this decision can be tested without a
+ * ClickHouse — it is the one part of the payload shape that is a policy rather
+ * than a measurement.
+ */
+export function assembleFingerprint(
+  parts: BuiltSections,
+  meta: {
+    username: string;
+    timezone: string;
+    generatedAt: string;
+    hidden: readonly FingerprintSection[];
+  }
+): FingerprintData {
+  const show = (key: FingerprintSection) => !meta.hidden.includes(key);
+
+  return {
+    username: meta.username,
+    timezone: meta.timezone,
+    generatedAt: meta.generatedAt,
+    sections: BUILT_SECTIONS.filter(show),
+    hidden: [...meta.hidden],
+    ...(show('value') && { value: parts.value }),
+    ...(show('anatomy') && { anatomy: parts.anatomy }),
+    ...(show('conversation') && { conversation: parts.conversation }),
+    ...(show('rings') && { rings: parts.rings }),
+    ...(show('class') && { class: parts.class }),
+    ...(show('milestones') && { milestones: parts.milestones }),
+    ...(show('ultrathink') && { ultrathink: parts.ultrathink }),
   };
 }
