@@ -1,17 +1,19 @@
 /**
  * Bucketing for the analytics chart (day / week / month).
  *
- * Two backends feed one chart — ClickHouse (OTEL) aggregates in SQL, SQLite
- * `daily_stats` (legacy) is re-bucketed here in JS — and mergeChartData aligns
- * them on the bucket key. If the two derive different keys for the same day,
- * one bucket silently splits in two, so the key is defined ONCE, here:
+ * ClickHouse aggregates into buckets in SQL (bucketSql) and the chart labels
+ * them in JS (bucketLabel). The two have to derive the SAME key for a day or a
+ * bucket silently splits in two, so the key is defined ONCE, here:
  *
  *   day   → 'YYYY-MM-DD'
  *   week  → the ISO Monday's 'YYYY-MM-DD'   (ClickHouse `toMonday`)
  *   month → 'YYYY-MM'                       (ClickHouse `toStartOfMonth`)
  *
- * Everything is UTC: the ClickHouse `timestamp` column is bare/UTC and
- * `daily_stats.date` is a UTC 'YYYY-MM-DD'.
+ * Everything is UTC: the ClickHouse `timestamp` column is bare/UTC.
+ *
+ * There was a third consumer, bucketDailyRows(), which re-bucketed SQLite
+ * daily_stats rows in JS for the legacy chart path. That path is gone — the
+ * pre-OTEL days are ClickHouse rows now — so the only bucketing left is SQL's.
  */
 
 export type ChartGroupBy = 'day' | 'week' | 'month';
@@ -74,28 +76,3 @@ export function bucketLabel(key: string, groupBy: ChartGroupBy): string {
     : `${startLabel}–${MONTHS[end.getUTCMonth()]} ${end.getUTCDate()}`;
 }
 
-/**
- * Collapse per-day rows into week/month buckets, summing every numeric column.
- * `date` becomes the canonical bucket key; rows come back in key order.
- * Used by the legacy path, where SQLite already stores one row per day.
- */
-export function bucketDailyRows<T extends { date: string }>(rows: T[], groupBy: ChartGroupBy): T[] {
-  if (groupBy === 'day') return rows;
-
-  const buckets = new Map<string, T>();
-  for (const row of rows) {
-    const key = bucketKey(row.date, groupBy);
-    const bucket = buckets.get(key);
-    if (!bucket) {
-      buckets.set(key, { ...row, date: key });
-      continue;
-    }
-    for (const [field, value] of Object.entries(row)) {
-      if (field === 'date' || typeof value !== 'number') continue;
-      const acc = bucket as Record<string, unknown>;
-      acc[field] = (typeof acc[field] === 'number' ? (acc[field] as number) : 0) + value;
-    }
-  }
-
-  return [...buckets.values()].sort((a, b) => a.date.localeCompare(b.date));
-}

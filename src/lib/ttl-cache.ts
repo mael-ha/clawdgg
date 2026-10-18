@@ -47,8 +47,21 @@ export class TtlCache<T> {
     this.#evict();
   }
 
-  /** Cached value, the in-flight build for this key, or a fresh build. */
-  async remember(key: string, build: () => Promise<T>): Promise<T> {
+  /**
+   * Cached value, the in-flight build for this key, or a fresh build.
+   *
+   * `shouldCache` decides whether the built value is worth keeping. Without it
+   * a build that degraded — a page assembled while ClickHouse was unreachable,
+   * say — gets pinned for the full TTL, so one failed query turns into a minute
+   * of everyone seeing an empty panel. Returning false still serves the value
+   * to this caller and still shares it with the callers already waiting behind
+   * the single-flight; it just isn't remembered, so the next request retries.
+   */
+  async remember(
+    key: string,
+    build: () => Promise<T>,
+    shouldCache?: (value: T) => boolean
+  ): Promise<T> {
     const hit = this.get(key);
     if (hit !== undefined) return hit;
 
@@ -57,7 +70,7 @@ export class TtlCache<T> {
 
     const promise = build()
       .then((value) => {
-        this.set(key, value);
+        if (!shouldCache || shouldCache(value)) this.set(key, value);
         return value;
       })
       .finally(() => {

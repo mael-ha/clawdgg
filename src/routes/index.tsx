@@ -2,10 +2,11 @@ import { Hono } from 'hono';
 import { Layout } from '../components/Layout';
 import { optionalAuth } from '../lib/auth-middleware';
 import { db } from '../db';
-import { dailyStats, users } from '../db/schema';
-import { sql, desc, eq } from 'drizzle-orm';
+import { users } from '../db/schema';
+import { sql, desc, and, inArray } from 'drizzle-orm';
 import type { LeaderboardEntry } from '../types';
 import { BADGES } from '../lib/badges';
+import { clickhouse, type LeaderboardSort } from '../db/clickhouse';
 import { formatCost, formatNumber, formatRelativeTime, formatTokens } from '../lib/format';
 
 // Extend Hono types for our app
@@ -389,32 +390,34 @@ const EmptyState = ({ isLoggedIn }: { isLoggedIn: boolean }) => (
 // Data Fetching
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * The homepage leaderboard.
+ *
+ * All-time reads `users.total_*`, which src/jobs/sync-clickhouse.ts fills from
+ * ClickHouse; period views ask ClickHouse directly. This used to GROUP BY over
+ * SQLite daily_stats for every period, which meant the homepage and the
+ * profile page could print different totals for the same person — the
+ * homepage summed what the old CLI had uploaded, the profile showed what
+ * OTEL had measured.
+ *
+ * Membership rule, same as /api/leaderboard: a user is listed when ClickHouse
+ * has usage for them, and `users.total_*` IS that answer.
+ */
+const HAS_USAGE = sql`(COALESCE(${users.totalPrompts}, 0) > 0 OR COALESCE(${users.totalTokens}, 0) > 0)`;
+
+const SORT_COLUMNS = {
+  prompts: { sqlite: users.totalPrompts, ch: 'prompts' },
+  tokens: { sqlite: users.totalTokens, ch: 'tokens' },
+  lines: { sqlite: users.totalLinesAdded, ch: 'lines' },
+} as const;
+
 async function getLeaderboardData(period: Period, sort: SortKey, limit: number, offset: number = 0) {
-  // Build date filter
-  let dateFilter = '';
-  const now = new Date();
-  if (period === 'today') {
-    dateFilter = now.toISOString().split('T')[0]!;
-  } else if (period === 'week') {
-    const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-    dateFilter = weekAgo.toISOString().split('T')[0]!;
-  } else if (period === 'month') {
-    const monthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-    dateFilter = monthAgo.toISOString().split('T')[0]!;
+  const column = SORT_COLUMNS[sort];
+
+  if (period !== 'all') {
+    return getPeriodLeaderboard(period, column.ch, limit, offset);
   }
 
-  const baseQuery = dateFilter
-    ? sql`${dailyStats.date} >= ${dateFilter}`
-    : sql`1=1`;
-
-  const sortConfig = SORT_OPTIONS[sort];
-  const sortColumn = sortConfig.column;
-
-  // Yesterday's date for rank change calculation
-  const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString().split('T')[0]!;
-  const yesterdayQuery = sql`${dailyStats.date} < ${yesterday}`;
-
-  // Fetch leaderboard with user data for badges, streak, cost
   const results = await db
     .select({
       userId: users.id,
@@ -424,85 +427,95 @@ async function getLeaderboardData(period: Period, sort: SortKey, limit: number, 
       currentStreak: users.currentStreak,
       totalCostCents: users.totalCostCents,
       updatedAt: users.updatedAt,
-      promptCount: sql<number>`sum(${dailyStats.promptCount})`.as('total_prompts'),
-      tokenCount: sql<number>`sum(${dailyStats.tokenCount})`.as('total_tokens'),
-      linesWritten: sql<number>`sum(${dailyStats.linesWritten})`.as('total_lines'),
-      messageCount: sql<number>`sum(${dailyStats.messageCount})`.as('total_messages'),
-      toolCallCount: sql<number>`sum(${dailyStats.toolCallCount})`.as('total_tools'),
-      commitCount: sql<number>`sum(${dailyStats.commitCount})`.as('total_commits'),
-      sessionCount: sql<number>`sum(${dailyStats.sessionCount})`.as('total_sessions'),
+      promptCount: users.totalPrompts,
+      tokenCount: users.totalTokens,
+      linesWritten: users.totalLinesAdded,
+      commitCount: users.totalCommits,
     })
-    .from(dailyStats)
-    .innerJoin(users, eq(dailyStats.userId, users.id))
-    .where(baseQuery)
-    .groupBy(users.id, users.githubUsername, users.avatarUrl, users.badges, users.currentStreak, users.totalCostCents, users.updatedAt)
-    .orderBy(desc(sql.raw(sortColumn)))
+    .from(users)
+    .where(HAS_USAGE)
+    .orderBy(desc(column.sqlite))
     .limit(limit)
     .offset(offset);
 
-  // Get yesterday's rankings for rank change (simplified - just get prompt totals)
-  const yesterdayRanks = new Map<string, number>();
-  if (period === 'all') {
-    try {
-      const yesterdayData = await db
-        .select({
-          userId: dailyStats.userId,
-          total: sql<number>`sum(${dailyStats.promptCount})`.as('total'),
-        })
-        .from(dailyStats)
-        .where(yesterdayQuery)
-        .groupBy(dailyStats.userId)
-        .orderBy(desc(sql`total`));
-
-      yesterdayData.forEach((row, idx) => {
-        yesterdayRanks.set(row.userId, idx + 1);
-      });
-    } catch (e) {
-      // Ignore errors, just won't show rank change
-    }
-  }
-
-  // Transform results
-  const entries: LeaderboardEntry[] = results.map((row, index) => {
-    const currentRank = offset + index + 1;
-    const yesterdayRank = yesterdayRanks.get(row.userId);
-    const rankChange = yesterdayRank ? yesterdayRank - currentRank : 0;
-
-    let badges: string[] = [];
-    try {
-      badges = row.badges ? JSON.parse(row.badges) : [];
-    } catch (e) {
-      badges = [];
-    }
-
-    return {
-      rank: currentRank,
-      userId: row.userId,
-      githubUsername: row.githubUsername,
-      avatarUrl: row.avatarUrl,
-      promptCount: row.promptCount || 0,
-      tokenCount: row.tokenCount || 0,
-      linesWritten: row.linesWritten || 0,
-      commitCount: row.commitCount || 0,
-      messageCount: row.messageCount || 0,
-      toolCallCount: row.toolCallCount || 0,
-      sessionCount: row.sessionCount || 0,
-      badges,
-      currentStreak: row.currentStreak || 0,
-      costUsdCents: row.totalCostCents || 0,
-      rankChange,
-      lastActive: row.updatedAt ? new Date(row.updatedAt) : null,
-    };
-  });
-
-  // Get total count
   const countResult = await db
-    .select({ count: sql<number>`count(distinct ${dailyStats.userId})` })
-    .from(dailyStats)
-    .where(baseQuery);
-  const total = countResult[0]?.count || 0;
+    .select({ count: sql<number>`count(*)` })
+    .from(users)
+    .where(HAS_USAGE);
 
-  return { entries, total };
+  const entries: LeaderboardEntry[] = results.map((row, index) => ({
+    rank: offset + index + 1,
+    userId: row.userId,
+    githubUsername: row.githubUsername,
+    avatarUrl: row.avatarUrl,
+    promptCount: row.promptCount || 0,
+    tokenCount: row.tokenCount || 0,
+    linesWritten: row.linesWritten || 0,
+    commitCount: row.commitCount || 0,
+    badges: parseBadges(row.badges),
+    currentStreak: row.currentStreak || 0,
+    costUsdCents: row.totalCostCents || 0,
+    lastActive: row.updatedAt ? new Date(row.updatedAt) : null,
+  }));
+
+  return { entries, total: countResult[0]?.count || 0 };
+}
+
+/** today / week / month — straight from ClickHouse, which is the only store that has days. */
+async function getPeriodLeaderboard(
+  period: Exclude<Period, 'all'>,
+  sortBy: LeaderboardSort,
+  limit: number,
+  offset: number
+) {
+  const chResults = await clickhouse.getLeaderboard(period, sortBy, limit, offset);
+  const userIds = chResults.entries.map(e => e.user_id);
+
+  const userInfos = userIds.length
+    ? await db
+        .select({
+          id: users.id,
+          githubUsername: users.githubUsername,
+          avatarUrl: users.avatarUrl,
+          badges: users.badges,
+          currentStreak: users.currentStreak,
+          updatedAt: users.updatedAt,
+        })
+        .from(users)
+        .where(inArray(users.id, userIds))
+    : [];
+  const userMap = new Map(userInfos.map(u => [u.id, u]));
+
+  const entries: LeaderboardEntry[] = chResults.entries
+    .filter(e => userMap.has(e.user_id))
+    .map((e, index) => {
+      const u = userMap.get(e.user_id)!;
+      return {
+        rank: offset + index + 1,
+        userId: e.user_id,
+        githubUsername: u.githubUsername,
+        avatarUrl: u.avatarUrl,
+        promptCount: e.total_prompts,
+        tokenCount: e.total_tokens,
+        linesWritten: e.total_lines_added,
+        commitCount: e.total_commits,
+        badges: parseBadges(u.badges),
+        currentStreak: u.currentStreak || 0,
+        // Period cost comes from ClickHouse too, so it matches the row's period.
+        costUsdCents: Math.round(e.total_cost_usd * 100),
+        lastActive: u.updatedAt ? new Date(u.updatedAt) : null,
+      };
+    });
+
+  return { entries, total: chResults.total };
+}
+
+function parseBadges(raw: string | null): string[] {
+  try {
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -556,13 +569,16 @@ app.get('/', optionalAuth, async (c) => {
 
   const { entries, total } = await getLeaderboardData(period, sort, initialSize);
 
-  // Aggregate stats for hero
+  // Hero totals: the same synced columns the rows above are ordered by, so the
+  // headline and the list can't disagree. (They used to: the hero summed
+  // daily_stats across ALL users including ones the list filtered out.)
   const aggregateStats = await db
     .select({
-      totalPrompts: sql<number>`sum(${dailyStats.promptCount})`,
-      totalTokens: sql<number>`sum(${dailyStats.tokenCount})`,
+      totalPrompts: sql<number>`COALESCE(sum(${users.totalPrompts}), 0)`,
+      totalTokens: sql<number>`COALESCE(sum(${users.totalTokens}), 0)`,
     })
-    .from(dailyStats);
+    .from(users)
+    .where(HAS_USAGE);
 
   const heroStats = {
     totalUsers: total,
@@ -577,23 +593,18 @@ app.get('/', optionalAuth, async (c) => {
     if (userEntry) {
       currentUserRank = userEntry.rank;
     } else {
-      // User not in top entries, calculate their rank
-      const userTotalResult = await db
-        .select({ total: sql<number>`sum(${dailyStats.promptCount})` })
-        .from(dailyStats)
-        .where(eq(dailyStats.userId, user.id));
-      const userTotal = userTotalResult[0]?.total || 0;
-
-      const higherCount = await db
+      // Not in the visible rows: count how many users are ahead on the same
+      // column the leaderboard is ordered by.
+      const ahead = await db
         .select({ count: sql<number>`count(*)` })
-        .from(
-          db.select({ userId: dailyStats.userId, total: sql<number>`sum(${dailyStats.promptCount})`.as('total') })
-            .from(dailyStats)
-            .groupBy(dailyStats.userId)
-            .having(sql`total > ${userTotal}`)
-            .as('higher')
+        .from(users)
+        .where(
+          and(
+            HAS_USAGE,
+            sql`COALESCE(${users.totalPrompts}, 0) > (SELECT COALESCE(total_prompts, 0) FROM users WHERE id = ${user.id})`
+          )
         );
-      currentUserRank = (higherCount[0]?.count || 0) + 1;
+      currentUserRank = (ahead[0]?.count || 0) + 1;
     }
   }
 

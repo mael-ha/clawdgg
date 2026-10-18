@@ -4,8 +4,8 @@ import { Layout } from '../components/Layout';
 import type { Island } from '../lib/assets';
 import { TtlCache } from '../lib/ttl-cache';
 import { db } from '../db';
-import { dailyStats, users } from '../db/schema';
-import { eq, sql, asc } from 'drizzle-orm';
+import { users } from '../db/schema';
+import { eq, sql } from 'drizzle-orm';
 import { getBadges, BADGES } from '../lib/badges';
 import { formatCost, formatHours, formatTokens } from '../lib/format';
 import { getTokenComparison } from '../lib/comparisons';
@@ -30,6 +30,7 @@ import { EfficiencyMetrics } from '../components/EfficiencyMetrics';
 import type { SessionUser } from '../types';
 import {
   clickhouse,
+  type DailyMetrics,
   type TodayMetrics,
   type CacheStats,
   type LanguageStats,
@@ -781,27 +782,37 @@ const NotFound: FC<{ username: string }> = ({ username }) => (
 
 type UserRow = typeof users.$inferSelect;
 
-interface OtelProfileData {
-  todayMetrics: TodayMetrics | null;
+/**
+ * The OTEL panels that are a 30/90-day rollup. Safe to cache: a minute of
+ * staleness is invisible in a 90-day aggregate.
+ */
+interface OtelRollups {
   cacheStats: CacheStats | null;
   languageStats: LanguageStats[];
   toolStats: ToolStats[];
   trustStyle: TrustStyle | null;
   agenticStats: AgenticStats | null;
   terminalStats: TerminalStats[];
+}
+
+/** The owner's live panels. NEVER cached — see fetchOtelToday. */
+interface OtelToday {
+  todayMetrics: TodayMetrics | null;
   todayEnhanced: TodayMetricsEnhanced | null;
 }
 
-const NO_OTEL_DATA: OtelProfileData = {
-  todayMetrics: null,
+type OtelProfileData = OtelRollups & OtelToday;
+
+const NO_ROLLUPS: OtelRollups = {
   cacheStats: null,
   languageStats: [],
   toolStats: [],
   trustStyle: null,
   agenticStats: null,
   terminalStats: [],
-  todayEnhanced: null,
 };
+
+const NO_TODAY: OtelToday = { todayMetrics: null, todayEnhanced: null };
 
 interface ProfilePayload {
   profile: ProfileData;
@@ -809,224 +820,139 @@ interface ProfilePayload {
   derivedMetrics: DerivedMetrics;
   peakHour: PeakHourInfo | null;
   contributions: ContributionDay[];
-  otel: OtelProfileData;
+  rollups: OtelRollups;
   summary: string;
+  /**
+   * False when a query behind this payload failed. The cache refuses to keep
+   * a payload built during an outage, so the next request retries instead of
+   * serving an empty page for the rest of the TTL.
+   */
+  complete: boolean;
 }
 
 /**
- * The whole page payload, for a minute at a time.
+ * The cacheable part of the page, for a minute at a time.
  *
- * Nothing here is live: SQLite totals are refreshed by the 5-minute
- * ClickHouse sync, and the OTEL panels are a "today" rollup. A minute of
- * staleness costs a viewer nothing and saves the fan-out below — about a
- * dozen queries, half of them ClickHouse round trips — on every reload,
- * every crawler hit, and every person who opens the same popular profile.
+ * SQLite totals are refreshed by the 5-minute ClickHouse sync and the panels
+ * below are 30/90-day rollups, so a minute of staleness costs a viewer nothing
+ * and saves the fan-out — about a dozen queries, half of them ClickHouse round
+ * trips — on every reload, every crawler hit, and every person who opens the
+ * same popular profile.
  *
  * Keyed by username AND whether the viewer owns the profile, because owners
- * get panels (today, languages, toolkit, trust) nobody else is shown.
+ * get panels (languages, toolkit, trust) nobody else is shown.
+ *
+ * What is NOT in here: the owner's "today" panels. Those are the one place a
+ * viewer would notice staleness — you run Claude Code, reload your own
+ * profile, and today's number has to have moved.
  */
 const profileCache = new TtlCache<ProfilePayload>(60_000);
 
-/** Everyone with either OTel enabled or a daily_stats row. */
+/** Everyone ClickHouse has usage for — users.total_* is that answer, synced. */
 async function fetchTotalUsers(): Promise<number> {
   const rows = (await db.all(sql`
     SELECT COUNT(*) as count
     FROM users u
-    WHERE u.otel_enabled = 1
-       OR EXISTS (SELECT 1 FROM daily_stats WHERE user_id = u.id)
+    WHERE COALESCE(u.total_prompts, 0) > 0 OR COALESCE(u.total_tokens, 0) > 0
   `)) as any[];
   return rows[0]?.count ?? 1;
 }
 
-/** Rank = how many users are ahead on prompts, +1. */
+/**
+ * Rank = how many users are ahead on prompts, +1.
+ *
+ * One column for everyone. This used to branch on `otel_enabled`, comparing
+ * OTEL users' synced totals against non-OTEL users' summed daily_stats — two
+ * different measurements in one ORDER BY, which is how a user could be ranked
+ * above someone who had done more.
+ */
 async function fetchRank(totalPrompts: number): Promise<number> {
   const rows = (await db.all(sql`
-    SELECT (
-      SELECT COUNT(*) + 1 FROM (
-        SELECT subq.id FROM (
-          SELECT u.id,
-            CASE
-              WHEN u.otel_enabled = 1 THEN u.total_prompts
-              ELSE COALESCE((SELECT SUM(prompt_count) FROM daily_stats WHERE user_id = u.id), 0)
-            END as total_prompts
-          FROM users u
-          WHERE u.otel_enabled = 1
-             OR EXISTS (SELECT 1 FROM daily_stats WHERE user_id = u.id)
-        ) subq
-        WHERE subq.total_prompts > ${totalPrompts}
-      )
-    ) as rank
+    SELECT COUNT(*) + 1 as rank
+    FROM users u
+    WHERE COALESCE(u.total_prompts, 0) > ${totalPrompts}
   `)) as any[];
   return rows[0]?.rank ?? 1;
 }
 
 /**
- * The owner-only OTEL panels. Isolated in its own try/catch on purpose: if
+ * The owner-only OTEL rollups. Isolated in its own try/catch on purpose: if
  * ClickHouse is unreachable the profile still renders from SQLite, just
- * without the live sections.
+ * without the live sections — and `ok: false` stops that degraded page being
+ * cached for the next minute.
  */
-async function fetchOtelProfileData(userId: string): Promise<OtelProfileData> {
+async function fetchOtelRollups(userId: string): Promise<{ data: OtelRollups; ok: boolean }> {
   try {
-    const [todayMetrics, cacheStats, languageStats, toolStats, trustStyle, agenticStats, terminalStats, todayEnhanced] =
+    const [cacheStats, languageStats, toolStats, trustStyle, agenticStats, terminalStats] =
       await Promise.all([
-        clickhouse.getUserTodayMetrics(userId),
         clickhouse.getUserCacheStats(userId),
         clickhouse.getUserLanguageStats(userId),
         clickhouse.getUserToolBreakdown(userId),
         clickhouse.getUserTrustStyle(userId),
         clickhouse.getUserAgenticStats(userId),
         clickhouse.getUserTerminalStats(userId),
-        clickhouse.getUserTodayMetricsEnhanced(userId),
       ]);
-    return { todayMetrics, cacheStats, languageStats, toolStats, trustStyle, agenticStats, terminalStats, todayEnhanced };
+    return {
+      data: { cacheStats, languageStats, toolStats, trustStyle, agenticStats, terminalStats },
+      ok: true,
+    };
   } catch (error) {
-    console.error('Error fetching OTEL data:', error);
-    return NO_OTEL_DATA;
+    console.error('Error fetching OTEL rollups:', error);
+    return { data: NO_ROLLUPS, ok: false };
   }
 }
 
+/**
+ * The owner's live panels, fetched on EVERY request and never cached.
+ *
+ * "Today" is the one number on the page whose whole point is that it just
+ * moved: the owner runs Claude Code, reloads, and expects to see it. Behind a
+ * 60s cache it reads as broken. Two cheap today-scoped queries are worth not
+ * being wrong about that.
+ */
+async function fetchOtelToday(userId: string): Promise<OtelToday> {
+  try {
+    const [todayMetrics, todayEnhanced] = await Promise.all([
+      clickhouse.getUserTodayMetrics(userId),
+      clickhouse.getUserTodayMetricsEnhanced(userId),
+    ]);
+    return { todayMetrics, todayEnhanced };
+  } catch (error) {
+    console.error('Error fetching today metrics:', error);
+    return NO_TODAY;
+  }
+}
+
+/**
+ * Everything the page shows, from ClickHouse via users.total_* and the daily
+ * metrics query.
+ *
+ * There is no `isOtelUser` branch left. This function used to read totals and
+ * the whole contribution graph from SQLite daily_stats for non-OTEL users and
+ * from ClickHouse for OTEL ones, then merge the two activity maps — which is
+ * exactly where the same user's prompt count could differ between this page
+ * and the leaderboard. The pre-OTEL days are ClickHouse rows now, and
+ * src/jobs/sync-clickhouse.ts syncs every user, so one path serves everyone.
+ */
 async function buildProfilePayload(userData: UserRow, isOwnProfile: boolean): Promise<ProfilePayload> {
-  const isOtelUser = userData.otelEnabled === true;
+  const totalPrompts = userData.totalPrompts ?? 0;
 
-  // OTel users carry their totals on the user row (synced from ClickHouse),
-  // so their rank can be asked for in the same breath as everything else.
-  // Legacy users have to sum daily_stats first.
-  const otelPrompts = isOtelUser ? userData.totalPrompts ?? 0 : null;
-
-  // One wave. These queries don't depend on each other, and the page used to
-  // await them one after another — six serial round trips, four of them to
-  // ClickHouse.
-  const [statsRows, otelToolCalls, legacyActivity, otelDaily, totalUsers, otelData, otelRank] = await Promise.all([
-    isOtelUser
-      ? null
-      : db
-          .select({
-            totalPrompts: sql<number>`sum(${dailyStats.promptCount})`,
-            totalLinesWritten: sql<number>`sum(${dailyStats.linesWritten})`,
-            totalCommits: sql<number>`sum(${dailyStats.commitCount})`,
-            totalMessages: sql<number>`sum(${dailyStats.messageCount})`,
-            totalToolCalls: sql<number>`sum(${dailyStats.toolCallCount})`,
-            totalTokens: sql<number>`sum(${dailyStats.tokenCount})`,
-            totalInputTokens: sql<number>`sum(${dailyStats.inputTokens})`,
-            totalOutputTokens: sql<number>`sum(${dailyStats.outputTokens})`,
-            totalCacheReadTokens: sql<number>`sum(${dailyStats.cacheReadTokens})`,
-            totalCacheCreationTokens: sql<number>`sum(${dailyStats.cacheCreationTokens})`,
-            totalCostCents: sql<number>`sum(${dailyStats.costUsdCents})`,
-          })
-          .from(dailyStats)
-          .where(eq(dailyStats.userId, userData.id)),
-    isOtelUser ? clickhouse.getUserTotalToolCalls(userData.id) : 0,
-    db
-      .select({
-        date: dailyStats.date,
-        count: dailyStats.promptCount,
-        // Rich data from V2 schema (may be 0 for older data)
-        inputTokens: dailyStats.inputTokens,
-        outputTokens: dailyStats.outputTokens,
-        linesWritten: dailyStats.linesWritten,
-        costUsdCents: dailyStats.costUsdCents,
-      })
-      .from(dailyStats)
-      .where(eq(dailyStats.userId, userData.id))
-      .orderBy(asc(dailyStats.date)),
-    isOtelUser ? clickhouse.getUserDailyMetrics(userData.id, 365) : [],
+  // One wave. These queries don't depend on each other.
+  const [toolCalls, dailyMetrics, totalUsers, rollups, rank] = await Promise.all([
+    clickhouse.getUserTotalToolCalls(userData.id).catch((error) => {
+      console.error('Error fetching tool calls:', error);
+      return null;
+    }),
+    clickhouse.getUserDailyMetrics(userData.id, 365).catch((error) => {
+      console.error('Error fetching daily metrics:', error);
+      return null;
+    }),
     fetchTotalUsers(),
-    isOwnProfile && isOtelUser ? fetchOtelProfileData(userData.id) : NO_OTEL_DATA,
-    otelPrompts === null ? null : fetchRank(otelPrompts),
+    isOwnProfile ? fetchOtelRollups(userData.id) : { data: NO_ROLLUPS, ok: true },
+    fetchRank(totalPrompts),
   ]);
 
-  // Totals: users.total_* for OTel users, summed daily_stats for legacy
-  const stats = statsRows?.[0];
-  const totalPrompts = otelPrompts ?? stats?.totalPrompts ?? 0;
-  const totalLinesWritten = isOtelUser ? userData.totalLinesAdded ?? 0 : stats?.totalLinesWritten ?? 0;
-  const totalCommits = isOtelUser ? userData.totalCommits ?? 0 : stats?.totalCommits ?? 0;
-  const totalTokens = isOtelUser ? userData.totalTokens ?? 0 : stats?.totalTokens ?? 0;
-  const totalInputTokens = isOtelUser ? userData.totalInputTokens ?? 0 : stats?.totalInputTokens ?? 0;
-  const totalOutputTokens = isOtelUser ? userData.totalOutputTokens ?? 0 : stats?.totalOutputTokens ?? 0;
-  const totalCacheReadTokens = isOtelUser ? userData.totalCacheReadTokens ?? 0 : stats?.totalCacheReadTokens ?? 0;
-  const totalCacheCreationTokens = isOtelUser
-    ? userData.totalCacheCreationTokens ?? 0
-    : stats?.totalCacheCreationTokens ?? 0;
-  const totalCostCents = isOtelUser ? userData.totalCostCents ?? 0 : stats?.totalCostCents ?? 0;
-  const totalActiveSeconds = isOtelUser ? userData.totalActiveSeconds ?? 0 : 0;
-  const totalMessages = isOtelUser ? totalPrompts : stats?.totalMessages ?? 0;
-  // Tool calls: OTEL + the frozen legacy snapshot
-  const totalToolCalls = isOtelUser
-    ? otelToolCalls + (userData.legacyTotalToolCalls ?? 0)
-    : stats?.totalToolCalls ?? 0;
-
-  // Build merged daily activity map with optional rich data
-  interface DailyData {
-    count: number;
-    tokens?: number;
-    linesAdded?: number;
-    linesRemoved?: number;
-    costUsd?: number;
-  }
-  const activityMap = new Map<string, DailyData>();
-  for (const day of legacyActivity) {
-    const tokens = (day.inputTokens || 0) + (day.outputTokens || 0);
-    activityMap.set(day.date, {
-      count: day.count,
-      // Only include rich data if we have it (V2 schema)
-      tokens: tokens > 0 ? tokens : undefined,
-      linesAdded: day.linesWritten > 0 ? day.linesWritten : undefined,
-      // Legacy doesn't track removed lines separately
-      linesRemoved: undefined,
-      costUsd: day.costUsdCents > 0 ? day.costUsdCents / 100 : undefined,
-    });
-  }
-
-  // For OTEL users, merge the ClickHouse days over the legacy ones
-  for (const day of otelDaily) {
-    const otelCount = day.prompts || 0;
-    if (otelCount > 0 || day.input_tokens > 0) {
-      const existing = activityMap.get(day.date);
-      activityMap.set(day.date, {
-        count: Math.max(existing?.count || 0, otelCount),
-        tokens: (day.input_tokens || 0) + (day.output_tokens || 0),
-        linesAdded: day.lines_added || 0,
-        linesRemoved: day.lines_removed || 0,
-        costUsd: day.cost_usd || 0,
-      });
-    }
-  }
-
-  // Convert map to sorted array
-  const dailyActivity = Array.from(activityMap.entries())
-    .map(([date, data]) => ({ date, ...data }))
-    .sort((a, b) => a.date.localeCompare(b.date));
-
-  // Calculate contribution levels.
-  // Use the LOUDER of the count-ratio and the tokens-ratio (each normalized
-  // against its own max). Days with token activity but zero recovered prompts
-  // (e.g. backfilled gap window where the prompt source is unavailable) still
-  // light up at a level proportional to their token volume.
-  const maxCount = Math.max(...dailyActivity.map(d => d.count || 0), 1);
-  const maxTokens = Math.max(...dailyActivity.map(d => d.tokens || 0), 1);
-  const contributions: ContributionDay[] = dailyActivity.map(d => {
-    const countRatio = (d.count || 0) / maxCount;
-    const tokenRatio = (d.tokens || 0) / maxTokens;
-    const ratio = Math.max(countRatio, tokenRatio);
-    let level: 0 | 1 | 2 | 3 | 4 = 0;
-    if (ratio > 0) {
-      if (ratio >= 0.75) level = 4;
-      else if (ratio >= 0.5) level = 3;
-      else if (ratio >= 0.25) level = 2;
-      else level = 1;
-    }
-    return {
-      date: d.date,
-      count: d.count,
-      level,
-      tokens: d.tokens,
-      linesAdded: d.linesAdded,
-      linesRemoved: d.linesRemoved,
-      costUsd: d.costUsd,
-    };
-  });
-
-  const rank = otelRank ?? (await fetchRank(totalPrompts));
+  const contributions = buildContributions(dailyMetrics ?? []);
 
   // Parse badges and hourCounts
   let badges: string[] = [];
@@ -1038,7 +964,14 @@ async function buildProfilePayload(userData: UserRow, isOwnProfile: boolean): Pr
     badges = [];
   }
 
-  // Calculate archetypes
+  const totalInputTokens = userData.totalInputTokens ?? 0;
+  const totalOutputTokens = userData.totalOutputTokens ?? 0;
+  const totalCacheReadTokens = userData.totalCacheReadTokens ?? 0;
+  const totalCacheCreationTokens = userData.totalCacheCreationTokens ?? 0;
+  const totalLinesWritten = userData.totalLinesAdded ?? 0;
+  const totalCommits = userData.totalCommits ?? 0;
+  const totalCostCents = userData.totalCostCents ?? 0;
+
   const archetypeInput: ArchetypeInput = {
     totalInputTokens,
     totalOutputTokens,
@@ -1060,7 +993,7 @@ async function buildProfilePayload(userData: UserRow, isOwnProfile: boolean): Pr
     currentStreak: userData.currentStreak ?? 0,
     longestStreak: userData.longestStreak ?? 0,
     totalPrompts,
-    totalTokens,
+    totalTokens: userData.totalTokens ?? 0,
     totalInputTokens,
     totalOutputTokens,
     totalCacheReadTokens,
@@ -1068,9 +1001,10 @@ async function buildProfilePayload(userData: UserRow, isOwnProfile: boolean): Pr
     totalCostCents,
     totalLinesWritten,
     totalCommits,
-    totalActiveSeconds,
-    totalMessages,
-    totalToolCalls,
+    totalActiveSeconds: userData.totalActiveSeconds ?? 0,
+    // `messages` was the pre-OTEL CLI's own metric; prompts is what we measure.
+    totalMessages: totalPrompts,
+    totalToolCalls: toolCalls ?? 0,
     rank,
     totalUsers,
     hourCounts,
@@ -1082,9 +1016,55 @@ async function buildProfilePayload(userData: UserRow, isOwnProfile: boolean): Pr
     derivedMetrics: calculateDerivedMetrics(archetypeInput, totalCostCents),
     peakHour: getPeakHour(hourCounts),
     contributions,
-    otel: otelData,
+    rollups: rollups.data,
     summary: `${formatArchetypeDisplay(archetypes)} · ${formatCost(totalCostCents)} invested in Claude · rank #${rank} of ${totalUsers}`,
+    complete: rollups.ok && dailyMetrics !== null && toolCalls !== null,
   };
+}
+
+/**
+ * Daily metrics -> contribution squares.
+ *
+ * The level is the LOUDER of the count-ratio and the tokens-ratio, each
+ * normalized against its own max, so a day with token activity but no
+ * recovered prompts (a backfilled window whose prompt source had rotated away)
+ * still lights up in proportion to its volume.
+ */
+function buildContributions(dailyMetrics: DailyMetrics[]): ContributionDay[] {
+  const days = dailyMetrics
+    .map((day) => ({
+      date: day.date,
+      count: day.prompts || 0,
+      tokens: (day.input_tokens || 0) + (day.output_tokens || 0),
+      linesAdded: day.lines_added || 0,
+      linesRemoved: day.lines_removed || 0,
+      costUsd: day.cost_usd || 0,
+    }))
+    .filter((day) => day.count > 0 || day.tokens > 0)
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  const maxCount = Math.max(...days.map((d) => d.count), 1);
+  const maxTokens = Math.max(...days.map((d) => d.tokens), 1);
+
+  return days.map((d) => {
+    const ratio = Math.max(d.count / maxCount, d.tokens / maxTokens);
+    let level: 0 | 1 | 2 | 3 | 4 = 0;
+    if (ratio > 0) {
+      if (ratio >= 0.75) level = 4;
+      else if (ratio >= 0.5) level = 3;
+      else if (ratio >= 0.25) level = 2;
+      else level = 1;
+    }
+    return {
+      date: d.date,
+      count: d.count,
+      level,
+      tokens: d.tokens || undefined,
+      linesAdded: d.linesAdded || undefined,
+      linesRemoved: d.linesRemoved || undefined,
+      costUsd: d.costUsd || undefined,
+    };
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1120,10 +1100,19 @@ app.get('/:username', async (c) => {
   const isOtelUser = userData.otelEnabled === true;
   const isOwnProfile = currentUser?.githubUsername === userData.githubUsername;
 
-  const { profile, archetypes, derivedMetrics, peakHour, contributions, otel, summary } =
-    await profileCache.remember(`${userData.githubUsername}|${isOwnProfile ? 'own' : 'public'}`, () =>
-      buildProfilePayload(userData, isOwnProfile),
-    );
+  // The cached part, plus the owner's today panels fetched fresh alongside it.
+  // `complete` keeps a payload built during a ClickHouse outage out of the
+  // cache, so the next reload retries instead of showing an empty page for the
+  // rest of the minute.
+  const [{ profile, archetypes, derivedMetrics, peakHour, contributions, rollups, summary }, today] =
+    await Promise.all([
+      profileCache.remember(
+        `${userData.githubUsername}|${isOwnProfile ? 'own' : 'public'}`,
+        () => buildProfilePayload(userData, isOwnProfile),
+        (payload) => payload.complete,
+      ),
+      isOwnProfile ? fetchOtelToday(userData.id) : Promise.resolve(NO_TODAY),
+    ]);
 
   const islands: Island[] = ['contribution-tooltip'];
   if (isOwnProfile) islands.push('analytics-chart', 'copy-share');
@@ -1148,15 +1137,15 @@ app.get('/:username', async (c) => {
         peakHour={peakHour}
         contributions={contributions}
         currentUser={currentUser}
-        todayMetrics={otel.todayMetrics}
-        cacheStats={otel.cacheStats}
+        todayMetrics={today.todayMetrics}
+        cacheStats={rollups.cacheStats}
         isOtelEnabled={isOtelUser}
-        languageStats={otel.languageStats}
-        toolStats={otel.toolStats}
-        trustStyle={otel.trustStyle}
-        agenticStats={otel.agenticStats}
-        terminalStats={otel.terminalStats}
-        todayEnhanced={otel.todayEnhanced}
+        languageStats={rollups.languageStats}
+        toolStats={rollups.toolStats}
+        trustStyle={rollups.trustStyle}
+        agenticStats={rollups.agenticStats}
+        terminalStats={rollups.terminalStats}
+        todayEnhanced={today.todayEnhanced}
       />
     </Layout>
   );

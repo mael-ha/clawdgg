@@ -21,6 +21,13 @@
  *   - model="<synthetic>" assistant rows: locally generated placeholders with
  *     all-zero usage that would inflate api-requests-per-prompt
  *   - built-in slash commands (/clear, /compact, …): session management, not work
+ *
+ * ONE PROMPT RULE, EVERY SOURCE. Built-in slash commands are dropped and
+ * custom / skill / MCP commands are kept, which is exactly what
+ * PROMPT_EVENT_SQL does to live OTEL rows via command_source. It is the
+ * default here rather than an option a caller might forget, because a source
+ * that applied a different rule would make the headline prompt number mean
+ * something different depending on which days you were looking at.
  */
 
 import {
@@ -93,9 +100,17 @@ export interface MapOptions {
   /** Lines from a `subagents/` file never produce user_prompt events. */
   isSubagentFile: boolean;
   /**
-   * Drop user_prompt events whose text is a built-in slash command. The count
-   * rule for prompts: built-ins don't count, custom/skill/MCP commands do.
-   * Off by default so backfill-jsonl.ts keeps its historical behaviour.
+   * Drop user_prompt events whose text is a built-in slash command.
+   *
+   * ON BY DEFAULT, because this is THE prompt rule and it has to be the same
+   * rule on every source — PROMPT_EVENT_SQL applies it to live OTEL rows by
+   * excluding command_source='builtin', and reconstructed rows carry no
+   * command_source, so the only place it can be applied to them is here. A
+   * source that opted out would contribute prompts the live path would not
+   * have counted, and the headline number would mean two different things
+   * depending on where a day's data came from.
+   *
+   * Pass `false` only to deliberately count built-ins, which nothing does.
    */
   excludeBuiltinSlashPrompts?: boolean;
 }
@@ -133,9 +148,26 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlySet<string> = new Set([
   "tui", "undo", "upgrade", "usage", "usage-credits", "vim", "voice",
 ]);
 
+/**
+ * Claude Code wraps a dispatched command in XML-ish tags rather than storing
+ * the raw text. Both orderings occur in real transcripts:
+ *
+ *   <command-name>/compact</command-name>
+ *     <command-message>compact</command-message><command-args></command-args>
+ *   <command-message>init</command-message>
+ *     <command-name>/init</command-name>
+ *
+ * so the name is extracted from wherever the tag is, not by assuming it comes
+ * first. Without this the wrapped text does not start with "/" at all, every
+ * built-in command read as a free-typed prompt, and /compact and /model
+ * inflated the count.
+ */
+const COMMAND_NAME_TAG = /<command-name>\s*([^<]*?)\s*<\/command-name>/;
+
 /** True for `/clear`, `/model opus`, … and false for `/code-review`, `/my-cmd`. */
 export function isBuiltinSlashCommand(text: string): boolean {
-  const trimmed = text.trimStart();
+  const tagged = COMMAND_NAME_TAG.exec(text);
+  const trimmed = (tagged ? tagged[1]! : text).trimStart();
   if (!trimmed.startsWith("/")) return false;
   const name = trimmed.slice(1).split(/[\s:]/, 1)[0]?.toLowerCase() ?? "";
   return BUILTIN_SLASH_COMMANDS.has(name);
@@ -266,7 +298,7 @@ export function mapLine(line: any, opts: MapOptions): MapLineResult {
     // OTEL does NOT emit as user_prompt events.
     if (opts.isSubagentFile || isSidechain) return out;
     const content = line?.message?.content;
-    if (opts.excludeBuiltinSlashPrompts && isBuiltinSlashCommand(contentText(content))) {
+    if (opts.excludeBuiltinSlashPrompts !== false && isBuiltinSlashCommand(contentText(content))) {
       return out;
     }
     out.events.push({
@@ -414,11 +446,15 @@ export interface HistoryOptions {
   from?: Date;
   to?: Date;
   /**
-   * 'drop-builtin' applies the prompt count rule: built-ins out, custom /
-   * skill / MCP commands in. 'drop-all' is what backfill-jsonl.ts has always
-   * done and is kept so re-running that script can't change prod counts.
+   * 'drop-builtin' is the prompt rule and the default: built-ins out, custom /
+   * skill / MCP commands in, exactly as PROMPT_EVENT_SQL treats live rows.
+   *
+   * 'drop-all' drops every slash entry. It was the backfill's original
+   * behaviour and is kept only for comparing a historical run against a new
+   * one — it UNDERCOUNTS, because a custom or MCP command is a real request to
+   * a model and the live path counts it.
    */
-  slashPolicy: HistorySlashPolicy;
+  slashPolicy?: HistorySlashPolicy;
 }
 
 export interface HistoryResult {
@@ -460,7 +496,7 @@ export function mapHistoryText(raw: string, opts: HistoryOptions): HistoryResult
       result.droppedEmpty++;
       continue;
     }
-    if (display.startsWith("/")) {
+    if (display.startsWith("/") || display.includes("<command-name>")) {
       if (opts.slashPolicy === "drop-all" || isBuiltinSlashCommand(display)) {
         result.droppedSlash++;
         continue;

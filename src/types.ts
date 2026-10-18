@@ -83,10 +83,13 @@ export interface LeaderboardEntry {
   commitCount: number;      // Git commits
   // V2 OTel: Cost tracking
   costUsdCents?: number;    // Cost in cents (divide by 100 for USD)
-  // Legacy (kept for backward compat)
-  messageCount: number;
-  toolCallCount: number;
-  sessionCount: number;
+  // Pre-OTEL CLI concepts with no source left. `messageCount` counted
+  // assistant+user messages and ClickHouse has no equivalent; the other two are
+  // answerable but nothing renders them. Omitted rather than reported as 0 —
+  // a fabricated zero reads as "none", not as "not measured".
+  messageCount?: number;
+  toolCallCount?: number;
+  sessionCount?: number;
   // Enhanced display fields
   badges?: string[];        // Array of badge IDs
   currentStreak?: number;   // Current streak in days

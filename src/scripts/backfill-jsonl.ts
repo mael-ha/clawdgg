@@ -20,14 +20,20 @@
  * Required env:
  *   CLAWDGG_USER_ID            user_id to attribute rows to (e.g. github_61985678)
  *   CLAWDGG_CLICKHOUSE_URL     prod CH endpoint (default http://localhost:8123)
- *   CLAWDGG_CLICKHOUSE_DB      database name (default clawdgg)
+ *   CLAWDGG_CLICKHOUSE_DB      database name (default clawd)
+ *
+ * Rows go in through src/db/clickhouse.ts's insertEvents / insertMetrics, NOT
+ * through a private HTTP helper. This script used to have its own `chInsert`,
+ * which meant it was the one writer that never computed `row_id` — every row it
+ * wrote landed with an empty hash, and under the v2 sorting key (which ends in
+ * row_id) every hashless row in a (user, metric, type, timestamp) group
+ * collapses onto every other. A whole backfill could merge away.
  */
 
-import { readFile, readdir, writeFile, stat } from "node:fs/promises";
+import { readFile, readdir, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { PricingMatchQuality } from "../lib/pricing";
 import {
   describeTranscriptPath,
   fmtTs,
@@ -36,6 +42,17 @@ import {
   type ImportEventRow,
   type ImportMetricRow,
 } from "../lib/session-import";
+
+// src/db/clickhouse.ts reads these at module scope, so the aliases have to be
+// in place before it is imported — hence the dynamic import below.
+if (process.env.CLAWDGG_CLICKHOUSE_URL) {
+  process.env.CLICKHOUSE_URL = process.env.CLAWDGG_CLICKHOUSE_URL;
+}
+if (process.env.CLAWDGG_CLICKHOUSE_DB) {
+  process.env.CLICKHOUSE_DATABASE = process.env.CLAWDGG_CLICKHOUSE_DB;
+}
+
+const { insertEvents, insertMetrics, query } = await import("../db/clickhouse");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI args
@@ -88,8 +105,8 @@ function parseDate(s: string): Date {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const USER_ID = process.env.CLAWDGG_USER_ID || "github_61985678";
-const CH_URL = process.env.CLAWDGG_CLICKHOUSE_URL || "http://localhost:8123";
-const CH_DB = process.env.CLAWDGG_CLICKHOUSE_DB || "clawd";
+const CH_URL = process.env.CLICKHOUSE_URL || "http://localhost:8123";
+const CH_DB = process.env.CLICKHOUSE_DATABASE || "clawd";
 const PROJECTS_DIR = join(homedir(), ".claude", "projects");
 const CHECKPOINT_PATH = join(homedir(), ".clawdgg-backfill-state.json");
 
@@ -172,44 +189,6 @@ async function walkJsonlFiles(root: string): Promise<string[]> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ClickHouse client (minimal — avoids importing src/db/index which initialises SQLite)
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function chQuery<T = any>(sql: string): Promise<T[]> {
-  const url = new URL(CH_URL);
-  url.searchParams.set("database", CH_DB);
-  const res = await fetch(url.toString(), {
-    method: "POST",
-    body: `${sql} FORMAT JSONEachRow`,
-    headers: { "Content-Type": "text/plain" },
-    signal: AbortSignal.timeout(30000),
-  });
-  if (!res.ok) {
-    throw new Error(`CH query failed (${res.status}): ${await res.text()}`);
-  }
-  const text = await res.text();
-  if (!text.trim()) return [];
-  return text.trim().split("\n").map((l) => JSON.parse(l)) as T[];
-}
-
-async function chInsert(table: string, rows: Record<string, any>[]): Promise<void> {
-  if (rows.length === 0) return;
-  const url = new URL(CH_URL);
-  url.searchParams.set("database", CH_DB);
-  url.searchParams.set("query", `INSERT INTO ${table} FORMAT JSONEachRow`);
-  const body = rows.map((r) => JSON.stringify(r)).join("\n");
-  const res = await fetch(url.toString(), {
-    method: "POST",
-    body,
-    headers: { "Content-Type": "application/json" },
-    signal: AbortSignal.timeout(60000),
-  });
-  if (!res.ok) {
-    throw new Error(`CH insert failed (${res.status}): ${await res.text()}`);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Modes
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -280,12 +259,12 @@ async function runDiffOverlap(args: Args): Promise<void> {
            formatDateTime(timestamp, '%F %T.%f') AS ts_str,
            tool_name, prompt_length, input_tokens, output_tokens,
            cache_read_tokens, cache_write_tokens, cost_usd, model, provenance
-    FROM clawd.events_raw FINAL
-    WHERE user_id = '${USER_ID}'
-      AND timestamp >= toDateTime64('${fromStr}', 3)
-      AND timestamp <  toDateTime64('${toStr}', 3)
+    FROM events_raw FINAL
+    WHERE user_id = {userId:String}
+      AND timestamp >= toDateTime64({from:String}, 3)
+      AND timestamp <  toDateTime64({to:String}, 3)
   `;
-  const prodRows = await chQuery<any>(sql);
+  const prodRows = await query<any>(sql, { userId: USER_ID, from: fromStr, to: toStr });
   console.log(`  prod events:          ${prodRows.length}`);
 
   // 3. Diff: keys only in prod, only in reconstructed, deltas.
@@ -363,12 +342,12 @@ async function runInsert(args: Args): Promise<void> {
 
   const flush = async () => {
     if (eventsBatch.length) {
-      await chInsert("events_raw", eventsBatch);
+      await insertEvents(eventsBatch);
       totalEvents += eventsBatch.length;
       eventsBatch = [];
     }
     if (metricsBatch.length) {
-      await chInsert("metrics_raw", metricsBatch);
+      await insertMetrics(metricsBatch);
       totalMetrics += metricsBatch.length;
       metricsBatch = [];
     }
@@ -440,15 +419,17 @@ async function runFromHistory(args: Args): Promise<void> {
 
   const raw = await readFile(HISTORY_PATH, "utf-8");
 
-  // `drop-all` keeps this script's historical behaviour: every slash entry is
-  // dropped. `clawdgg import` uses 'drop-builtin' instead, which keeps custom
-  // / skill / MCP commands — see the note in src/lib/session-import.ts.
+  // 'drop-builtin' — the default, and the same rule PROMPT_EVENT_SQL applies
+  // to live rows. This script used to pass 'drop-all', which dropped custom,
+  // skill and MCP commands too: real requests to a model that the live path
+  // counts, so the gap window came out lower than the days around it for no
+  // reason the numbers could explain. Re-running adds those prompts; it cannot
+  // duplicate the ones already there, because row_id is deterministic.
   const mapped = mapHistoryText(raw, {
     userId: USER_ID,
     provenance: "backfill-history",
     from: args.from,
     to,
-    slashPolicy: "drop-all",
   });
   const rows = mapped.events;
 
@@ -470,7 +451,7 @@ async function runFromHistory(args: Args): Promise<void> {
   // Phase 3: insert in batches.
   console.log(`\n[from-history] Inserting ${rows.length} events_raw rows...`);
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-    await chInsert("events_raw", rows.slice(i, i + BATCH_SIZE));
+    await insertEvents(rows.slice(i, i + BATCH_SIZE));
   }
   console.log(`[from-history] Done.`);
 }

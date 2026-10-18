@@ -28,11 +28,8 @@
  */
 
 import { createHash } from 'node:crypto';
-import { db } from './index';
 import { getModelPricing } from '../lib/pricing';
-import { bucketDailyRows, bucketLabel, bucketSql, type ChartGroupBy } from '../lib/chart-buckets';
-import { dailyStats } from './schema';
-import { eq, and, gte, lte, asc, desc } from 'drizzle-orm';
+import { bucketLabel, bucketSql, type ChartGroupBy } from '../lib/chart-buckets';
 
 const CLICKHOUSE_URL = process.env.CLICKHOUSE_URL || 'http://localhost:8123';
 const CLICKHOUSE_DATABASE = process.env.CLICKHOUSE_DATABASE || 'clawd';
@@ -298,7 +295,7 @@ export interface UserTotals {
   user_id: string;
   total_prompts: number;
   total_tokens: number;
-  // Token breakdown (for TokenOrbit visualization)
+  // Token breakdown, for the profile's token-flow bar
   total_input_tokens: number;
   total_output_tokens: number;
   total_cache_read_tokens: number;
@@ -515,15 +512,42 @@ export async function insertEvents(events: EventRow[]): Promise<void> {
  * and counting those inflates the number with keystrokes that never reached a
  * model. Custom, plugin and `mcp` commands ARE requests and still count.
  *
- * Rows with `command_source = ''` count: free-typed prompts (no command at
- * all), anything ingested before 2.1.117, and JSONL-reconstructed rows — the
- * backfill drops prompts starting with "/" at the source, so a builtin command
- * never reaches ClickHouse as a backfill row in the first place. Any importer
- * must mirror that: either skip builtin commands or set command_source so this
- * predicate can.
+ * Rows with `command_source = ''` count, and that is correct for all four
+ * kinds of row that have it:
+ *
+ *   - free-typed prompts, which carry no command at all
+ *   - anything ingested before Claude Code 2.1.117, which did not send the
+ *     attribute
+ *   - JSONL-reconstructed rows (`backfill`, `backfill-history`, `import`):
+ *     src/lib/session-import.ts applies the SAME rule at the source and by
+ *     default, dropping built-in commands — including the ones Claude Code
+ *     wraps in `<command-name>` tags — while keeping custom, skill and MCP
+ *     commands. So a built-in never reaches ClickHouse as a reconstructed row,
+ *     and the custom ones that do are rows this predicate should count.
+ *   - pre-OTEL `legacy` rows, where daily_stats recorded a prompt count and
+ *     nothing about what was typed. Those counts came from a CLI that did not
+ *     distinguish commands either, so they are taken as given.
+ *
+ * Any new importer must mirror that: drop built-in commands at the source, or
+ * set command_source so this predicate can do it.
  */
 export const PROMPT_EVENT_SQL =
   `event_name = 'claude_code.user_prompt' AND command_source != 'builtin'`;
+
+/**
+ * Excludes rows reconstructed from the pre-OTEL SQLite `daily_stats` table.
+ *
+ * Those rows are honest about WHAT happened on a day and silent about WHEN and
+ * HOW: daily_stats held one row per day, so the import puts every row at 12:00
+ * UTC, leaves `session_id` and `model` empty, and sets `tool_success = 1`
+ * because the old CLI counted tool calls and not their outcomes.
+ *
+ * Counts and sums over those rows are correct and must include them. Anything
+ * that reads the SHAPE of a day — hour of the week, per-session structure,
+ * api-calls-per-prompt, a success rate — must not, or it reports a noon spike,
+ * a 100% tool success rate and a collapsed agentic ratio that nobody lived.
+ */
+export const NO_LEGACY_SQL = `provenance != 'legacy'`;
 
 /**
  * Model id reduced to its bare form for GROUPING, mirroring
@@ -571,7 +595,8 @@ export async function getUserTotals(userId?: string): Promise<UserTotals[]> {
         SELECT
           user_id,
           countIf(${PROMPT_EVENT_SQL}) as total_prompts,
-          sumIf(prompt_length, ${PROMPT_EVENT_SQL}) as total_prompt_chars
+          sumIf(prompt_length, ${PROMPT_EVENT_SQL} AND prompt_length > 0) as total_prompt_chars,
+          countIf(${PROMPT_EVENT_SQL} AND prompt_length > 0) as total_measured_prompts
         FROM events_raw FINAL
         ${whereClause}
         GROUP BY user_id
@@ -605,7 +630,7 @@ export async function getUserTotals(userId?: string): Promise<UserTotals[]> {
       toUInt64(COALESCE(m.total_commits, 0)) as total_commits,
       toUInt64(COALESCE(m.total_prs, 0)) as total_prs,
       toUInt64(COALESCE(m.total_active_seconds, 0)) as total_active_seconds,
-      toFloat64(if(COALESCE(e.total_prompts, 0) > 0, COALESCE(e.total_prompt_chars, 0) / e.total_prompts, 0)) as avg_prompt_length
+      toFloat64(if(COALESCE(e.total_measured_prompts, 0) > 0, COALESCE(e.total_prompt_chars, 0) / e.total_measured_prompts, 0)) as avg_prompt_length
     FROM event_stats e
     FULL OUTER JOIN metric_stats m ON e.user_id = m.user_id
   `;
@@ -615,6 +640,13 @@ export async function getUserTotals(userId?: string): Promise<UserTotals[]> {
 
 /**
  * Get daily metrics for a user (for contribution graph)
+ *
+ * `sessions` is `claude_code.session.count` — sessions STARTED — and not
+ * `uniqExact(session_id)`. One definition that holds for every source: live
+ * OTEL emits the metric, the JSONL import counts transcripts, and the
+ * pre-OTEL daily_stats import carries the old CLI's own session count. The
+ * uniqExact version read 1 for every imported day (those rows have no
+ * session_id) and silently disagreed with the number the CLI used to show.
  */
 export async function getUserDailyMetrics(userId: string, days: number = 365): Promise<DailyMetrics[]> {
   const sql = `
@@ -622,8 +654,7 @@ export async function getUserDailyMetrics(userId: string, days: number = 365): P
       daily_events AS (
         SELECT
           toDate(timestamp) as date,
-          countIf(${PROMPT_EVENT_SQL}) as prompts,
-          uniqExact(session_id) as sessions
+          countIf(${PROMPT_EVENT_SQL}) as prompts
         FROM events_raw FINAL
         WHERE user_id = {userId:String}
           AND toDate(timestamp) >= today() - {days:UInt32}
@@ -641,6 +672,7 @@ export async function getUserDailyMetrics(userId: string, days: number = 365): P
           sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'removed') as lines_removed,
           sumIf(value, metric_name = 'claude_code.commit.count') as commits,
           sumIf(value, metric_name = 'claude_code.pull_request.count') as prs,
+          sumIf(value, metric_name = 'claude_code.session.count') as sessions,
           sumIf(value, metric_name = 'claude_code.active_time.total') as active_seconds
         FROM metrics_raw FINAL
         WHERE user_id = {userId:String}
@@ -659,7 +691,7 @@ export async function getUserDailyMetrics(userId: string, days: number = 365): P
       toUInt64(COALESCE(m.lines_removed, 0)) as lines_removed,
       toUInt64(COALESCE(m.commits, 0)) as commits,
       toUInt64(COALESCE(m.prs, 0)) as prs,
-      toUInt64(COALESCE(e.sessions, 0)) as sessions,
+      toUInt64(COALESCE(m.sessions, 0)) as sessions,
       toUInt64(COALESCE(m.active_seconds, 0)) as active_seconds,
       toUInt64(COALESCE(e.prompts, 0)) as prompts
     FROM daily_events e
@@ -708,6 +740,7 @@ export async function getUserHourlyActivity(userId: string, days: number = 90): 
       toUInt64(sumIf(value, metric_name = 'claude_code.token.usage')) as activity
     FROM metrics_raw FINAL
     WHERE user_id = {userId:String}
+      AND ${NO_LEGACY_SQL}
       AND timestamp >= now() - INTERVAL {days:UInt32} DAY
     GROUP BY hour, day_of_week
     ORDER BY day_of_week, hour
@@ -719,9 +752,11 @@ export async function getUserHourlyActivity(userId: string, days: number = 90): 
 /**
  * Get leaderboard data
  */
+export type LeaderboardSort = 'prompts' | 'tokens' | 'cost' | 'lines' | 'commits';
+
 export async function getLeaderboard(
   period: 'today' | 'week' | 'month' | 'all',
-  sortBy: 'prompts' | 'tokens' | 'cost' | 'lines' = 'prompts',
+  sortBy: LeaderboardSort = 'prompts',
   limit: number = 100,
   offset: number = 0
 ): Promise<{ entries: UserTotals[]; total: number }> {
@@ -737,6 +772,7 @@ export async function getLeaderboard(
     tokens: 'total_tokens',
     cost: 'total_cost_usd',
     lines: 'total_lines_added',
+    commits: 'total_commits',
   }[sortBy];
 
   const sql = `
@@ -745,7 +781,8 @@ export async function getLeaderboard(
         SELECT
           user_id,
           countIf(${PROMPT_EVENT_SQL}) as total_prompts,
-          sumIf(prompt_length, ${PROMPT_EVENT_SQL}) as total_prompt_chars
+          sumIf(prompt_length, ${PROMPT_EVENT_SQL} AND prompt_length > 0) as total_prompt_chars,
+          countIf(${PROMPT_EVENT_SQL} AND prompt_length > 0) as total_measured_prompts
         FROM events_raw FINAL
         WHERE ${dateFilter}
         GROUP BY user_id
@@ -779,7 +816,7 @@ export async function getLeaderboard(
       toUInt64(COALESCE(m.total_commits, 0)) as total_commits,
       toUInt64(COALESCE(m.total_prs, 0)) as total_prs,
       toUInt64(COALESCE(m.total_active_seconds, 0)) as total_active_seconds,
-      toFloat64(if(COALESCE(e.total_prompts, 0) > 0, COALESCE(e.total_prompt_chars, 0) / e.total_prompts, 0)) as avg_prompt_length
+      toFloat64(if(COALESCE(e.total_measured_prompts, 0) > 0, COALESCE(e.total_prompt_chars, 0) / e.total_measured_prompts, 0)) as avg_prompt_length
     FROM event_stats e
     FULL OUTER JOIN metric_stats m ON e.user_id = m.user_id
     ORDER BY ${sortColumn} DESC
@@ -1031,6 +1068,7 @@ export async function getUserToolBreakdown(userId: string, days: number = 30): P
     WHERE user_id = {userId:String}
       AND event_name = 'claude_code.tool_result'
       AND tool_name != ''
+      AND ${NO_LEGACY_SQL}
       AND timestamp >= now() - INTERVAL {days:UInt32} DAY
     GROUP BY tool_name
     ORDER BY totalCalls DESC
@@ -1074,6 +1112,7 @@ export async function getActivityHeatmap(userId: string, days: number = 90): Pro
     FROM events_raw FINAL
     WHERE user_id = {userId:String}
       AND ${PROMPT_EVENT_SQL}
+      AND ${NO_LEGACY_SQL}
       AND timestamp >= now() - INTERVAL {days:UInt32} DAY
     GROUP BY hour, dayOfWeek
     ORDER BY dayOfWeek, hour
@@ -1192,8 +1231,7 @@ export interface ChartDataPoint {
 export interface ChartData {
   chartType: 'line' | 'bar' | 'dualBar';
   // Canonical bucket keys, 1:1 with `labels` — 'YYYY-MM-DD' (day/week) or
-  // 'YYYY-MM' (month), or the hour label for the 1d view. mergeChartData aligns
-  // the legacy and OTEL series on these, never on the display label.
+  // 'YYYY-MM' (month), or the hour label for the 1d view.
   keys: string[];
   labels: string[];
   datasets: Array<{
@@ -1208,8 +1246,6 @@ export interface ChartData {
     peak: { date: string; value: number } | null;
     trend: string; // e.g., "+12%" or "-5%"
   };
-  // Optional: indicates this is legacy-only data with limitations
-  isLegacyData?: boolean;
 }
 
 // Response when OTEL is required but not enabled
@@ -1219,185 +1255,6 @@ export interface OtelRequiredResponse {
   message: string;
   action: string;
   fallbackPeriod: ChartPeriod;
-}
-
-/**
- * Get chart data from SQLite dailyStats (legacy/pre-OTEL data)
- */
-export async function getLegacyChartData(
-  userId: string,
-  metric: ChartMetric,
-  period: ChartPeriod,
-  groupBy: ChartGroupBy = 'day',
-  endDate?: string // Optional: limit to dates before this (for OTEL users, this would be otelSetupDate)
-): Promise<ChartData | null> {
-  // "1d" (hourly) is not supported for legacy data
-  if (period === '1d') {
-    return null;
-  }
-
-  // Calculate date range
-  const today = new Date().toISOString().split('T')[0]!;
-  const days = period === '7d' ? 7 : period === '30d' ? 30 : period === '90d' ? 90 : 365 * 10; // 10 years for "all"
-  const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0]!;
-
-  // Build conditions
-  const conditions = [eq(dailyStats.userId, userId), gte(dailyStats.date, startDate)];
-  if (endDate) {
-    conditions.push(lte(dailyStats.date, endDate));
-  }
-
-  // Query SQLite
-  const rawData = await db
-    .select({
-      date: dailyStats.date,
-      promptCount: dailyStats.promptCount,
-      tokenCount: dailyStats.tokenCount,
-      inputTokens: dailyStats.inputTokens,
-      outputTokens: dailyStats.outputTokens,
-      cacheReadTokens: dailyStats.cacheReadTokens,
-      cacheCreationTokens: dailyStats.cacheCreationTokens,
-      costUsdCents: dailyStats.costUsdCents,
-      linesWritten: dailyStats.linesWritten,
-      commitCount: dailyStats.commitCount,
-    })
-    .from(dailyStats)
-    .where(and(...conditions))
-    .orderBy(asc(dailyStats.date));
-
-  if (rawData.length === 0) {
-    return null;
-  }
-
-  // daily_stats is already one row per day — week/month collapse in JS, on the
-  // same canonical key the ClickHouse path derives in SQL.
-  const rows = bucketDailyRows(rawData, groupBy);
-
-  // Transform to chart format
-  const keys: string[] = [];
-  const labels: string[] = [];
-  const datasets: ChartData['datasets'] = [];
-  const hover: Record<string, Record<string, number>> = {};
-
-  // Determine chart type and color based on metric
-  let chartType: ChartData['chartType'] = 'line';
-  let primaryColor = '#22d3ee'; // cyan
-
-  switch (metric) {
-    case 'tokens':
-      primaryColor = '#22d3ee';
-      chartType = 'line';
-      break;
-    case 'cost':
-      primaryColor = '#22c55e';
-      chartType = 'line';
-      break;
-    case 'prompts':
-      primaryColor = '#a855f7';
-      chartType = 'bar';
-      break;
-    case 'lines':
-      // For legacy, we only have linesWritten (added), no removed
-      // Show as single bar, not dualBar
-      primaryColor = '#22c55e';
-      chartType = 'bar';
-      break;
-    case 'commits':
-      primaryColor = '#f59e0b';
-      chartType = 'bar';
-      break;
-  }
-
-  // Build datasets based on metric
-  const values: number[] = [];
-
-  for (const row of rows) {
-    const dateLabel = bucketLabel(row.date, groupBy);
-    keys.push(row.date);
-    labels.push(dateLabel);
-
-    switch (metric) {
-      case 'tokens': {
-        const total = (row.inputTokens || 0) + (row.outputTokens || 0) +
-                      (row.cacheReadTokens || 0) + (row.cacheCreationTokens || 0);
-        values.push(total);
-        hover[dateLabel] = {
-          input: row.inputTokens || 0,
-          output: row.outputTokens || 0,
-          cacheRead: row.cacheReadTokens || 0,
-          cacheWrite: row.cacheCreationTokens || 0,
-        };
-        break;
-      }
-      case 'cost':
-        values.push((row.costUsdCents || 0) / 100); // Convert cents to dollars
-        break;
-      case 'prompts':
-        values.push(row.promptCount || 0);
-        break;
-      case 'lines':
-        values.push(row.linesWritten || 0);
-        break;
-      case 'commits':
-        values.push(row.commitCount || 0);
-        break;
-    }
-  }
-
-  const labelMap: Record<ChartMetric, string> = {
-    tokens: 'Tokens',
-    cost: 'Cost',
-    prompts: 'Prompts',
-    lines: 'Lines Added', // Note: legacy only has additions
-    commits: 'Commits',
-  };
-
-  datasets.push({ label: labelMap[metric], data: values, color: primaryColor });
-
-  // Calculate summary
-  const total = values.reduce((a, b) => a + b, 0);
-  const average = values.length > 0 ? total / values.length : 0;
-
-  // Find peak
-  let peak: { date: string; value: number } | null = null;
-  if (values.length > 0) {
-    const maxIdx = values.indexOf(Math.max(...values));
-    const maxValue = values[maxIdx] ?? 0;
-    const peakLabel = labels[maxIdx];
-    if (maxValue > 0 && peakLabel) {
-      peak = {
-        date: peakLabel,
-        value: maxValue,
-      };
-    }
-  }
-
-  // Calculate trend
-  let trend = '—';
-  if (values.length >= 4) {
-    const mid = Math.floor(values.length / 2);
-    const firstHalf = values.slice(0, mid).reduce((a, b) => a + b, 0);
-    const secondHalf = values.slice(mid).reduce((a, b) => a + b, 0);
-    if (firstHalf > 0) {
-      const pctChange = ((secondHalf - firstHalf) / firstHalf) * 100;
-      trend = pctChange >= 0 ? `+${Math.round(pctChange)}%` : `${Math.round(pctChange)}%`;
-    }
-  }
-
-  return {
-    chartType,
-    keys,
-    labels,
-    datasets,
-    ...(Object.keys(hover).length > 0 && { hover }),
-    summary: {
-      total: Math.round(total),
-      average: Math.round(average),
-      peak,
-      trend,
-    },
-    isLegacyData: true,
-  };
 }
 
 /**
@@ -1682,144 +1539,10 @@ export async function getChartData(
     labels,
     datasets,
     ...(Object.keys(hover).length > 0 && { hover }),
-    summary: {
-      total: Math.round(total),
-      average: Math.round(average),
-      peak,
-      trend,
-    },
-  };
-}
-
-/**
- * Merge legacy and OTEL chart data for seamless historical view.
- *
- * Aligns the two backends on the canonical bucket key, never on position: with
- * week/month grouping the bucket straddling the OTEL setup date holds rows from
- * BOTH sources, and concatenating would render it as two bars.
- */
-export function mergeChartData(
-  legacyData: ChartData | null,
-  otelData: ChartData
-): ChartData {
-  if (!legacyData) {
-    return otelData;
-  }
-
-  // Legacy only has "Lines Added" — pad it out to OTEL's dual structure
-  const isDualBar = otelData.chartType === 'dualBar' && legacyData.chartType === 'bar';
-  const shape = isDualBar
-    ? [{ label: 'Added', color: '#22c55e' }, { label: 'Removed', color: '#ef4444' }]
-    : otelData.datasets.map(ds => ({ label: ds.label, color: ds.color }));
-
-  // Legacy dataset labels don't always match OTEL's ("Lines Added" vs "Added"),
-  // so fall back to position when the label lookup misses
-  const seriesFor = (src: ChartData, index: number, label: string): number[] =>
-    src.datasets.find(ds => ds.label === label)?.data ?? src.datasets[index]?.data ?? [];
-
-  const order: string[] = [];
-  const buckets = new Map<string, { label: string; values: number[]; hover?: Record<string, number> }>();
-
-  const absorb = (src: ChartData) => {
-    const series = shape.map((ds, i) => seriesFor(src, i, ds.label));
-    for (let i = 0; i < src.keys.length; i++) {
-      const key = src.keys[i]!;
-      const label = src.labels[i] ?? key;
-      let bucket = buckets.get(key);
-      if (!bucket) {
-        bucket = { label, values: new Array(shape.length).fill(0) };
-        buckets.set(key, bucket);
-        order.push(key);
-      }
-      for (let d = 0; d < shape.length; d++) {
-        bucket.values[d] = (bucket.values[d] ?? 0) + (series[d]?.[i] ?? 0);
-      }
-      const breakdown = src.hover?.[label];
-      if (breakdown) {
-        const acc = bucket.hover ?? (bucket.hover = {});
-        for (const [field, value] of Object.entries(breakdown)) {
-          acc[field] = (acc[field] ?? 0) + value;
-        }
-      }
-    }
-  };
-
-  absorb(legacyData);
-  absorb(otelData);
-
-  // Canonical keys ('YYYY-MM-DD', 'YYYY-MM') sort chronologically as strings
-  const mergedKeys = order.sort((a, b) => a.localeCompare(b));
-  const mergedLabels = mergedKeys.map(key => buckets.get(key)!.label);
-  const mergedDatasets: ChartData['datasets'] = shape.map((ds, d) => ({
-    label: ds.label,
-    data: mergedKeys.map(key => buckets.get(key)!.values[d] ?? 0),
-    color: ds.color,
-  }));
-
-  if (isDualBar) {
-    return {
-      chartType: 'dualBar',
-      keys: mergedKeys,
-      labels: mergedLabels,
-      datasets: mergedDatasets,
-      summary: otelData.summary, // Use OTEL summary as it's more recent
-    };
-  }
-
-  // Merge hover data if present
-  let mergedHover: Record<string, Record<string, number>> | undefined;
-  for (const key of mergedKeys) {
-    const breakdown = buckets.get(key)!.hover;
-    if (breakdown) {
-      mergedHover ??= {};
-      mergedHover[buckets.get(key)!.label] = breakdown;
-    }
-  }
-
-  // Recalculate summary from merged data
-  const allValues = mergedDatasets[0]?.data || [];
-  const total = allValues.reduce((a, b) => a + Math.abs(b), 0);
-  const average = allValues.length > 0 ? total / allValues.length : 0;
-
-  // Find peak from merged data
-  let peak: { date: string; value: number } | null = null;
-  if (allValues.length > 0) {
-    const absValues = allValues.map(v => Math.abs(v));
-    const maxIdx = absValues.indexOf(Math.max(...absValues));
-    const maxValue = absValues[maxIdx] ?? 0;
-    const peakLabel = mergedLabels[maxIdx];
-    if (maxValue > 0 && peakLabel) {
-      peak = {
-        date: peakLabel,
-        value: maxValue,
-      };
-    }
-  }
-
-  // Calculate trend from merged data
-  let trend = '—';
-  if (allValues.length >= 4) {
-    const mid = Math.floor(allValues.length / 2);
-    const firstHalf = allValues.slice(0, mid).reduce((a, b) => a + Math.abs(b), 0);
-    const secondHalf = allValues.slice(mid).reduce((a, b) => a + Math.abs(b), 0);
-    if (firstHalf > 0) {
-      const pctChange = ((secondHalf - firstHalf) / firstHalf) * 100;
-      trend = pctChange >= 0 ? `+${Math.round(pctChange)}%` : `${Math.round(pctChange)}%`;
-    }
-  }
-
-  return {
-    chartType: otelData.chartType,
-    keys: mergedKeys,
-    labels: mergedLabels,
-    datasets: mergedDatasets,
-    ...(mergedHover && { hover: mergedHover }),
-    summary: {
-      total: Math.round(total),
-      average: Math.round(average),
-      peak,
-      trend,
-    },
+    // NOT rounded here. Rounding is a display decision and the client makes it
+    // per metric; pre-rounding to a whole number threw away every cent of a
+    // cost total, so a $0.42 day read as 0.
+    summary: { total, average, peak, trend },
   };
 }
 
@@ -1966,6 +1689,7 @@ export async function getUserAgenticStats(userId: string, days?: number): Promis
           toUInt64(countIf(${PROMPT_EVENT_SQL})) as totalPrompts
         FROM events_raw FINAL
         WHERE user_id = {userId:String}
+          AND ${NO_LEGACY_SQL}
           ${dateFilter}
       ),
       session_stats AS (
@@ -1976,6 +1700,7 @@ export async function getUserAgenticStats(userId: string, days?: number): Promis
         FROM events_raw FINAL
         WHERE user_id = {userId:String}
           AND session_id != ''
+          AND ${NO_LEGACY_SQL}
           ${dateFilter}
         GROUP BY session_id
         HAVING prompts > 0
@@ -2095,6 +1820,61 @@ export async function getUserTerminalStats(userId: string): Promise<TerminalStat
 }
 
 /**
+ * Where a user's numbers came from, by provenance.
+ *
+ * This replaces the old `dataSources` block on /api/me/insights, which
+ * reported "legacy vs OTEL" by SUBTRACTING the frozen users.legacy_total_*
+ * snapshot from the synced total — a derivation that went negative the moment
+ * either number moved for any other reason. Asking ClickHouse directly is both
+ * honest and exhaustive: every row has a provenance, so the parts add up to
+ * the whole by construction. That is the "traceable" half of the data-integrity
+ * rule — any displayed number can be followed back to the rows behind it.
+ */
+export interface ProvenanceBreakdown {
+  provenance: string;
+  prompts: number;
+  tokens: number;
+  costUsd: number;
+  firstDay: string | null;
+  lastDay: string | null;
+}
+
+export async function getUserProvenanceBreakdown(userId: string): Promise<ProvenanceBreakdown[]> {
+  const sql = `
+    WITH
+      event_parts AS (
+        SELECT provenance,
+               countIf(${PROMPT_EVENT_SQL}) as prompts,
+               toString(min(toDate(timestamp))) as first_day,
+               toString(max(toDate(timestamp))) as last_day
+        FROM events_raw FINAL
+        WHERE user_id = {userId:String}
+        GROUP BY provenance
+      ),
+      metric_parts AS (
+        SELECT provenance,
+               sumIf(value, metric_name = 'claude_code.token.usage') as tokens,
+               sumIf(value, metric_name = 'claude_code.cost.usage') as cost_usd
+        FROM metrics_raw FINAL
+        WHERE user_id = {userId:String}
+        GROUP BY provenance
+      )
+    SELECT
+      COALESCE(e.provenance, m.provenance) as provenance,
+      toUInt64(COALESCE(e.prompts, 0)) as prompts,
+      toUInt64(COALESCE(m.tokens, 0)) as tokens,
+      toFloat64(COALESCE(m.cost_usd, 0)) as costUsd,
+      e.first_day as firstDay,
+      e.last_day as lastDay
+    FROM event_parts e
+    FULL OUTER JOIN metric_parts m ON e.provenance = m.provenance
+    ORDER BY prompts DESC, tokens DESC
+  `;
+
+  return query<ProvenanceBreakdown>(sql, { userId });
+}
+
+/**
  * Enhanced Today metrics with active time and languages
  */
 export interface TodayMetricsEnhanced extends TodayMetrics {
@@ -2166,8 +1946,6 @@ export const clickhouse = {
   getUserSessionStats,
   // Chart data
   getChartData,
-  getLegacyChartData,
-  mergeChartData,
   // NEW: Profile Signature Insights
   getUserLanguageStats,
   getUserTrustStyle,
@@ -2176,6 +1954,7 @@ export const clickhouse = {
   getTodayLanguages,
   getUserTerminalStats,
   getUserTodayMetricsEnhanced,
+  getUserProvenanceBreakdown,
 };
 
 export default clickhouse;

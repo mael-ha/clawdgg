@@ -7,12 +7,22 @@
  * Data flow:
  *   Claude Code → OTel → ClickHouse → [THIS JOB] → SQLite → Leaderboard/Profile
  *
- * Runs every 5 minutes for all OTel-enabled users.
+ * ClickHouse IS THE SOURCE. `users.total_*` is a cache of it and nothing else.
+ * This job used to ADD the frozen `users.legacy_total_*` snapshot on top of
+ * the ClickHouse figures, because the pre-OTEL history lived only in SQLite.
+ * That history is now imported into ClickHouse itself
+ * (docker/clickhouse/migrations/2026-10-18_import_daily_stats.ts), so adding
+ * the snapshot would count it twice. Every `legacy_*` column and every
+ * `daily_stats` read is gone from here; do not reintroduce one.
+ *
+ * Runs every 5 minutes for every user, not just OTel-enabled ones: a user who
+ * never enabled OTEL still has imported history in ClickHouse, and without a
+ * sync their totals would read 0 on the leaderboard.
  */
 
 import { db } from '../db';
-import { users, dailyStats } from '../db/schema';
-import { clickhouse, query } from '../db/clickhouse';
+import { users } from '../db/schema';
+import { clickhouse, query, NO_LEGACY_SQL, PROMPT_EVENT_SQL } from '../db/clickhouse';
 import { computeBadges } from '../lib/badges';
 import { eq } from 'drizzle-orm';
 
@@ -104,7 +114,8 @@ async function getUserHourlyCounts(userId: string): Promise<Record<string, numbe
         COUNT(*) as count
       FROM events_raw FINAL
       WHERE user_id = {userId:String}
-        AND event_name = 'claude_code.user_prompt'
+        AND ${PROMPT_EVENT_SQL}
+        AND ${NO_LEGACY_SQL}
       GROUP BY hour
       `,
       { userId }
@@ -135,7 +146,8 @@ async function getLongestSessionMessages(userId: string): Promise<number> {
         SELECT session_id, COUNT(*) as prompt_count
         FROM events_raw FINAL
         WHERE user_id = {userId:String}
-          AND event_name = 'claude_code.user_prompt'
+          AND ${PROMPT_EVENT_SQL}
+          AND session_id != ''
         GROUP BY session_id
       )
       `,
@@ -173,36 +185,19 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
     let synced = 0;
     let errors = 0;
 
-    // Get all OTel-enabled users WITH their legacy totals AND current CLI-synced values
-    const otelUsers = await db
+    // Every user, not only the OTel-enabled ones: imported pre-OTEL history
+    // lives in ClickHouse now, and a user who never ran `clawdgg setup` would
+    // otherwise never have their totals filled in.
+    const syncTargets = await db
       .select({
         id: users.id,
         createdAt: users.createdAt,
-        // Legacy snapshot (frozen at OTEL enable time)
-        legacyPrompts: users.legacyTotalPrompts,
-        legacyTokens: users.legacyTotalTokens,
-        legacyCostCents: users.legacyTotalCostUsdCents,
-        legacyLines: users.legacyTotalLinesAdded,
-        legacyCommits: users.legacyTotalCommits,
-        legacyToolCalls: users.legacyTotalToolCalls,
-        // Legacy token breakdown (for TokenOrbit visualization)
-        legacyInputTokens: users.legacyTotalInputTokens,
-        legacyOutputTokens: users.legacyTotalOutputTokens,
-        legacyCacheReadTokens: users.legacyTotalCacheReadTokens,
-        legacyCacheCreationTokens: users.legacyTotalCacheCreationTokens,
-        // Legacy hourCounts (frozen at OTEL enable time)
-        legacyHourCounts: users.legacyHourCounts,
-        // Current values (may have been set by CLI sync - preserve if OTEL has no data)
-        currentHourCounts: users.hourCounts,
-        currentLongestSession: users.longestSessionMessages,
-        currentStreak: users.currentStreak,
         currentLongestStreak: users.longestStreak,
         currentFirstSessionDate: users.firstSessionDate,
       })
-      .from(users)
-      .where(eq(users.otelEnabled, true));
+      .from(users);
 
-    console.log(`[sync] Found ${otelUsers.length} OTel-enabled users`);
+    console.log(`[sync] Syncing ${syncTargets.length} users from ClickHouse`);
 
     // Pre-calculate user ranks once (for OG badge)
     const allUsers = await db
@@ -212,38 +207,18 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
     const rankLookup = new Map(allUsers.map((u, idx) => [u.id, idx + 1]));
 
     // Process users in batches to avoid overwhelming ClickHouse
-    for (const user of otelUsers) {
+    for (const user of syncTargets) {
       const {
         id: userId,
-        legacyPrompts = 0,
-        legacyTokens = 0,
-        legacyCostCents = 0,
-        legacyLines = 0,
-        legacyCommits = 0,
-        legacyToolCalls = 0,
-        // Legacy token breakdown
-        legacyInputTokens = 0,
-        legacyOutputTokens = 0,
-        legacyCacheReadTokens = 0,
-        legacyCacheCreationTokens = 0,
-        // Legacy hourCounts (frozen at OTEL enable time)
-        legacyHourCounts,
-        // Current values from CLI sync (preserve if OTEL has no data)
-        currentHourCounts,
-        currentLongestSession = 0,
-        currentStreak: existingCurrentStreak = 0,
         currentLongestStreak: existingLongestStreak = 0,
         currentFirstSessionDate,
       } = user;
 
       try {
-        // Get totals from ClickHouse (OTEL data only)
+        // Get totals from ClickHouse — the only source there is.
         const totals = await clickhouse.getUserTotals(userId);
-        const otelTotals = totals[0];
-
-        // Even if no OTEL data yet, we still have legacy data to show
-        const hasOtelData = !!otelTotals;
-        const userTotals = otelTotals || {
+        const chTotals = totals[0];
+        const userTotals = chTotals || {
           total_prompts: 0,
           total_tokens: 0,
           total_input_tokens: 0,
@@ -258,148 +233,85 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
           avg_prompt_length: 0,
         };
 
-        if (!hasOtelData && legacyPrompts === 0) {
+        if (!chTotals) {
           console.log(`[sync] No data yet for user ${userId}`);
           continue;
         }
 
-        // ═══════════════════════════════════════════════════════════════════════
-        // BULLETPROOF STREAK CALCULATION
-        // Merge dates from BOTH sources to get accurate streaks across transition
-        // ═══════════════════════════════════════════════════════════════════════
+        // Active days come from ClickHouse alone — the imported pre-OTEL days
+        // are in there, so a streak that spans the OTEL transition is just a
+        // streak now, with no two sources to reconcile.
+        const dailyData = await clickhouse.getUserDailyMetrics(userId, 365);
+        const activeDates = dailyData.map((d) => d.date);
+        const streaks = calculateStreaks(activeDates);
 
-        // Get dates from ClickHouse (OTEL data, post-enable)
-        const otelDailyData = await clickhouse.getUserDailyMetrics(userId, 365);
-        const otelDates = otelDailyData.map((d) => d.date);
+        const hourCounts = await getUserHourlyCounts(userId);
+        const longestSession = await getLongestSessionMessages(userId);
+        const toolCalls = await clickhouse.getUserTotalToolCalls(userId);
 
-        // Get dates from SQLite dailyStats (legacy data, pre-enable)
-        const legacyDailyActivity = await db
-          .select({ date: dailyStats.date })
-          .from(dailyStats)
-          .where(eq(dailyStats.userId, userId));
-        const legacyDates = legacyDailyActivity.map((d) => d.date);
+        // longestStreak keeps a max with the stored value: a user may have
+        // history older than the 365-day window this query reads.
+        const finalLongestStreak = Math.max(streaks.longestStreak, existingLongestStreak ?? 0);
 
-        // Merge all dates (deduplicated) for accurate streak calculation
-        const allDates = [...new Set([...legacyDates, ...otelDates])];
-        const mergedStreaks = calculateStreaks(allDates);
-
-        // Get hourly counts from OTEL
-        const otelHourCounts = await getUserHourlyCounts(userId);
-        const hasOtelHourCounts = Object.keys(otelHourCounts).length > 0;
-
-        // Get longest session messages from OTEL
-        const otelLongestSession = await getLongestSessionMessages(userId);
-
-        // Get total tool calls from OTEL
-        const otelToolCalls = await clickhouse.getUserTotalToolCalls(userId);
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // CRITICAL: Use legacyHourCounts (frozen at OTEL enable) + fresh OTEL data
-        // DO NOT use currentHourCounts - it gets corrupted by repeated additions
-        // ═══════════════════════════════════════════════════════════════════════
-
-        // Parse legacy hourCounts (frozen at OTEL enable time)
-        let parsedLegacyHourCounts: Record<string, number> = {};
-        try {
-          parsedLegacyHourCounts = legacyHourCounts ? JSON.parse(legacyHourCounts) : {};
-        } catch {
-          parsedLegacyHourCounts = {};
-        }
-
-        // Merge hourCounts: legacy (frozen) + OTEL (fresh from ClickHouse)
-        // This correctly combines pre-OTEL CLI data with post-OTEL data
-        const finalHourCounts: Record<string, number> = { ...parsedLegacyHourCounts };
-        for (const [hour, count] of Object.entries(otelHourCounts)) {
-          finalHourCounts[hour] = (finalHourCounts[hour] || 0) + count;
-        }
-
-        // Streaks: Use merged calculation (combines legacy + OTEL dates)
-        // currentStreak: Use merged value directly (it's authoritative)
-        // longestStreak: Use max with existing (in case user has >365 day history we can't see)
-        const finalCurrentStreak = mergedStreaks.currentStreak;
-        const finalLongestStreak = Math.max(mergedStreaks.longestStreak, existingLongestStreak ?? 0);
-
-        // Longest session: Use max of OTEL vs existing
-        const finalLongestSession = Math.max(otelLongestSession, currentLongestSession ?? 0);
-
-        // First session date: Prefer existing, fall back to earliest from merged dates
-        const finalFirstSessionDate = currentFirstSessionDate || (allDates.length > 0 ? [...allDates].sort()[0] : undefined);
+        // First session date: prefer the stored one (it can predate the
+        // 365-day window), else the earliest day ClickHouse knows about.
+        const finalFirstSessionDate =
+          currentFirstSessionDate || (activeDates.length > 0 ? [...activeDates].sort()[0] : undefined);
 
         // Get user rank from pre-calculated lookup
         const userRank = rankLookup.get(userId) ?? allUsers.length;
 
-      // ═══════════════════════════════════════════════════════════════════════
-      // CRITICAL: Combine OTEL totals with legacy snapshot
-      // This preserves complete user history across the transition
-      // ═══════════════════════════════════════════════════════════════════════
-      const combinedPrompts = Math.round(userTotals.total_prompts) + (legacyPrompts ?? 0);
-      const combinedTokens = Math.round(userTotals.total_tokens) + (legacyTokens ?? 0);
-      const combinedCostCents = Math.round(userTotals.total_cost_usd * 100) + (legacyCostCents ?? 0);
-      const combinedLines = Math.round(userTotals.total_lines_added) + (legacyLines ?? 0);
-      const combinedCommits = Math.round(userTotals.total_commits) + (legacyCommits ?? 0);
+      // Totals are ClickHouse's answer, rounded. Nothing is added on top.
+      const totalPrompts = Math.round(userTotals.total_prompts);
+      const totalTokens = Math.round(userTotals.total_tokens);
+      const totalCostCents = Math.round(userTotals.total_cost_usd * 100);
+      const totalLines = Math.round(userTotals.total_lines_added);
+      const totalCommits = Math.round(userTotals.total_commits);
 
-      // Token breakdown: OTEL + legacy (for TokenOrbit visualization)
-      const combinedInputTokens = Math.round(userTotals.total_input_tokens || 0) + (legacyInputTokens ?? 0);
-      const combinedOutputTokens = Math.round(userTotals.total_output_tokens || 0) + (legacyOutputTokens ?? 0);
-      const combinedCacheReadTokens = Math.round(userTotals.total_cache_read_tokens || 0) + (legacyCacheReadTokens ?? 0);
-      const combinedCacheCreationTokens = Math.round(userTotals.total_cache_write_tokens || 0) + (legacyCacheCreationTokens ?? 0);
-
-      // Combined tool calls: OTEL + legacy
-      const combinedToolCalls = otelToolCalls + (legacyToolCalls ?? 0);
-
-      // Compute badges with COMBINED totals and PRESERVED metadata
       const badges = computeBadges({
-        totalMessages: combinedPrompts,
-        totalToolCalls: combinedToolCalls,
-        currentStreak: finalCurrentStreak,
+        totalMessages: totalPrompts,
+        totalToolCalls: toolCalls,
+        currentStreak: streaks.currentStreak,
         longestStreak: finalLongestStreak,
-        longestSessionMessages: finalLongestSession,
-        hourCounts: finalHourCounts,
+        longestSessionMessages: longestSession,
+        hourCounts,
         userRank: userRank > 0 ? userRank : undefined,
       });
 
-      // Update SQLite with COMBINED totals and PRESERVED metadata
+      // users.total_* is a cache of the ClickHouse figures above, nothing more.
       await db
         .update(users)
         .set({
-          // COMBINED totals (OTEL from ClickHouse + legacy snapshot)
-          totalPrompts: combinedPrompts,
-          totalTokens: combinedTokens,
-          totalCostCents: combinedCostCents,
-          totalLinesAdded: combinedLines,
-          totalCommits: combinedCommits,
-          totalPrs: Math.round(userTotals.total_prs), // No legacy PRs tracked
-          totalActiveSeconds: Math.round(userTotals.total_active_seconds), // OTEL only
-          avgPromptLength: Math.round(userTotals.avg_prompt_length), // OTEL only
+          totalPrompts,
+          totalTokens,
+          totalCostCents,
+          totalLinesAdded: totalLines,
+          totalCommits,
+          totalPrs: Math.round(userTotals.total_prs),
+          totalActiveSeconds: Math.round(userTotals.total_active_seconds),
+          avgPromptLength: Math.round(userTotals.avg_prompt_length),
 
-          // Token breakdown (for TokenOrbit visualization)
-          totalInputTokens: combinedInputTokens,
-          totalOutputTokens: combinedOutputTokens,
-          totalCacheReadTokens: combinedCacheReadTokens,
-          totalCacheCreationTokens: combinedCacheCreationTokens,
+          totalInputTokens: Math.round(userTotals.total_input_tokens || 0),
+          totalOutputTokens: Math.round(userTotals.total_output_tokens || 0),
+          totalCacheReadTokens: Math.round(userTotals.total_cache_read_tokens || 0),
+          totalCacheCreationTokens: Math.round(userTotals.total_cache_write_tokens || 0),
 
-          // Streak data (max of OTEL vs CLI-synced)
-          currentStreak: finalCurrentStreak,
+          currentStreak: streaks.currentStreak,
           longestStreak: finalLongestStreak,
 
-          // Badge-related (preserve CLI-synced if OTEL has no data)
-          longestSessionMessages: finalLongestSession,
-          hourCounts: JSON.stringify(finalHourCounts),
+          longestSessionMessages: longestSession,
+          hourCounts: JSON.stringify(hourCounts),
           badges: JSON.stringify(badges),
 
-          // First session date (prefer CLI-synced)
           firstSessionDate: finalFirstSessionDate,
 
-          // Update timestamp
           updatedAt: new Date(),
         })
         .where(eq(users.id, userId));
 
         synced++;
-        const otelPrompts = Math.round(userTotals.total_prompts);
-        const otelCost = userTotals.total_cost_usd;
         console.log(
-          `[sync] Updated user ${userId}: ${combinedPrompts} prompts (${otelPrompts} OTEL + ${legacyPrompts} legacy), $${(combinedCostCents / 100).toFixed(2)} total`
+          `[sync] Updated user ${userId}: ${totalPrompts} prompts, $${(totalCostCents / 100).toFixed(2)}`
         );
       } catch (error) {
         errors++;

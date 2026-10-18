@@ -77,3 +77,45 @@ describe('TtlCache', () => {
     expect(cache.get('b')).toBeUndefined();
   });
 });
+
+describe('remember(shouldCache)', () => {
+  it('serves a rejected value without remembering it', async () => {
+    const cache = new TtlCache<{ ok: boolean; n: number }>(60_000);
+    let builds = 0;
+    const build = async () => ({ ok: false, n: ++builds });
+    const keep = (v: { ok: boolean }) => v.ok;
+
+    expect(await cache.remember('k', build, keep)).toEqual({ ok: false, n: 1 });
+    expect(cache.get('k')).toBeUndefined();
+    // Next request retries rather than serving the degraded value for a minute.
+    expect(await cache.remember('k', build, keep)).toEqual({ ok: false, n: 2 });
+    expect(builds).toBe(2);
+  });
+
+  it('remembers an accepted value as usual', async () => {
+    const cache = new TtlCache<{ ok: boolean; n: number }>(60_000);
+    let builds = 0;
+    const build = async () => ({ ok: true, n: ++builds });
+    const keep = (v: { ok: boolean }) => v.ok;
+
+    expect(await cache.remember('k', build, keep)).toEqual({ ok: true, n: 1 });
+    expect(await cache.remember('k', build, keep)).toEqual({ ok: true, n: 1 });
+    expect(builds).toBe(1);
+  });
+
+  it('still single-flights a value it will not cache', async () => {
+    const cache = new TtlCache<{ ok: boolean }>(60_000);
+    let builds = 0;
+    const build = async () => {
+      builds++;
+      await Promise.resolve();
+      return { ok: false };
+    };
+    const [a, b] = await Promise.all([
+      cache.remember('k', build, v => v.ok),
+      cache.remember('k', build, v => v.ok),
+    ]);
+    expect(a).toBe(b);
+    expect(builds).toBe(1);
+  });
+});

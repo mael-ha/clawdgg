@@ -336,3 +336,167 @@ describe('fillPromptGapsFromHistory', () => {
       .toHaveLength(1);
   });
 });
+
+describe('one prompt rule, every source', () => {
+  // Real shapes, taken verbatim from ~/.claude/projects/**/*.jsonl on
+  // 2026-10-18. Claude Code wraps a dispatched command in tags, and the
+  // command-name tag is not always first.
+  it.each([
+    '<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>',
+    '<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>claude-fable-5</command-args>',
+    '<command-message>rename</command-message>\n<command-name>/rename</command-name>',
+  ])('detects a built-in command wrapped in <command-name> tags', text => {
+    expect(isBuiltinSlashCommand(text)).toBe(true);
+  });
+
+  it('keeps a wrapped custom or workflow command — those reach a model', () => {
+    // /init and /code-review are bundled workflow commands, not session
+    // management: they do real work, so they count exactly like a typed prompt.
+    expect(isBuiltinSlashCommand('<command-message>init</command-message>\n<command-name>/init</command-name>')).toBe(false);
+    expect(isBuiltinSlashCommand('<command-name>/code-review</command-name>')).toBe(false);
+    expect(isBuiltinSlashCommand('<command-name>/my-own-thing</command-name>')).toBe(false);
+  });
+
+  it('drops built-in slash prompts from JSONL by DEFAULT', () => {
+    const line = {
+      type: 'user',
+      timestamp: '2026-10-18T09:00:00.000Z',
+      sessionId: 's1',
+      message: { content: '<command-name>/compact</command-name>' },
+    };
+    // No excludeBuiltinSlashPrompts passed at all.
+    const dropped = mapLine(line, { userId: 'u', provenance: 'backfill', sessionFallback: 's1', isSubagentFile: false });
+    expect(dropped.events).toHaveLength(0);
+
+    // And an explicit false still counts it, for a deliberate comparison run.
+    const kept = mapLine(line, {
+      userId: 'u',
+      provenance: 'backfill',
+      sessionFallback: 's1',
+      isSubagentFile: false,
+      excludeBuiltinSlashPrompts: false,
+    });
+    expect(kept.events).toHaveLength(1);
+  });
+
+  it('keeps a free-typed prompt and a custom command from JSONL', () => {
+    const base = { userId: 'u', provenance: 'backfill' as const, sessionFallback: 's1', isSubagentFile: false };
+    for (const content of ['just a normal prompt', '<command-name>/code-review</command-name>']) {
+      const out = mapLine(
+        { type: 'user', timestamp: '2026-10-18T09:00:00.000Z', sessionId: 's1', message: { content } },
+        base
+      );
+      expect(out.events).toHaveLength(1);
+      expect(out.events[0]!.event_name).toBe('claude_code.user_prompt');
+    }
+  });
+
+  it('applies drop-builtin to history.jsonl by DEFAULT', () => {
+    const raw = [
+      { timestamp: Date.parse('2026-10-18T09:00:00Z'), display: '/compact', sessionId: 's1' },
+      { timestamp: Date.parse('2026-10-18T09:01:00Z'), display: '/code-review', sessionId: 's1' },
+      { timestamp: Date.parse('2026-10-18T09:02:00Z'), display: 'a typed prompt', sessionId: 's1' },
+      { timestamp: Date.parse('2026-10-18T09:03:00Z'), display: '<command-name>/model</command-name>', sessionId: 's1' },
+    ]
+      .map(r => JSON.stringify(r))
+      .join('\n');
+
+    // No slashPolicy passed at all.
+    const out = mapHistoryText(raw, { userId: 'u', provenance: 'backfill-history' });
+    expect(out.events).toHaveLength(2); // /code-review + the typed prompt
+    expect(out.droppedSlash).toBe(2);   // /compact + the wrapped /model
+  });
+
+  it('still supports drop-all for comparing against a historical run', () => {
+    const raw = JSON.stringify({
+      timestamp: Date.parse('2026-10-18T09:00:00Z'),
+      display: '/code-review',
+      sessionId: 's1',
+    });
+    const out = mapHistoryText(raw, {
+      userId: 'u',
+      provenance: 'backfill-history',
+      slashPolicy: 'drop-all',
+    });
+    expect(out.events).toHaveLength(0);
+    expect(out.droppedSlash).toBe(1);
+  });
+});
+
+describe('fast-mode speed reaches the rows', () => {
+  const line = (speed: string | undefined) => ({
+    type: 'assistant',
+    timestamp: '2026-10-18T09:00:00.000Z',
+    sessionId: 's1',
+    message: {
+      model: 'claude-opus-5-5',
+      usage: {
+        input_tokens: 1_000_000,
+        output_tokens: 0,
+        ...(speed === undefined ? {} : { speed }),
+      },
+    },
+  });
+
+  const opts = { userId: 'u', provenance: 'backfill' as const, sessionFallback: 's1', isSubagentFile: false };
+
+  it('prices Opus 5.5 fast mode at $8/MTok and records the speed', () => {
+    const out = mapLine(line('fast'), opts);
+    const apiRequest = out.events.find(e => e.event_name === 'claude_code.api_request')!;
+    expect(apiRequest.speed).toBe('fast');
+    expect(apiRequest.cost_usd).toBeCloseTo(8, 6);
+    expect(out.metrics.every(m => m.speed === 'fast')).toBe(true);
+  });
+
+  it('prices standard and absent speed at the standard $4/MTok', () => {
+    for (const speed of ['standard', undefined]) {
+      const apiRequest = mapLine(line(speed), opts).events.find(
+        e => e.event_name === 'claude_code.api_request'
+      )!;
+      expect(apiRequest.cost_usd).toBeCloseTo(4, 6);
+    }
+  });
+});
+
+describe('Haiku 5.5 prompt-length tier reaches the rows', () => {
+  const haikuLine = (inputTokens: number) => ({
+    type: 'assistant',
+    timestamp: '2026-10-18T09:00:00.000Z',
+    sessionId: 's1',
+    message: {
+      model: 'claude-haiku-5-5',
+      usage: { input_tokens: inputTokens, output_tokens: 0 },
+    },
+  });
+
+  const opts = { userId: 'u', provenance: 'backfill' as const, sessionFallback: 's1', isSubagentFile: false };
+
+  it('uses the standard tier at 100K input tokens', () => {
+    const cost = mapLine(haikuLine(100_000), opts).events[0]!.cost_usd!;
+    expect(cost).toBeCloseTo(100_000 * 0.1 / 1e6, 10);
+  });
+
+  it('uses the 5x tier just above 100K', () => {
+    const cost = mapLine(haikuLine(100_001), opts).events[0]!.cost_usd!;
+    expect(cost).toBeCloseTo(100_001 * 0.5 / 1e6, 10);
+  });
+
+  it('counts cache reads toward the prompt length, per the pricing page', () => {
+    // 60K fresh + 60K cache read = 120K prompt, over the threshold even though
+    // neither category alone is.
+    const out = mapLine(
+      {
+        type: 'assistant',
+        timestamp: '2026-10-18T09:00:00.000Z',
+        sessionId: 's1',
+        message: {
+          model: 'claude-haiku-5-5',
+          usage: { input_tokens: 60_000, output_tokens: 0, cache_read_input_tokens: 60_000 },
+        },
+      },
+      opts
+    );
+    // priced at the high tier: 60000*0.50 + 60000*0.05 per MTok
+    expect(out.events[0]!.cost_usd).toBeCloseTo((60_000 * 0.5 + 60_000 * 0.05) / 1e6, 10);
+  });
+});
