@@ -898,7 +898,6 @@ export function boardRowFor(
   evidence: ClassEvidence | undefined,
   change: number | undefined
 ): BoardRow {
-  const figure = figures ?? emptyFigures(user.userId, user.streak);
   const row: BoardRow = {
     rank: entry.rank,
     userId: entry.userId,
@@ -913,7 +912,10 @@ export function boardRowFor(
     const label = classFromEvidence(evidence);
     if (label) row.classLabel = label;
   }
-  if (user.visibility.ultrathink) row.ultrathinks = figure.ultrathinks;
+  // No figures means they could not be READ, which is not the same as zero —
+  // during a ClickHouse outage the streak board still ranks, and the 🌈 column
+  // beside it goes blank instead of claiming everyone has none.
+  if (user.visibility.ultrathink && figures) row.ultrathinks = figures.ultrathinks;
   if (user.visibility.curve) row.streak = user.streak;
   return row;
 }
@@ -965,12 +967,17 @@ async function buildBoardPage(options: BoardQuery): Promise<BoardPage> {
 
   const boardUsers = await loadBoardUsers();
 
-  let figures: Map<string, BoardFigures>;
+  // A ClickHouse outage is not a reason to show nothing: the streak board is
+  // read from SQLite and stays correct, and the other three come out empty
+  // rather than wrong. `complete` goes false either way, so the page says so
+  // and nothing is cached.
+  let figures = new Map<string, BoardFigures>();
+  let complete = true;
   try {
     figures = await fetchFigures(scope, boardUsers, now);
   } catch (error) {
     console.error('[boards] figures unavailable:', error);
-    return { ...base, rows: [], total: 0, comparedTo: null, complete: false };
+    complete = false;
   }
 
   const ranked = rankBoard(board, boardUsers, figures);
@@ -981,7 +988,6 @@ async function buildBoardPage(options: BoardQuery): Promise<BoardPage> {
     .filter((user): user is BoardUser => !!user);
 
   let evidence = new Map<string, ClassEvidence>();
-  let complete = true;
   try {
     evidence = await fetchClassEvidence(pageUsers, now);
   } catch (error) {

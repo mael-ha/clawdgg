@@ -418,6 +418,17 @@ describe('boardRowFor', () => {
     expect(row.change).toBeUndefined();
   });
 
+  /**
+   * An unreadable figure is not a zero. With ClickHouse down the streak board
+   * still ranks off SQLite, and the 🌈 column beside it has to go blank rather
+   * than tell everyone they have none.
+   */
+  it('leaves out the ultrathink figure when the figures could not be read', () => {
+    const row = boardRowFor('streak', entry, boardUser('a', { streak: 19 }), undefined, evidence, undefined);
+    expect(row.ultrathinks).toBeUndefined();
+    expect(row.streak).toBe(19);
+  });
+
   it('has no clock at all when the class evidence could not be read', () => {
     const row = boardRowFor('value', entry, boardUser('a'), figure, undefined, undefined);
     expect(row.hours).toBeUndefined();
