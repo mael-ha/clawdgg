@@ -15,6 +15,11 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # The 24.3 line production runs. Bump both this and the compose image
+  # together, or the tests stop describing the engine prod has.
+  CLICKHOUSE_VERSION: "24.3.18.7"
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -33,8 +38,45 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
+      # The ClickHouse-backed suites (docker/clickhouse/migrations) assert what
+      # the DATABASE computes — that ClickHouse's row_id expression agrees with
+      # the TypeScript hash, that the repair migration moves the rows it claims
+      # to. Without a binary they SKIP, which is 20 tests that have never run
+      # anywhere but a laptop. This is clickhouse-local: one static binary, no
+      # server and no Docker.
+      - name: Cache the ClickHouse binary
+        id: clickhouse-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/clickhouse
+          # The version is in the key, so a bump downloads instead of serving
+          # the old binary from a warm cache.
+          key: clickhouse-${{ env.CLICKHOUSE_VERSION }}-amd64
+
+      - name: Download the ClickHouse binary
+        if: steps.clickhouse-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.cache/clickhouse
+          # Pinned, and pinned to the 24.3 line production runs
+          # (clickhouse/clickhouse-server:24.3-alpine): a test that passes
+          # against a different engine than prod's proves less than it looks.
+          url="https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}-lts/clickhouse-common-static-${CLICKHOUSE_VERSION}-amd64.tgz"
+          curl --proto '=https' --tlsv1.2 -fsSL "$url" -o /tmp/clickhouse.tgz
+          tar -xzf /tmp/clickhouse.tgz -C ~/.cache/clickhouse --strip-components=3 \
+            "clickhouse-common-static-${CLICKHOUSE_VERSION}/usr/bin/clickhouse"
+          rm -f /tmp/clickhouse.tgz
+          chmod +x ~/.cache/clickhouse/clickhouse
+
       - name: Tests
-        run: bun test
+        run: |
+          set -euo pipefail
+          # $HOME is not available to a step-level `env:`, so the path is built
+          # here. A binary that cannot run is a failure, not a reason to skip:
+          # silently skipping is the state this step exists to end.
+          export CLICKHOUSE_BIN="$HOME/.cache/clickhouse/clickhouse"
+          "$CLICKHOUSE_BIN" local --query 'SELECT version()'
+          bun test
 
       # The repo carries pre-existing type errors, so a hard `tsc --noEmit`
       # gate would fail every run. This fails only when a change ADDS one:
@@ -64,6 +106,15 @@ jobs:
           echo "::error::New TypeScript errors introduced:"
           echo "$NEW"
           exit 1
+
+      # The SQLite chain must replay into the schema src/db/schema.ts
+      # describes. It did not for ten months — a journal naming a file that had
+      # been renamed, two hand-written migrations with no breakpoint markers,
+      # three columns in a file no journal entry pointed at — and no test could
+      # see any of it, because the app and the tests run against a database
+      # that was migrated by other means.
+      - name: Migrations replay from zero
+        run: bun scripts/check-migrations.ts
 
       # The app's own build. A page that renders without its stylesheet is a
       # broken deploy, and the manifest is what every template resolves its
