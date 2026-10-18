@@ -9,6 +9,7 @@ import { getModelDisplayName } from '../lib/pricing';
 import { isValidTimezone, normalizeTimezone } from '../lib/timezone';
 import { getFingerprint, type FingerprintData, type FingerprintSection } from '../lib/fingerprint';
 import { TtlCache } from '../lib/ttl-cache';
+import { rankChangesFor, type RankMetric } from '../lib/rank-snapshots';
 
 const api = new Hono();
 
@@ -119,7 +120,10 @@ api.get('/leaderboard', optionalAuth, async (c) => {
           COALESCE(u.total_cost_cents, 0) as costUsdCents
         FROM users u
         WHERE ${HAS_USAGE}
-        ORDER BY ${sql.raw(sortSpec.sqlite)} DESC
+        -- u.id is a TIEBREAKER, not decoration: without it two users on the
+        -- same total come back in an arbitrary order and the rank snapshot
+        -- shows both a phantom move every day (src/lib/rank-snapshots.ts).
+        ORDER BY ${sql.raw(sortSpec.sqlite)} DESC, u.id ASC
         LIMIT ${limit}
         OFFSET ${offset}
       `)) as any[];
@@ -128,16 +132,31 @@ api.get('/leaderboard', optionalAuth, async (c) => {
         SELECT COUNT(*) as count FROM users u WHERE ${HAS_USAGE}
       `)) as any[];
 
+      const entries = results.map((row, index) =>
+        toEntry(row, {
+          promptCount: Number(row.promptCount) || 0,
+          tokenCount: Number(row.tokenCount) || 0,
+          linesWritten: Number(row.linesWritten) || 0,
+          commitCount: Number(row.commitCount) || 0,
+          costUsdCents: Number(row.costUsdCents) || 0,
+        }, index)
+      );
+
+      // Movement since the last snapshot. All-time only — a period board ranks
+      // on a different question, so its rows get no arrow rather than one
+      // computed from an unrelated field.
+      const changes = await rankChangesFor(
+        sort as RankMetric,
+        entries.map((e) => e.userId),
+        new Map(entries.map((e) => [e.userId, e.rank]))
+      );
+      for (const entry of entries) {
+        const change = changes.get(entry.userId);
+        if (change !== undefined) entry.rankChange = change;
+      }
+
       const response: LeaderboardResponse = {
-        entries: results.map((row, index) =>
-          toEntry(row, {
-            promptCount: Number(row.promptCount) || 0,
-            tokenCount: Number(row.tokenCount) || 0,
-            linesWritten: Number(row.linesWritten) || 0,
-            commitCount: Number(row.commitCount) || 0,
-            costUsdCents: Number(row.costUsdCents) || 0,
-          }, index)
-        ),
+        entries,
         period,
         total: countResult[0]?.count || 0,
         page,

@@ -8,6 +8,7 @@ import type { LeaderboardEntry } from '../types';
 import { BADGES } from '../lib/badges';
 import { clickhouse, type LeaderboardSort } from '../db/clickhouse';
 import { formatCost, formatNumber, formatRelativeTime, formatTokens } from '../lib/format';
+import { rankChangesFor, rankOrdering } from '../lib/rank-snapshots';
 
 // Extend Hono types for our app
 type Variables = {
@@ -434,7 +435,10 @@ async function getLeaderboardData(period: Period, sort: SortKey, limit: number, 
     })
     .from(users)
     .where(HAS_USAGE)
-    .orderBy(desc(column.sqlite))
+    // The tiebreaker is load-bearing, not tidiness: without it two users on
+    // the same total come back in an arbitrary order, and the rank snapshot
+    // would show both a phantom move every day. src/lib/rank-snapshots.ts.
+    .orderBy(...rankOrdering(column.sqlite))
     .limit(limit)
     .offset(offset);
 
@@ -457,6 +461,18 @@ async function getLeaderboardData(period: Period, sort: SortKey, limit: number, 
     costUsdCents: row.totalCostCents || 0,
     lastActive: row.updatedAt ? new Date(row.updatedAt) : null,
   }));
+
+  // The arrows. Only on the all-time board, and only for users who were in the
+  // previous snapshot — see rankChangesFor for why a period board gets none.
+  const changes = await rankChangesFor(
+    sort,
+    entries.map(e => e.userId),
+    new Map(entries.map(e => [e.userId, e.rank]))
+  );
+  for (const entry of entries) {
+    const change = changes.get(entry.userId);
+    if (change !== undefined) entry.rankChange = change;
+  }
 
   return { entries, total: countResult[0]?.count || 0 };
 }

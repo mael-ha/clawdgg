@@ -24,6 +24,7 @@ import { db } from '../db';
 import { users } from '../db/schema';
 import { clickhouse, query, LOCAL_TS_SQL, NO_LEGACY_SQL, PROMPT_EVENT_SQL } from '../db/clickhouse';
 import { normalizeTimezone } from '../lib/timezone';
+import { pruneRankSnapshots, snapshotRanks } from '../lib/rank-snapshots';
 import { computeBadges } from '../lib/badges';
 import { eq } from 'drizzle-orm';
 
@@ -327,6 +328,20 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         errors++;
         console.error(`[sync] Error syncing user ${userId}:`, error);
       }
+    }
+
+    // Where everyone stands today, recorded once per UTC day. It runs AFTER
+    // the loop above, so the snapshot is of the same totals the leaderboard is
+    // about to show rather than of the ones it had five minutes ago. A failure
+    // here costs the board its arrows, not its numbers, so it is caught.
+    try {
+      const written = await snapshotRanks();
+      if (written > 0) {
+        console.log(`[sync] Rank snapshot written: ${written} rows`);
+        await pruneRankSnapshots();
+      }
+    } catch (error) {
+      console.error('[sync] Rank snapshot failed:', error);
     }
 
     const duration = Date.now() - startTime;

@@ -205,6 +205,63 @@ export const planUsageSnapshots = sqliteTable('plan_usage_snapshots', {
   ),
 }));
 
+// One row per user, per leaderboard metric, per UTC day: where they stood.
+//
+// This exists so the board can show which way someone is MOVING, which is not
+// a question any current total can answer — a rank is a position in a field,
+// and yesterday's field is gone unless it was written down.
+//
+// At most one row per (user, day, metric), enforced here rather than in the
+// job: the sync runs every five minutes, so "once a day" has to be a property
+// of the table or it is a race. `value` is stored beside the rank so a
+// surprising arrow can be traced to the figure behind it.
+export const rankSnapshots = sqliteTable('rank_snapshots', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  userId: text('user_id')
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  day: text('day').notNull(), // YYYY-MM-DD, UTC
+  metric: text('metric').notNull(), // prompts | tokens | lines | commits | cost
+  rank: integer('rank').notNull(), // 1 = first
+  value: integer('value').notNull(), // the figure ranked on, for traceability
+  capturedAt: integer('captured_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, (table) => ({
+  userDayMetricIdx: uniqueIndex('rank_snapshot_user_day_metric_idx').on(
+    table.userId,
+    table.day,
+    table.metric
+  ),
+  dayMetricIdx: index('rank_snapshot_day_metric_idx').on(table.day, table.metric),
+}));
+
+// Which sections of their profile a user shows. All ON by default: a profile is
+// public, and the toggles exist so the owner can take one down — not so they
+// have to opt in to being visible.
+//
+// One row per user, one column per section, rather than a JSON blob: a column
+// can be queried, defaulted and migrated, and a blob with a typo in a key
+// silently reads as "hidden".
+export const profileSettings = sqliteTable('profile_settings', {
+  userId: text('user_id')
+    .primaryKey()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  showValue: integer('show_value', { mode: 'boolean' }).notNull().default(true),
+  showAnatomy: integer('show_anatomy', { mode: 'boolean' }).notNull().default(true),
+  showConversation: integer('show_conversation', { mode: 'boolean' }).notNull().default(true),
+  showRings: integer('show_rings', { mode: 'boolean' }).notNull().default(true),
+  showClass: integer('show_class', { mode: 'boolean' }).notNull().default(true),
+  showMilestones: integer('show_milestones', { mode: 'boolean' }).notNull().default(true),
+  showCurve: integer('show_curve', { mode: 'boolean' }).notNull().default(true),
+  showYear: integer('show_year', { mode: 'boolean' }).notNull().default(true),
+  showUltrathink: integer('show_ultrathink', { mode: 'boolean' }).notNull().default(true),
+  showPlan: integer('show_plan', { mode: 'boolean' }).notNull().default(true),
+  updatedAt: integer('updated_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+});
+
 // Export types
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
@@ -216,3 +273,7 @@ export type DeviceToken = typeof deviceTokens.$inferSelect;
 export type NewDeviceToken = typeof deviceTokens.$inferInsert;
 export type PlanUsageSnapshot = typeof planUsageSnapshots.$inferSelect;
 export type NewPlanUsageSnapshot = typeof planUsageSnapshots.$inferInsert;
+export type RankSnapshot = typeof rankSnapshots.$inferSelect;
+export type NewRankSnapshot = typeof rankSnapshots.$inferInsert;
+export type ProfileSettings = typeof profileSettings.$inferSelect;
+export type NewProfileSettings = typeof profileSettings.$inferInsert;
