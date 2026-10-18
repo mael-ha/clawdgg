@@ -604,6 +604,22 @@ export const PROMPT_EVENT_SQL =
 export const NO_LEGACY_SQL = `provenance != 'legacy'`;
 
 /**
+ * MANDATORY on every FULL OUTER JOIN in this file. Not a tuning knob.
+ *
+ * ClickHouse's default fills an unmatched side with the column's DEFAULT, not
+ * with NULL — so `COALESCE(e.user_id, m.user_id)` returns `''` for a user who
+ * has metric rows and no events, and `COALESCE(e.date, m.date)` returns
+ * `1970-01-01`. Both were happening: a metrics-only day came back dated 1970,
+ * which the sync job then stored as the user's first session, and a
+ * metrics-only user came back under the empty user id. Verified against a real
+ * clickhouse-local: the same join reads `('', 1970-01-01)` by default and
+ * `('u2', 2026-09-01)` with this setting.
+ *
+ * src/db/join-nulls.test.ts asserts no FULL OUTER JOIN here is missing it.
+ */
+export const JOIN_NULLS_SETTING = `SETTINGS join_use_nulls = 1`;
+
+/**
  * A prompt that contained the word "ultrathink", recorded WITHOUT its text.
  *
  * These are synthetic rows: there is no such OTEL event. A local Claude Code
@@ -618,6 +634,40 @@ export const NO_LEGACY_SQL = `provenance != 'legacy'`;
  */
 export { ULTRATHINK_EVENT_NAME };
 export const ULTRATHINK_EVENT_SQL = `event_name = '${ULTRATHINK_EVENT_NAME}'`;
+
+/**
+ * Only the events Claude Code itself emitted.
+ *
+ * USE THIS wherever a query's POPULATION comes out of events_raw — the user set
+ * on a board, the date set behind a streak, a "has this person used it" check.
+ * The synthetic ultrathink rows are in the same table with a `clawdgg.` prefix,
+ * and while no COUNT includes them (every count names a `claude_code.*` event),
+ * a bare `GROUP BY user_id` or `GROUP BY toDate(timestamp)` does: a flag on a
+ * day with no prompts manufactured an active day, and a user whose only row is
+ * a flag was an entrant on the leaderboard with zeroes across the board.
+ */
+export const CLAUDE_CODE_EVENT_SQL = `startsWith(event_name, 'claude_code.')`;
+
+/**
+ * Ultrathink flags, CAPPED AT ONE PER PROMPT PER DAY. The ONE definition.
+ *
+ * A flag is a synthetic row a local hook posts, so nothing in the transport
+ * stops a client from sending more of them than it sent prompts — and an
+ * uncapped count ranks whoever scripted the hook hardest, while a share of
+ * prompts could read over 100%. `least(flags, prompts)` per user per day cannot
+ * exceed what that day's prompts could have carried, and it costs an honest
+ * user nothing: for them flags <= prompts holds on every day already, so the
+ * capped total and the raw total are the same number.
+ *
+ * It is a per-(user, day) AGGREGATE expression, not a whole query, because the
+ * grouping is the caller's: the profile groups by the user's own local day, the
+ * boards by each user's local day via a multiIf offset, and the cross-user
+ * rarity comparison by UTC day (one query cannot hold a hundred zones). All
+ * three read the same expression — see fetchPeerTotals for why the UTC variant
+ * differs only for an abuser.
+ */
+export const CAPPED_ULTRATHINKS_SQL =
+  `least(countIf(${ULTRATHINK_EVENT_SQL}), countIf(${PROMPT_EVENT_SQL}))`;
 
 /**
  * `timestamp` in the user's own wall clock. Every hour-of-day, weekday and
@@ -687,7 +737,7 @@ export async function getUserTotals(userId?: string): Promise<UserTotals[]> {
           sumIf(prompt_length, ${PROMPT_EVENT_SQL} AND prompt_length > 0) as total_prompt_chars,
           countIf(${PROMPT_EVENT_SQL} AND prompt_length > 0) as total_measured_prompts
         FROM events_raw FINAL
-        ${whereClause}
+        ${whereClause ? `${whereClause} AND ${CLAUDE_CODE_EVENT_SQL}` : `WHERE ${CLAUDE_CODE_EVENT_SQL}`}
         GROUP BY user_id
       ),
       metric_stats AS (
@@ -722,6 +772,7 @@ export async function getUserTotals(userId?: string): Promise<UserTotals[]> {
       toFloat64(if(COALESCE(e.total_measured_prompts, 0) > 0, COALESCE(e.total_prompt_chars, 0) / e.total_measured_prompts, 0)) as avg_prompt_length
     FROM event_stats e
     FULL OUTER JOIN metric_stats m ON e.user_id = m.user_id
+    ${JOIN_NULLS_SETTING}
   `;
 
   return query<UserTotals>(sql, userId ? { userId } : undefined);
@@ -747,6 +798,10 @@ export async function getUserDailyMetrics(userId: string, days: number = 365): P
         FROM events_raw FINAL
         WHERE user_id = {userId:String}
           AND toDate(timestamp) >= today() - {days:UInt32}
+          -- The DATE SET, not just the count: an ultrathink flag on a day with
+          -- no prompts used to manufacture an active day here, which the sync
+          -- job then counted into a streak.
+          AND ${CLAUDE_CODE_EVENT_SQL}
         GROUP BY date
       ),
       daily_metrics AS (
@@ -786,9 +841,45 @@ export async function getUserDailyMetrics(userId: string, days: number = 365): P
     FROM daily_events e
     FULL OUTER JOIN daily_metrics m ON e.date = m.date
     ORDER BY date
+    ${JOIN_NULLS_SETTING}
   `;
 
   return query<DailyMetrics>(sql, { userId, days });
+}
+
+/**
+ * The local days a user actually sent a prompt on. ONE streak definition.
+ *
+ * A streak was computed three different ways: the sync job walked every UTC
+ * date `getUserDailyMetrics` returned (which included days with no prompts at
+ * all, and — before CLAUDE_CODE_EVENT_SQL — days whose only row was an
+ * ultrathink flag), while the profile's milestones walk LOCAL days with
+ * `prompts > 0`. Two numbers for one word is the thing the data-integrity rule
+ * forbids, so this is the definition and both callers read it.
+ *
+ * Local, because a streak is a run of DAYS AS THE USER LIVED THEM: a 23:00
+ * prompt in Paris is the previous UTC day, so a UTC streak breaks for someone
+ * who works late and never for someone who works early. `prompts > 0`, because
+ * a day Claude spent tokens on without being asked anything is not a day the
+ * user showed up — that is a background job, a retry or a subagent finishing.
+ */
+export async function getUserActiveLocalDays(
+  userId: string,
+  tz?: string,
+  days: number = 365
+): Promise<string[]> {
+  const rows = await query<{ date: string }>(
+    `SELECT toString(toDate(${LOCAL_TS_SQL})) as date
+     FROM events_raw FINAL
+     WHERE user_id = {userId:String}
+       AND toDate(timestamp) >= today() - {days:UInt32}
+       AND ${PROMPT_EVENT_SQL}
+     GROUP BY date
+     HAVING count() > 0
+     ORDER BY date`,
+    { userId, days, tz: normalizeTimezone(tz) }
+  );
+  return rows.map((row) => row.date);
 }
 
 /**
@@ -880,6 +971,10 @@ export async function getLeaderboard(
           countIf(${PROMPT_EVENT_SQL} AND prompt_length > 0) as total_measured_prompts
         FROM events_raw FINAL
         WHERE ${dateFilter}
+          -- The ENTRANT SET: a user whose only row in the period is an
+          -- ultrathink flag is not on the leaderboard with zeroes, they are
+          -- not on it. The count below already agreed; this makes the rows do.
+          AND ${CLAUDE_CODE_EVENT_SQL}
         GROUP BY user_id
       ),
       metric_stats AS (
@@ -914,9 +1009,15 @@ export async function getLeaderboard(
       toFloat64(if(COALESCE(e.total_measured_prompts, 0) > 0, COALESCE(e.total_prompt_chars, 0) / e.total_measured_prompts, 0)) as avg_prompt_length
     FROM event_stats e
     FULL OUTER JOIN metric_stats m ON e.user_id = m.user_id
-    ORDER BY ${sortColumn} DESC
+    -- user_id is a TIEBREAKER, not decoration: two users on the same total
+    -- come back in an arbitrary order without it, and the rank snapshot then
+    -- shows both of them a phantom move every day. Same ordering as the
+    -- all-time board's (src/routes/api.ts) and the snapshot's
+    -- (src/lib/rank-snapshots.ts), which is the point.
+    ORDER BY ${sortColumn} DESC, user_id ASC
     LIMIT {limit:UInt32}
     OFFSET {offset:UInt32}
+    ${JOIN_NULLS_SETTING}
   `;
 
   const entries = await query<UserTotals>(sql, { limit, offset });
@@ -966,6 +1067,7 @@ export async function getUserRank(
           countIf(${PROMPT_EVENT_SQL}) as total_prompts
         FROM events_raw FINAL
         WHERE ${dateFilter}
+          AND ${CLAUDE_CODE_EVENT_SQL}
         GROUP BY user_id
       ),
       metric_stats AS (
@@ -991,12 +1093,13 @@ export async function getUserRank(
       ranked AS (
         SELECT
           user_id,
-          row_number() OVER (ORDER BY ${sortColumn} DESC) as rank
+          row_number() OVER (ORDER BY ${sortColumn} DESC, user_id ASC) as rank
         FROM user_totals
       )
     SELECT toUInt64(rank) as rank, toUInt64((SELECT count() FROM ranked)) as total
     FROM ranked
     WHERE user_id = {userId:String}
+    ${JOIN_NULLS_SETTING}
   `;
 
   const result = await query<{ rank: number; total: number }>(sql, { userId });
@@ -1244,6 +1347,7 @@ export async function getUserVelocityTrend(userId: string, days: number = 30): P
         FROM events_raw FINAL
         WHERE user_id = {userId:String}
           AND toDate(timestamp) >= today() - {days:UInt32}
+          AND ${CLAUDE_CODE_EVENT_SQL}
         GROUP BY date
       ),
       daily_metrics AS (
@@ -1266,6 +1370,7 @@ export async function getUserVelocityTrend(userId: string, days: number = 30): P
     FROM daily_events e
     FULL OUTER JOIN daily_metrics m ON e.date = m.date
     ORDER BY date
+    ${JOIN_NULLS_SETTING}
   `;
 
   return query<DailyTrend>(sql, { userId, days });
@@ -1957,6 +2062,10 @@ export async function getUserProvenanceBreakdown(userId: string): Promise<Proven
                toString(max(toDate(timestamp))) as last_day
         FROM events_raw FINAL
         WHERE user_id = {userId:String}
+          -- A provenance whose only rows are ultrathink flags contributes no
+          -- prompt, no token and no dollar, so listing it as a source of the
+          -- numbers would be a row of zeroes claiming to explain something.
+          AND ${CLAUDE_CODE_EVENT_SQL}
         GROUP BY provenance
       ),
       metric_parts AS (
@@ -1977,6 +2086,7 @@ export async function getUserProvenanceBreakdown(userId: string): Promise<Proven
     FROM event_parts e
     FULL OUTER JOIN metric_parts m ON e.provenance = m.provenance
     ORDER BY prompts DESC, tokens DESC
+    ${JOIN_NULLS_SETTING}
   `;
 
   return query<ProvenanceBreakdown>(sql, { userId });
@@ -2040,6 +2150,7 @@ export const clickhouse = {
   insertEvents,
   getUserTotals,
   getUserDailyMetrics,
+  getUserActiveLocalDays,
   getUserModelUsage,
   getUserHourlyActivity,
   getLeaderboard,

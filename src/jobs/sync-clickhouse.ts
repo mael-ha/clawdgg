@@ -25,6 +25,7 @@ import { users } from '../db/schema';
 import { clickhouse, query, LOCAL_TS_SQL, NO_LEGACY_SQL, PROMPT_EVENT_SQL } from '../db/clickhouse';
 import { normalizeTimezone } from '../lib/timezone';
 import { pruneRankSnapshots, snapshotRanks } from '../lib/rank-snapshots';
+import { snapshotBoardRanks } from '../lib/boards';
 import { computeBadges } from '../lib/badges';
 import { eq } from 'drizzle-orm';
 
@@ -252,8 +253,14 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         // Active days come from ClickHouse alone — the imported pre-OTEL days
         // are in there, so a streak that spans the OTEL transition is just a
         // streak now, with no two sources to reconcile.
-        const dailyData = await clickhouse.getUserDailyMetrics(userId, 365);
-        const activeDates = dailyData.map((d) => d.date);
+        //
+        // getUserActiveLocalDays, not every date getUserDailyMetrics returns:
+        // that set included days with no prompt at all (a background retry, a
+        // subagent finishing) and days whose only row was an ultrathink flag,
+        // and it was in UTC, so a 23:00 prompt in Paris landed on the previous
+        // day and broke the streak of anyone who works late. One definition,
+        // shared with the profile's streak milestones — see the helper.
+        const activeDates = await clickhouse.getUserActiveLocalDays(userId, timezone, 365);
         const streaks = calculateStreaks(activeDates);
 
         const hourCounts = await getUserHourlyCounts(userId, timezone);
@@ -342,6 +349,18 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
       }
     } catch (error) {
       console.error('[sync] Rank snapshot failed:', error);
+    }
+
+    // The same thing for the boards, which rank on their own derived figures
+    // (leverage, value per prompt, …) rather than on users.total_*, so their
+    // positions cannot be read off the snapshot above. Once-per-UTC-day guarded
+    // by its own sentinel row and caught separately: without it the ▲▼ never
+    // appears, which is worth a log line and not a failed sync.
+    try {
+      const written = await snapshotBoardRanks();
+      if (written > 0) console.log(`[sync] Board rank snapshot written: ${written} rows`);
+    } catch (error) {
+      console.error('[sync] Board rank snapshot failed:', error);
     }
 
     const duration = Date.now() - startTime;

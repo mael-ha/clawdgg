@@ -59,11 +59,35 @@ export interface AssignedRank extends RankedUser {
  * leaderboard displays `offset + index + 1`, and a rank stored under a
  * different rule would disagree with the number next to the user's name. Same
  * metric, same number, everywhere.
+ *
+ * The tiebreaker is a BINARY comparison, not `localeCompare`. SQLite's `ORDER
+ * BY u.id ASC` and ClickHouse's `ORDER BY user_id ASC` both compare bytes, and
+ * `localeCompare` does not: it ignores case and punctuation differences that
+ * byte order does not, so `github_Z1` and `github_a1` come out in one order
+ * here and the other order on the board. Two users on the same total would then
+ * swap places in the snapshot without moving on the page, and both would be
+ * shown a ±1 arrow every single day. The ids are ASCII, so `<` is the whole
+ * rule the databases are using.
  */
 export function assignRanks(rows: RankedUser[]): AssignedRank[] {
   return [...rows]
-    .sort((a, b) => b.value - a.value || a.userId.localeCompare(b.userId))
+    .sort((a, b) => b.value - a.value || (a.userId < b.userId ? -1 : a.userId > b.userId ? 1 : 0))
     .map((row, index) => ({ ...row, rank: index + 1 }));
+}
+
+/**
+ * Who is ON the all-time board: anyone ClickHouse has usage for.
+ *
+ * The same rule the board itself applies (`HAS_USAGE` in src/routes/api.ts), and
+ * it has to be the same rule. snapshotRanks used to rank EVERY row in `users`,
+ * including everyone who signed in once and never ran Claude Code — so a user
+ * displayed at rank 12 was recorded at rank 40, and the morning after the first
+ * zero-usage signup the whole board appeared to move up by one. The arrow is a
+ * difference of two positions; the two positions have to be positions in the
+ * same field.
+ */
+export function hasUsage(row: { prompts: number | null; tokens: number | null }): boolean {
+  return (Number(row.prompts) || 0) > 0 || (Number(row.tokens) || 0) > 0;
 }
 
 /**
@@ -120,10 +144,13 @@ export async function snapshotRanks(
     })
     .from(users);
 
+  // Only the users the board shows — see hasUsage.
+  const entrants = rows.filter(hasUsage);
+
   const values: { userId: string; day: string; metric: string; rank: number; value: number }[] = [];
   for (const metric of RANK_METRIC_NAMES) {
     const ranked = assignRanks(
-      rows.map((row) => ({ userId: row.userId, value: Number(row[metric]) || 0 }))
+      entrants.map((row) => ({ userId: row.userId, value: Number(row[metric]) || 0 }))
     );
     for (const entry of ranked) {
       values.push({ userId: entry.userId, day, metric, rank: entry.rank, value: entry.value });

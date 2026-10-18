@@ -34,9 +34,9 @@ import { and, desc, eq, inArray, lt, sql } from 'drizzle-orm';
 import { db } from '../db';
 import { profileSettings, rankSnapshots, users, type ProfileSettings } from '../db/schema';
 import {
+  CAPPED_ULTRATHINKS_SQL,
   NO_LEGACY_SQL,
   PROMPT_EVENT_SQL,
-  ULTRATHINK_EVENT_SQL,
   query,
 } from '../db/clickhouse';
 import {
@@ -533,21 +533,6 @@ function localTsExpr(
   });
   return { expr: `timestamp + toIntervalMinute(multiIf(${branches.join(', ')}, 0))`, params };
 }
-
-/**
- * Ultrathink flags, CAPPED AT ONE PER PROMPT PER LOCAL DAY.
- *
- * A flag is a synthetic row a local hook posts (commit 1afec9d), so nothing
- * stops a client from sending more of them than it sent prompts. Uncapped,
- * the 🌈 board ranks whoever scripted the hook hardest. `least(flags, prompts)`
- * per user per local day is the read-side rule: it cannot exceed what the same
- * day's prompts could have carried, and it costs an honest user nothing.
- *
- * TODO: switch to the shared helper track D is adding to src/db/clickhouse.ts
- * once it lands, so the profile, the board and the sync job all apply one
- * definition rather than three copies of this expression.
- */
-const CAPPED_ULTRATHINKS_SQL = `least(countIf(${ULTRATHINK_EVENT_SQL}), countIf(${PROMPT_EVENT_SQL}))`;
 
 /**
  * Value, ultrathinks, output tokens and typed characters for every user, over
