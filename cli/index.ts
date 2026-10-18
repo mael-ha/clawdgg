@@ -11,6 +11,7 @@
 
 import { readFile, writeFile, mkdir, chmod, readdir, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import {
@@ -50,7 +51,15 @@ import {
   removeStatusLineSetting,
   type StatusLineMergeResult,
 } from "./statusline";
-import { isWellFormedToken, MISSING_TOKEN_MESSAGE, otelHeadersLine } from "./otel-headers";
+import {
+  deviceTokenId,
+  isDeviceToken,
+  isWellFormedToken,
+  MISSING_TOKEN_MESSAGE,
+  otelHeadersLine,
+  REVOKED_TOKEN_MESSAGE,
+} from "./otel-headers";
+import { clearTokenRevoked, isTokenRevoked, markTokenRevoked } from "./token-state";
 import { version } from "./version";
 
 // ANSI color codes
@@ -86,6 +95,8 @@ interface Config {
   token?: string;
   userId?: string;
   username?: string;
+  /** device_tokens.id of our own token — what `devices` marks as "this machine". */
+  deviceId?: string;
   /** ISO timestamp of the consent that enabled telemetry. */
   consentAt?: string;
   /** Values in ~/.claude/settings.json that `setup` displaced, for `disable`. */
@@ -204,6 +215,24 @@ async function fetchProfile(token: string): Promise<ProfileData | null> {
 
 // ============= LOGIN =============
 
+/**
+ * The server issues a device token before it can know what to call it (the
+ * token is minted in the browser's OAuth callback, not here), so the CLI names
+ * it the moment it has one. Cosmetic: a failure leaves it "unnamed device".
+ */
+async function nameThisDevice(config: Config): Promise<void> {
+  if (!config.token || !config.deviceId) return;
+  try {
+    await apiFetch(`/api/cli/devices/${config.deviceId}`, {
+      method: "PATCH",
+      token: config.token,
+      body: JSON.stringify({ name: hostname() }),
+    });
+  } catch {
+    // `clawdgg devices rename` is the manual path.
+  }
+}
+
 const DEVICE_POLL_INTERVAL_MS = 5_000;
 const DEVICE_MAX_WAIT_MS = 10 * 60 * 1000;
 /** Consecutive network failures tolerated while polling before we give up. */
@@ -271,9 +300,19 @@ async function initiateLogin(): Promise<Config> {
     if (response.ok) {
       const { token, userId, username } = await response.json();
       const previous = await loadConfig();
-      const config: Config = { ...previous, token, userId, username };
+      const config: Config = {
+        ...previous,
+        token,
+        userId,
+        username,
+        deviceId: deviceTokenId(token) ?? undefined,
+      };
       await saveConfig(config);
+      // A fresh token means whatever we recorded as revoked is history.
+      await clearTokenRevoked();
+      await nameThisDevice(config);
       log.success(`Linked! Welcome, ${colors.bright}${username}${colors.reset}`);
+      log.dim("    This machine has its own token — logging in elsewhere leaves it alone.");
       return config;
     }
 
@@ -559,9 +598,18 @@ async function cmdLogout(): Promise<void> {
   try {
     const response = await apiFetch("/api/cli/logout", { method: "POST", token: config.token });
     if (response.ok) {
-      log.success("Token revoked server-side.");
-      log.dim("    Revocation bumps your token generation, so EVERY clawdgg login");
-      log.dim("    on every machine is now logged out too.");
+      const result = (await response.json()) as { revokedAllDevices?: boolean };
+      if (result.revokedAllDevices) {
+        // Only a pre-2.0 token lands here: it has no device row, so the sole
+        // lever is the per-user generation bump.
+        log.success("Token revoked server-side.");
+        log.warn("That was a pre-2.0 token, which can only be revoked for every machine");
+        log.dim("    at once — so any other clawdgg login is logged out too. Re-run");
+        log.dim("    `clawdgg login` on each machine to get per-device tokens.");
+      } else {
+        log.success("This device's token is revoked. Your other machines keep streaming.");
+        log.dim("    `clawdgg devices revoke --all` is the log-out-everywhere button.");
+      }
     } else if (response.status === 401) {
       log.dim("Server already considered that token invalid.");
     } else {
@@ -591,6 +639,7 @@ async function cmdLogout(): Promise<void> {
   }
 
   await saveConfig({});
+  await clearTokenRevoked();
   log.success("Local credentials cleared.");
   console.log();
 }
@@ -602,7 +651,162 @@ async function cmdOtelHeaders(): Promise<void> {
     process.stderr.write(`${MISSING_TOKEN_MESSAGE}\n`);
     process.exit(1);
   }
+  // A token the server has already refused must FAIL here rather than be
+  // handed to the exporter, which would 401 every batch without telling anyone.
+  if (await isTokenRevoked(config.token)) {
+    process.stderr.write(`${REVOKED_TOKEN_MESSAGE}\n`);
+    process.exit(1);
+  }
   process.stdout.write(otelHeadersLine(config.token));
+}
+
+// ============= DEVICES =============
+
+interface DeviceRow {
+  id: string;
+  name: string;
+  createdAt: string | null;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+}
+
+async function fetchDevices(
+  token: string
+): Promise<{ devices: DeviceRow[]; currentDeviceId: string | null }> {
+  const response = await apiFetch("/api/cli/devices", { token });
+  if (response.status === 401) {
+    await markTokenRevoked(token);
+    throw new Error("Server rejected your token — run `clawdgg login`.");
+  }
+  if (!response.ok) throw new Error(`Server returned HTTP ${response.status}`);
+  return (await response.json()) as { devices: DeviceRow[]; currentDeviceId: string | null };
+}
+
+async function cmdDevices(args: string[]): Promise<void> {
+  const config = await loadConfig();
+  if (!config.token) {
+    log.error("Not logged in. Run `clawdgg login` first.");
+    process.exit(1);
+  }
+
+  const sub = args[0];
+
+  if (sub === "revoke") {
+    await revokeDevice(config, args.slice(1));
+    return;
+  }
+  if (sub === "rename") {
+    await renameDevice(config, args.slice(1));
+    return;
+  }
+  if (sub && sub !== "list") {
+    log.error(`Unknown: clawdgg devices ${sub}`);
+    log.dim("    clawdgg devices [list] | revoke <id|--all> | rename <id> <name>");
+    process.exit(1);
+  }
+
+  log.title("Your devices");
+  const { devices, currentDeviceId } = await fetchDevices(config.token);
+  const current = currentDeviceId ?? config.deviceId ?? null;
+
+  if (devices.length === 0) {
+    log.info("No per-device tokens on record.");
+    if (!isDeviceToken(config.token)) {
+      log.dim("    You're on a pre-2.0 token, which isn't tied to a machine.");
+      log.dim("    Run `clawdgg login` to upgrade it to a revocable one.");
+    }
+    console.log();
+    return;
+  }
+
+  for (const device of devices) {
+    const here = device.id === current;
+    const label = `${device.name}${here ? `  ${colors.cyan}(this machine)${colors.reset}` : ""}`;
+    if (device.revokedAt) {
+      log.dim(`✗ ${device.name}  (revoked ${describeAge(device.revokedAt)})`);
+    } else {
+      console.log(`${colors.green}•${colors.reset} ${label}`);
+    }
+    const seen = device.lastUsedAt ? `last used ${describeAge(device.lastUsedAt)}` : "never used";
+    const added = device.createdAt ? `added ${describeAge(device.createdAt)}` : "";
+    log.dim(`    ${device.id}  ${colors.dim}·${colors.reset} ${seen}${added ? ` · ${added}` : ""}`);
+  }
+
+  console.log();
+  log.dim("Revoke one:  clawdgg devices revoke <id>");
+  log.dim("Revoke all:  clawdgg devices revoke --all   (logs out every machine)");
+  console.log();
+}
+
+async function revokeDevice(config: Config, args: string[]): Promise<void> {
+  const token = config.token!;
+  const all = args.includes("--all");
+  const id = args.find((a) => !a.startsWith("-"));
+
+  if (!all && !id) {
+    log.error("Which device? `clawdgg devices revoke <id>` or `--all`.");
+    process.exit(1);
+  }
+
+  const body = all ? { all: true } : { id };
+  const response = await apiFetch("/api/cli/devices/revoke", {
+    method: "POST",
+    token,
+    body: JSON.stringify(body),
+  });
+
+  if (response.status === 401) {
+    await markTokenRevoked(token);
+    log.error("Server rejected your token — run `clawdgg login`.");
+    process.exit(1);
+  }
+  if (!response.ok) {
+    log.error(`Revoke failed (HTTP ${response.status}): ${await response.text()}`);
+    process.exit(1);
+  }
+
+  const result = (await response.json()) as { revoked?: number; wasCurrentDevice?: boolean };
+
+  if (all) {
+    log.success(`Revoked ${result.revoked ?? 0} device token(s) — every machine is logged out.`);
+    await forgetLocalCredentials();
+  } else if (result.wasCurrentDevice) {
+    log.success("Revoked this machine's token.");
+    await forgetLocalCredentials();
+  } else {
+    log.success(`Revoked ${id}.`);
+    log.dim("    That machine stops streaming at its next Claude Code start.");
+  }
+  console.log();
+}
+
+async function renameDevice(config: Config, args: string[]): Promise<void> {
+  const [id, ...rest] = args;
+  const name = rest.join(" ").trim();
+  if (!id || !name) {
+    log.error("Usage: clawdgg devices rename <id> <name>");
+    process.exit(1);
+  }
+
+  const response = await apiFetch(`/api/cli/devices/${id}`, {
+    method: "PATCH",
+    token: config.token!,
+    body: JSON.stringify({ name }),
+  });
+  if (!response.ok) {
+    log.error(`Rename failed (HTTP ${response.status}): ${await response.text()}`);
+    process.exit(1);
+  }
+  log.success(`Renamed to ${name}.`);
+  console.log();
+}
+
+/** Drop the local token after we revoked the credential it names. */
+async function forgetLocalCredentials(): Promise<void> {
+  const { token, deviceId, ...keep } = await loadConfig();
+  await saveConfig(keep);
+  await clearTokenRevoked();
+  log.dim(`    Cleared the token in ${CONFIG_FILE}. Run \`clawdgg login\` to come back.`);
 }
 
 // ============= STATUS =============
@@ -857,6 +1061,28 @@ async function cmdDoctor(): Promise<void> {
     });
   } else {
     checks.push({ status: "ok", label: `Logged in as @${config.username ?? "?"}` });
+
+    if (!isDeviceToken(config.token)) {
+      checks.push({
+        status: "warn",
+        label: "Pre-2.0 token — re-login to upgrade",
+        detail:
+          "it still works, but it can only be revoked for every machine at once\n" +
+          "    a per-device token is revocable on its own, and `clawdgg devices` lists it",
+        fix: "clawdgg login",
+      });
+    }
+
+    // The flag the statusLine hook and this command write on a 401 — the same
+    // one `otel-headers` fails on.
+    if (await isTokenRevoked(config.token)) {
+      checks.push({
+        status: "fail",
+        label: "This device's token was revoked",
+        detail: "`otel-headers` is failing on purpose, so Claude Code warns at startup",
+        fix: "clawdgg login",
+      });
+    }
   }
 
   // 3. settings.json — parse, OTEL block, helper, status line.
@@ -955,10 +1181,12 @@ async function cmdDoctor(): Promise<void> {
       const elapsed = Date.now() - startedAt;
 
       if (response.status === 401) {
+        // Record it, so the next Claude Code start shows the warning too.
+        await markTokenRevoked(config.token);
         checks.push({
           status: "fail",
           label: "Server rejected your token",
-          detail: "revoked, or superseded by a login elsewhere",
+          detail: "revoked — `otel-headers` will now fail loudly instead of 401ing in silence",
           fix: "clawdgg login",
         });
       } else if (!response.ok) {
@@ -969,7 +1197,10 @@ async function cmdDoctor(): Promise<void> {
           otelEnabled?: boolean;
           lastLiveEventAt?: string | null;
           lastEventAt?: string | null;
+          tokenKind?: string | null;
         };
+        // The server accepted it, so whatever we had recorded as revoked is stale.
+        await clearTokenRevoked();
         checks.push({ status: "ok", label: `Token valid (${elapsed}ms)` });
 
         if (health.otelEnabled === false) {
@@ -1280,7 +1511,8 @@ ${colors.bright}Commands:${colors.reset}
   ${colors.green}doctor${colors.reset}        Why isn't my data showing up?
   ${colors.green}import${colors.reset}        Backfill history from local Claude Code transcripts
   ${colors.green}login${colors.reset}         Link your GitHub account
-  ${colors.green}logout${colors.reset}        Revoke the token and clear local state
+  ${colors.green}logout${colors.reset}        Revoke THIS machine's token and clear local state
+  ${colors.green}devices${colors.reset}       List your machines (${colors.dim}revoke <id>${colors.reset} / ${colors.dim}revoke --all${colors.reset} / ${colors.dim}rename${colors.reset})
   ${colors.green}disable${colors.reset}       Stop streaming (${colors.dim}--purge${colors.reset} also deletes ~/.config/clawdgg)
   ${colors.green}version${colors.reset}       Print the version
 
@@ -1323,6 +1555,9 @@ async function main() {
       break;
     case "logout":
       await cmdLogout();
+      break;
+    case "devices":
+      await cmdDevices(args.slice(1));
       break;
     case "disable":
       await cmdDisable(args.includes("--purge"));

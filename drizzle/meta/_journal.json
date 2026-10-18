@@ -64,6 +64,13 @@
       "when": 1790000000000,
       "tag": "0008_add_plan_usage_snapshots",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1792000000000,
+      "tag": "0009_add_device_tokens",
+      "breakpoints": true
     }
   ]
 }

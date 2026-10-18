@@ -1,17 +1,23 @@
 /**
  * Endpoints the `clawdgg` CLI calls on its own behalf.
  *
- * Mounted at /api/cli, so the /api/* rate limiter and the optionalAuth
- * middleware apply the same way they do to the rest of the API. Everything
- * here is bearer-token authenticated via requireAuth — these are never called
- * from a browser.
+ * Mounted at /api/cli, so the /api/* rate limiter applies the same way it does
+ * to the rest of the API. Every route here is BEARER-ONLY (requireBearerAuth):
+ * a cookie session is refused, because these are called by a local binary and
+ * accepting the cookie would make "revoke all my devices" a CSRF one-liner.
  */
 
 import { Hono } from 'hono';
-import { eq, sql } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import { db } from '../db';
 import { users } from '../db/schema';
-import { requireAuth } from '../lib/auth-middleware';
+import { requireBearerAuth } from '../lib/auth-middleware';
+import {
+  listDeviceTokens,
+  renameDeviceToken,
+  revokeAllDeviceTokens,
+  revokeDeviceToken,
+} from '../lib/session';
 import {
   eventRowId,
   insertEvents,
@@ -45,7 +51,7 @@ function toIsoOrNull(chTimestamp: unknown): string | null {
 // working leaves the OTel SDK dropping batches with no user-visible signal.
 // `lastLiveEventAt` is how the CLI turns that into "nothing has arrived since
 // April" instead of "looks configured, must be fine".
-cli.get('/health', requireAuth, async (c) => {
+cli.get('/health', requireBearerAuth, async (c) => {
   const user = c.get('user');
   if (!user) return c.json({ error: 'Unauthorized' }, 401);
 
@@ -84,33 +90,111 @@ cli.get('/health', requireAuth, async (c) => {
     lastLiveEventAt,
     lastEventAt,
     clickhouse,
+    // 'legacy' means a pre-2.0 token_gen bearer: it works, but it can only be
+    // revoked by logging every machine out at once. `doctor` says so.
+    tokenKind: c.get('tokenKind'),
+    deviceId: c.get('deviceTokenId'),
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// POST /api/cli/logout — revoke the caller's CLI tokens
+// Devices — one revocable token per machine
 // ═══════════════════════════════════════════════════════════════════════════
-//
-// Revocation in this project is a token_gen bump (verifyBearerToken rejects a
-// gen mismatch), and gen is per-user — so this logs the user out of every
-// machine, not just this one. The CLI says so in its output.
-cli.post('/logout', requireAuth, async (c) => {
+
+/** GET /api/cli/devices — what `clawdgg devices` lists. */
+cli.get('/devices', requireBearerAuth, async (c) => {
   const user = c.get('user');
   if (!user) return c.json({ error: 'Unauthorized' }, 401);
 
-  const result = await db
-    .update(users)
-    .set({ tokenGen: sql`${users.tokenGen} + 1`, updatedAt: new Date() })
-    .where(eq(users.id, user.id))
-    .returning({ gen: users.tokenGen });
+  return c.json({
+    devices: await listDeviceTokens(user.id),
+    // Lets the CLI mark one row "this machine" without storing its own id.
+    currentDeviceId: c.get('deviceTokenId'),
+  });
+});
 
-  if (result.length === 0) return c.json({ error: 'User not found' }, 404);
+/**
+ * POST /api/cli/devices/revoke — { id } or { all: true }
+ *
+ * `all` also bumps users.token_gen, so a legacy bearer (which has no
+ * device_tokens row) dies with the rest.
+ */
+cli.post('/devices/revoke', requireBearerAuth, async (c) => {
+  const user = c.get('user');
+  if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+  let body: { id?: unknown; all?: unknown };
+  try {
+    body = (await c.req.json()) ?? {};
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  if (body.all === true) {
+    const revoked = await revokeAllDeviceTokens(user.id);
+    return c.json({ success: true, revoked, all: true });
+  }
+
+  const id = typeof body.id === 'string' ? body.id : '';
+  if (!/^[0-9a-f]{32}$/.test(id)) {
+    return c.json({ error: 'Pass a device id, or { "all": true }' }, 400);
+  }
+
+  const revoked = await revokeDeviceToken(user.id, id);
+  if (!revoked) return c.json({ error: 'No such live device' }, 404);
 
   return c.json({
     success: true,
-    revokedAllDevices: true,
-    tokenGen: result[0]!.gen,
+    revoked: 1,
+    // The CLI clears its own credentials when it revokes the device it's using.
+    wasCurrentDevice: id === c.get('deviceTokenId'),
   });
+});
+
+/** PATCH /api/cli/devices/:id — { name }. The CLI sets its hostname after login. */
+cli.patch('/devices/:id', requireBearerAuth, async (c) => {
+  const user = c.get('user');
+  if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+  const id = c.req.param('id');
+  if (!/^[0-9a-f]{32}$/.test(id)) return c.json({ error: 'Invalid device id' }, 400);
+
+  let body: { name?: unknown };
+  try {
+    body = (await c.req.json()) ?? {};
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  if (!(await renameDeviceToken(user.id, id, body.name))) {
+    return c.json({ error: 'No such device' }, 404);
+  }
+
+  return c.json({ success: true });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POST /api/cli/logout — revoke THIS device
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Only this one. `clawdgg devices revoke --all` is the "log me out everywhere"
+// button; logout used to be that by accident, because revocation was a per-user
+// token_gen bump.
+cli.post('/logout', requireBearerAuth, async (c) => {
+  const user = c.get('user');
+  if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+  const tokenId = c.get('deviceTokenId');
+
+  // A legacy bearer has no row to revoke, so the only lever is the gen bump —
+  // which does log every machine out. Said plainly in the response.
+  if (!tokenId) {
+    const revoked = await revokeAllDeviceTokens(user.id);
+    return c.json({ success: true, revokedAllDevices: true, revoked, tokenKind: 'legacy' });
+  }
+
+  const revoked = await revokeDeviceToken(user.id, tokenId);
+  return c.json({ success: true, revokedAllDevices: false, revoked: revoked ? 1 : 0 });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -402,7 +486,7 @@ async function lookupExistingIds(
   return found;
 }
 
-cli.post('/import', requireAuth, async (c) => {
+cli.post('/import', requireBearerAuth, async (c) => {
   const user = c.get('user');
   if (!user) return c.json({ error: 'Unauthorized' }, 401);
 

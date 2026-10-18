@@ -64,10 +64,12 @@ export const users = sqliteTable('users', {
   // Token management (extended to 1 year for OTel)
   tokenExpiresAt: integer('token_expires_at', { mode: 'timestamp' }),
 
-  // Token generation counter for revocation. Incremented by `clawdgg login`.
-  // Bearer tokens carry the gen number they were issued with; verifyBearerToken
-  // rejects mismatches. Bumping this column instantly revokes all outstanding
-  // tokens for the user without requiring expiry-based rotation.
+  // Token generation counter for revocation of the LEGACY (pre-CLI-2.0) bearer
+  // format, which carried the gen number it was issued with. Those tokens were
+  // per-user, so a bump logged every machine out at once — which is why
+  // device_tokens replaced them. Still read by verifyBearerToken so the one
+  // outstanding legacy token keeps working until it re-logs in; still bumped by
+  // "revoke all devices", which must kill legacy tokens too.
   tokenGen: integer('token_gen').notNull().default(1),
 
   // Potential future: Anthropic account linking
@@ -148,6 +150,33 @@ export const deviceAuths = sqliteTable('device_auths', {
   expiresAtIdx: index('expires_at_idx').on(table.expiresAt),
 }));
 
+// One row per `clawdgg login` — a revocable credential for ONE machine.
+//
+// The bearer the CLI holds is `cgt_<id>.<secret>`: the id selects this row, the
+// secret is compared against secretHash. Only the hash is stored, so a dump of
+// this table cannot be replayed as a token. Revoking a row logs out exactly
+// that machine and nothing else, which is the whole reason it exists — the
+// users.token_gen scheme it replaced could only revoke every device at once.
+export const deviceTokens = sqliteTable('device_tokens', {
+  id: text('id').primaryKey(), // 32 hex chars, the public half of the bearer
+  userId: text('user_id')
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  // Defaults to the machine's hostname; the user can rename it.
+  deviceName: text('device_name').notNull(),
+  // SHA-256 of the secret half, hex. NEVER the secret itself.
+  secretHash: text('secret_hash').notNull(),
+  createdAt: integer('created_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  // Written at most once per LAST_USED_THROTTLE_MS — this is touched by the
+  // OTLP ingest path, which runs on every exported batch.
+  lastUsedAt: integer('last_used_at', { mode: 'timestamp' }),
+  revokedAt: integer('revoked_at', { mode: 'timestamp' }),
+}, (table) => ({
+  userIdx: index('device_tokens_user_idx').on(table.userId),
+}));
+
 // Plan usage snapshots (Pro/Max rate-limit windows captured via the statusLine hook)
 // One row per observed CHANGE of a window — see src/lib/plan-usage.ts for the
 // dedup rule. Timestamps are raw unix epoch SECONDS (not `mode: 'timestamp'`)
@@ -176,5 +205,7 @@ export type DailyStat = typeof dailyStats.$inferSelect;
 export type NewDailyStat = typeof dailyStats.$inferInsert;
 export type DeviceAuth = typeof deviceAuths.$inferSelect;
 export type NewDeviceAuth = typeof deviceAuths.$inferInsert;
+export type DeviceToken = typeof deviceTokens.$inferSelect;
+export type NewDeviceToken = typeof deviceTokens.$inferInsert;
 export type PlanUsageSnapshot = typeof planUsageSnapshots.$inferSelect;
 export type NewPlanUsageSnapshot = typeof planUsageSnapshots.$inferInsert;

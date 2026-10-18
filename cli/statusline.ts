@@ -13,10 +13,11 @@
 //   2. Nothing blocks the prompt. The POST is best-effort: short timeout, all
 //      errors swallowed, skipped entirely when there's no token or no payload.
 
-import { readFile, appendFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, appendFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { API_BASE_URL, CONFIG_DIR, CONFIG_FILE } from "./paths";
+import { markTokenRevoked, mergeState, readState } from "./token-state";
 import { parseRateLimits } from "../src/lib/plan-usage";
 
 // Fallback for callers that don't pass an absolute binary path (and the shape
@@ -24,7 +25,6 @@ import { parseRateLimits } from "../src/lib/plan-usage";
 export const STATUSLINE_COMMAND = "clawdgg statusline";
 
 const DEBUG_LOG_FILE = join(CONFIG_DIR, "statusline-debug.log");
-const STATE_FILE = join(CONFIG_DIR, "statusline-state.json");
 
 // The prompt render waits on this process, so the network gets a hard ceiling.
 const POST_TIMEOUT_MS = 1500;
@@ -38,11 +38,6 @@ interface StatusLineInput {
   model?: { display_name?: string; id?: string };
   session_id?: string;
   rate_limits?: unknown;
-}
-
-interface StatusLineState {
-  lastPostAt?: number;
-  fingerprint?: string;
 }
 
 // ============= SETTINGS.JSON MERGE =============
@@ -162,24 +157,6 @@ async function readTokenQuietly(): Promise<string | null> {
   return null;
 }
 
-async function readState(): Promise<StatusLineState> {
-  try {
-    if (!existsSync(STATE_FILE)) return {};
-    return JSON.parse(await readFile(STATE_FILE, "utf-8"));
-  } catch {
-    return {};
-  }
-}
-
-async function writeState(state: StatusLineState): Promise<void> {
-  try {
-    await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
-    await writeFile(STATE_FILE, JSON.stringify(state), { mode: 0o600 });
-  } catch {
-    // Losing the throttle state only costs an extra request.
-  }
-}
-
 async function reportPlanUsage(input: StatusLineInput): Promise<void> {
   try {
     const rateLimits = input?.rate_limits;
@@ -202,9 +179,9 @@ async function reportPlanUsage(input: StatusLineInput): Promise<void> {
 
     // Record the attempt before it happens: a server that's down shouldn't get
     // hammered on every prompt either.
-    await writeState({ lastPostAt: nowSeconds, fingerprint });
+    await mergeState({ lastPostAt: nowSeconds, fingerprint });
 
-    await fetch(`${API_BASE_URL}/api/plan-usage`, {
+    const response = await fetch(`${API_BASE_URL}/api/plan-usage`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -217,9 +194,15 @@ async function reportPlanUsage(input: StatusLineInput): Promise<void> {
       }),
       signal: AbortSignal.timeout(POST_TIMEOUT_MS),
     });
+
+    // This is the earliest place a revocation shows up — the status line talks
+    // to the API far more often than `doctor` does. Record it so `otel-headers`
+    // fails loudly at the next Claude Code start instead of the exporter 401ing
+    // in silence.
+    if (response.status === 401) await markTokenRevoked(token);
   } catch {
-    // Network down, token revoked, server 500 — none of it is the user's
-    // problem while they're waiting for a prompt.
+    // Network down, server 500 — none of it is the user's problem while they
+    // are waiting for a prompt.
   }
 }
 
