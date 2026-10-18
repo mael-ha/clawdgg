@@ -1,0 +1,510 @@
+/**
+ * Claude Code JSONL → OTLP-equivalent rows.
+ *
+ * One mapper, three callers:
+ *   - src/scripts/backfill-jsonl.ts  (operator-run, provenance='backfill')
+ *   - cli/index.ts `clawdgg import`  (user-run, provenance='import')
+ *   - its tests
+ *
+ * It is deliberately pure: no filesystem, no ClickHouse, no module-level
+ * mutable state. The CLI bundles this file into a compiled binary, so it must
+ * not reach for anything a `bun build --compile` target can't carry.
+ *
+ * What it reads (per line of ~/.claude/projects/**\/*.jsonl):
+ *   type:"user"       → claude_code.user_prompt  (prompt LENGTH, never text)
+ *   type:"assistant"  → claude_code.api_request + token/cost metrics
+ *                     → claude_code.tool_result per tool_use block
+ *
+ * What it deliberately drops, to match what live OTEL emits:
+ *   - subagent files and isSidechain lines: those user prompts are Task-tool
+ *     delegations written by the orchestrator, not typed by a human
+ *   - model="<synthetic>" assistant rows: locally generated placeholders with
+ *     all-zero usage that would inflate api-requests-per-prompt
+ *   - built-in slash commands (/clear, /compact, …): session management, not work
+ */
+
+import {
+  getModelPricingDetailed,
+  splitCacheCreationTokens,
+  type PricingMatchQuality,
+} from "./pricing";
+
+export type Provenance = "live" | "backfill" | "backfill-history" | "import";
+
+/**
+ * Superset of src/db/clickhouse.ts's EventRow: the provenance union there is
+ * narrower than the ClickHouse column (a plain `String DEFAULT 'live'`), and
+ * `pricing_source` exists in the DDL but not yet in that interface. Rows cross
+ * into clickhouse.ts's types at the insert boundary.
+ */
+export interface ImportEventRow {
+  timestamp: string; // 'YYYY-MM-DD HH:MM:SS.sss', UTC
+  user_id: string;
+  session_id: string;
+  event_name: string;
+  prompt_length?: number;
+  tool_name?: string;
+  /**
+   * Claude Code's own id for a tool call. Part of EVENT_IDENTITY_COLUMNS, and
+   * the only thing that keeps two calls to the SAME tool inside one assistant
+   * message (same millisecond, same tool_name) from hashing to one row.
+   */
+  tool_use_id?: string;
+  model?: string;
+  cost_usd?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
+  provenance: Provenance;
+  pricing_source?: PricingMatchQuality;
+}
+
+export interface ImportMetricRow {
+  timestamp: string;
+  user_id: string;
+  session_id: string;
+  metric_name: string;
+  value: number;
+  model?: string;
+  token_type?: string;
+  provenance: Provenance;
+  pricing_source?: PricingMatchQuality;
+}
+
+export interface MappedRows {
+  events: ImportEventRow[];
+  metrics: ImportMetricRow[];
+}
+
+export interface MapOptions {
+  userId: string;
+  provenance: Provenance;
+  /** sessionId to use when a line doesn't carry one (from the file name). */
+  sessionFallback: string;
+  /** Lines from a `subagents/` file never produce user_prompt events. */
+  isSubagentFile: boolean;
+  /**
+   * Drop user_prompt events whose text is a built-in slash command. The count
+   * rule for prompts: built-ins don't count, custom/skill/MCP commands do.
+   * Off by default so backfill-jsonl.ts keeps its historical behaviour.
+   */
+  excludeBuiltinSlashPrompts?: boolean;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Built-in slash commands
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Claude Code's own session/UI/config commands. Typing one is not a prompt —
+ * no model is asked anything — so it must not land in the prompt count.
+ *
+ * Deliberately NOT in here: the bundled skills and workflow commands
+ * (/code-review, /security-review, /simplify, /init, /review, /deep-research,
+ * /loop, …). Those do real work through the model, so they count exactly like
+ * a typed prompt does. Same for any custom, plugin or MCP command.
+ *
+ * Erring short is the safe direction: a command we fail to list is counted as
+ * a prompt (a small overcount), while listing a real one would silently lose
+ * work from someone's history.
+ */
+export const BUILTIN_SLASH_COMMANDS: ReadonlySet<string> = new Set([
+  "add-dir", "agents", "autocompact", "background", "bashes", "bug", "cd",
+  "clear", "color", "compact", "config", "context", "continue", "copy", "cost",
+  "debug", "diff", "doctor", "effort", "exit", "export", "feedback", "focus",
+  "fork", "heapdump", "help", "hooks", "ide", "install-github-app",
+  "install-slack-app", "keybindings", "list-agents", "login", "logout", "mcp",
+  "memory", "migrate-installer", "model", "new", "output-style", "passes",
+  "peers", "permissions", "plugin", "pr-comments", "privacy-settings", "quit",
+  "rate-limit-options", "release-notes", "reload-plugins", "reload-skills",
+  "remote-control", "remote-env", "rename", "reset", "resume", "rewind",
+  "sandbox", "scroll-speed", "settings", "setup-bedrock", "setup-vertex",
+  "share", "skill-doctor", "skills", "stats", "status", "statusline",
+  "stickers", "stop", "tasks", "teleport", "terminal-setup", "theme", "todos",
+  "tui", "undo", "upgrade", "usage", "usage-credits", "vim", "voice",
+]);
+
+/** True for `/clear`, `/model opus`, … and false for `/code-review`, `/my-cmd`. */
+export function isBuiltinSlashCommand(text: string): boolean {
+  const trimmed = text.trimStart();
+  if (!trimmed.startsWith("/")) return false;
+  const name = trimmed.slice(1).split(/[\s:]/, 1)[0]?.toLowerCase() ?? "";
+  return BUILTIN_SLASH_COMMANDS.has(name);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Primitives
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Format a JS Date as ClickHouse DateTime64(3): "YYYY-MM-DD HH:MM:SS.sss" (UTC) */
+export function fmtTs(d: Date): string {
+  const pad = (n: number, len = 2) => String(n).padStart(len, "0");
+  return (
+    `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +
+    `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}.` +
+    `${pad(d.getUTCMilliseconds(), 3)}`
+  );
+}
+
+/** Character count of a message's content — the only thing we take from it. */
+export function contentLength(content: unknown): number {
+  if (typeof content === "string") return content.length;
+  if (Array.isArray(content)) {
+    let n = 0;
+    for (const block of content) {
+      if (block && typeof block === "object" && "text" in block && typeof (block as any).text === "string") {
+        n += (block as any).text.length;
+      }
+    }
+    return n;
+  }
+  return 0;
+}
+
+/** The plain text of a message's content, for slash-command detection only. */
+function contentText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === "object" && typeof (block as any).text === "string") {
+        return (block as any).text;
+      }
+    }
+  }
+  return "";
+}
+
+export interface CostEstimate {
+  costUsd: number;
+  pricingSource: PricingMatchQuality;
+  /**
+   * The usage object had no nested `cache_creation` breakdown, so its
+   * cache-creation tokens were all priced at the 5m rate and this row's
+   * cache-write cost is understated.
+   */
+  usedFlatCacheFallback: boolean;
+}
+
+/**
+ * USD cost from token usage + model, plus how the price was looked up.
+ *
+ * Cache creation is billed per TTL: 1h costs 2x input, 5m costs 1.25x. Pricing
+ * everything at 5m understates cache-write cost by ~22% on the current corpus,
+ * where 37% of cache-creation tokens are 1h.
+ */
+export function computeCostUsd(model: string, usage: any): CostEstimate {
+  const { pricing: p, matchQuality } = getModelPricingDetailed(model || "");
+  const input = Number(usage?.input_tokens ?? 0);
+  const output = Number(usage?.output_tokens ?? 0);
+  const cacheRead = Number(usage?.cache_read_input_tokens ?? 0);
+  const { tokens5m, tokens1h, fromFlatFallback } = splitCacheCreationTokens(usage);
+  return {
+    costUsd:
+      (input * p.input +
+        output * p.output +
+        cacheRead * p.cacheRead +
+        tokens5m * p.cacheWrite5m +
+        tokens1h * p.cacheWrite1h) / 1_000_000,
+    pricingSource: matchQuality,
+    usedFlatCacheFallback: fromFlatFallback,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Line → rows
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface MapLineResult extends MappedRows {
+  /** Rows whose cache-creation cost had to fall back to the flat 5m rate. */
+  flatCacheFallbacks: number;
+}
+
+/** Map one already-JSON-parsed JSONL line. Unmappable lines return nothing. */
+export function mapLine(line: any, opts: MapOptions): MapLineResult {
+  const out: MapLineResult = { events: [], metrics: [], flatCacheFallbacks: 0 };
+
+  const tsStr: string | undefined = line?.timestamp;
+  if (!tsStr) return out;
+  const ts = new Date(tsStr);
+  if (isNaN(ts.getTime())) return out;
+
+  const sessionId: string = line?.sessionId || opts.sessionFallback;
+  const base = {
+    timestamp: fmtTs(ts),
+    user_id: opts.userId,
+    session_id: sessionId,
+    provenance: opts.provenance,
+  };
+
+  const type: string | undefined = line?.type;
+  const isSidechain: boolean = line?.isSidechain === true;
+
+  if (type === "user") {
+    // Only top-level human-typed prompts. Subagent files and isSidechain lines
+    // carry orchestrator-internal prompts (Task tool delegations) that live
+    // OTEL does NOT emit as user_prompt events.
+    if (opts.isSubagentFile || isSidechain) return out;
+    const content = line?.message?.content;
+    if (opts.excludeBuiltinSlashPrompts && isBuiltinSlashCommand(contentText(content))) {
+      return out;
+    }
+    out.events.push({
+      ...base,
+      event_name: "claude_code.user_prompt",
+      prompt_length: contentLength(content),
+    });
+    return out;
+  }
+
+  if (type === "assistant") {
+    const usage = line?.message?.usage;
+    const model: string = line?.message?.model || "";
+
+    if (model === "<synthetic>") return out;
+
+    if (usage && (usage.input_tokens != null || usage.output_tokens != null)) {
+      const inputTokens = Number(usage.input_tokens ?? 0);
+      const outputTokens = Number(usage.output_tokens ?? 0);
+      const cacheRead = Number(usage.cache_read_input_tokens ?? 0);
+      const cacheWrite = Number(usage.cache_creation_input_tokens ?? 0);
+      const { costUsd, pricingSource, usedFlatCacheFallback } = computeCostUsd(model, usage);
+      if (usedFlatCacheFallback) out.flatCacheFallbacks++;
+
+      out.events.push({
+        ...base,
+        event_name: "claude_code.api_request",
+        model,
+        cost_usd: costUsd,
+        pricing_source: pricingSource,
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        cache_read_tokens: cacheRead,
+        cache_write_tokens: cacheWrite,
+      });
+
+      const tokenMetricBase = { ...base, metric_name: "claude_code.token.usage", model };
+      if (inputTokens > 0)
+        out.metrics.push({ ...tokenMetricBase, value: inputTokens, token_type: "input" });
+      if (outputTokens > 0)
+        out.metrics.push({ ...tokenMetricBase, value: outputTokens, token_type: "output" });
+      if (cacheRead > 0)
+        out.metrics.push({ ...tokenMetricBase, value: cacheRead, token_type: "cacheRead" });
+      if (cacheWrite > 0)
+        out.metrics.push({ ...tokenMetricBase, value: cacheWrite, token_type: "cacheCreation" });
+
+      // cost.usage so getUserTotals' total_cost_usd aggregates correctly. This
+      // is *estimated* from token counts × pricing table, not measured, and
+      // pricing_source records how well the model id matched the price table.
+      if (costUsd > 0) {
+        out.metrics.push({
+          ...base,
+          metric_name: "claude_code.cost.usage",
+          value: costUsd,
+          model,
+          pricing_source: pricingSource,
+        });
+      }
+    }
+
+    // Tool uses inside an assistant message → tool_result events. Best-effort.
+    const blocks = line?.message?.content;
+    if (Array.isArray(blocks)) {
+      for (const block of blocks) {
+        if (block && typeof block === "object" && (block as any).type === "tool_use") {
+          out.events.push({
+            ...base,
+            event_name: "claude_code.tool_result",
+            tool_name: String((block as any).name || ""),
+            tool_use_id: String((block as any).id || ""),
+          });
+        }
+      }
+    }
+    return out;
+  }
+
+  return out;
+}
+
+export interface MapTextOptions extends MapOptions {
+  /** Keep only lines at or after this instant. */
+  from?: Date;
+  /** Keep only lines strictly before this instant. */
+  to?: Date;
+}
+
+/** Map a whole JSONL file's text. Malformed lines are skipped, not fatal. */
+export function mapJsonlText(raw: string, opts: MapTextOptions): MapLineResult {
+  const out: MapLineResult = { events: [], metrics: [], flatCacheFallbacks: 0 };
+
+  for (const line of raw.split("\n")) {
+    if (!line) continue;
+    let parsed: any;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    const tsStr: string | undefined = parsed?.timestamp;
+    if (!tsStr) continue;
+    const ts = new Date(tsStr);
+    if (isNaN(ts.getTime())) continue;
+    if (opts.from && ts < opts.from) continue;
+    if (opts.to && ts >= opts.to) continue;
+
+    const mapped = mapLine(parsed, opts);
+    out.events.push(...mapped.events);
+    out.metrics.push(...mapped.metrics);
+    out.flatCacheFallbacks += mapped.flatCacheFallbacks;
+  }
+
+  return out;
+}
+
+/** Derive the session-id fallback and subagent flag from a transcript path. */
+export function describeTranscriptPath(path: string): {
+  sessionFallback: string;
+  isSubagentFile: boolean;
+} {
+  return {
+    sessionFallback: path.split("/").pop()?.replace(/\.jsonl$/, "") || "",
+    isSubagentFile: path.includes("/subagents/"),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ~/.claude/history.jsonl → user_prompt events
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// history.jsonl is the chronological log of every prompt typed at the REPL. It
+// persists far longer than the per-session transcripts (which rotate at ~60d),
+// so it's the only source for prompt counts in older windows — at the cost of
+// carrying slash commands and up-arrow repeats, which we filter here.
+
+export type HistorySlashPolicy = "drop-all" | "drop-builtin";
+
+export interface HistoryOptions {
+  userId: string;
+  provenance: Provenance;
+  from?: Date;
+  to?: Date;
+  /**
+   * 'drop-builtin' applies the prompt count rule: built-ins out, custom /
+   * skill / MCP commands in. 'drop-all' is what backfill-jsonl.ts has always
+   * done and is kept so re-running that script can't change prod counts.
+   */
+  slashPolicy: HistorySlashPolicy;
+}
+
+export interface HistoryResult {
+  events: ImportEventRow[];
+  parsed: number;
+  droppedSlash: number;
+  droppedEmpty: number;
+  droppedOutOfWindow: number;
+  droppedDuplicate: number;
+}
+
+/** Map history.jsonl text. Prompt text is used for filtering only, never emitted. */
+export function mapHistoryText(raw: string, opts: HistoryOptions): HistoryResult {
+  const result: HistoryResult = {
+    events: [],
+    parsed: 0,
+    droppedSlash: 0,
+    droppedEmpty: 0,
+    droppedOutOfWindow: 0,
+    droppedDuplicate: 0,
+  };
+
+  const seen = new Set<string>();
+
+  for (const line of raw.split("\n")) {
+    if (!line) continue;
+    let rec: any;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    result.parsed++;
+
+    if (typeof rec.timestamp !== "number" || typeof rec.display !== "string") continue;
+
+    const display = rec.display.trim();
+    if (display.length === 0) {
+      result.droppedEmpty++;
+      continue;
+    }
+    if (display.startsWith("/")) {
+      if (opts.slashPolicy === "drop-all" || isBuiltinSlashCommand(display)) {
+        result.droppedSlash++;
+        continue;
+      }
+    }
+
+    const ts = new Date(rec.timestamp);
+    if (isNaN(ts.getTime())) continue;
+    if ((opts.from && ts < opts.from) || (opts.to && ts >= opts.to)) {
+      result.droppedOutOfWindow++;
+      continue;
+    }
+
+    // Collapse up-arrow repeats: same session, same text, same minute.
+    const sessionId = typeof rec.sessionId === "string" ? rec.sessionId : "";
+    const key = `${sessionId}|${display.slice(0, 200)}|${Math.floor(rec.timestamp / 60000)}`;
+    if (seen.has(key)) {
+      result.droppedDuplicate++;
+      continue;
+    }
+    seen.add(key);
+
+    result.events.push({
+      timestamp: fmtTs(ts),
+      user_id: opts.userId,
+      session_id: sessionId,
+      event_name: "claude_code.user_prompt",
+      prompt_length: display.length,
+      provenance: opts.provenance,
+    });
+  }
+
+  return result;
+}
+
+/**
+ * Keep only the history-derived prompts for days the transcripts don't cover.
+ *
+ * Both sources describe the same prompts, and they do NOT agree to the
+ * millisecond (history records when you hit enter, the transcript when the
+ * line was written), so dedup can't catch the overlap — importing both would
+ * double every prompt. history.jsonl is only useful where the transcripts have
+ * rotated away, which is a whole-day phenomenon: a day either has transcripts
+ * or it doesn't.
+ */
+export function fillPromptGapsFromHistory(
+  transcriptEvents: ImportEventRow[],
+  historyEvents: ImportEventRow[]
+): { events: ImportEventRow[]; coveredDays: number; gapDays: string[] } {
+  const covered = new Set<string>();
+  for (const event of transcriptEvents) {
+    if (event.event_name === "claude_code.user_prompt") covered.add(event.timestamp.slice(0, 10));
+  }
+
+  const gapDays = new Set<string>();
+  const events: ImportEventRow[] = [];
+  for (const event of historyEvents) {
+    const day = event.timestamp.slice(0, 10);
+    if (covered.has(day)) continue;
+    gapDays.add(day);
+    events.push(event);
+  }
+
+  return { events, coveredDays: covered.size, gapDays: [...gapDays].sort() };
+}
+
+// Row identity (what makes a re-import a no-op) is NOT defined here: it is
+// src/db/clickhouse.ts's `eventRowId` / `metricRowId`, the same hash the
+// ReplacingMergeTree sorting key ends in. Keeping a second notion of identity
+// in this file is how the two would drift.

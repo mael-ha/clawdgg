@@ -27,7 +27,15 @@ import { readFile, readdir, writeFile, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { getModelPricingDetailed, splitCacheCreationTokens, type PricingMatchQuality } from "../lib/pricing";
+import type { PricingMatchQuality } from "../lib/pricing";
+import {
+  describeTranscriptPath,
+  fmtTs,
+  mapHistoryText,
+  mapJsonlText,
+  type ImportEventRow,
+  type ImportMetricRow,
+} from "../lib/session-import";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI args
@@ -88,86 +96,17 @@ const CHECKPOINT_PATH = join(homedir(), ".clawdgg-backfill-state.json");
 const BATCH_SIZE = 1000;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Types matching docker/clickhouse/init/01_schema.sql
+// Row shapes + JSONL mapping now live in src/lib/session-import.ts, shared with
+// `clawdgg import`. This script keeps its own provenance and its own
+// cache-breakdown counter; everything else is the same code path.
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface EventRow {
-  timestamp: string;          // YYYY-MM-DD HH:MM:SS.sss
-  user_id: string;
-  session_id: string;
-  event_name: string;
-  prompt_length?: number;
-  tool_name?: string;
-  tool_success?: number;
-  tool_duration_ms?: number;
-  model?: string;
-  cost_usd?: number;
-  input_tokens?: number;
-  output_tokens?: number;
-  cache_read_tokens?: number;
-  cache_write_tokens?: number;
-  error_message?: string;
-  status_code?: number;
-  duration_ms?: number;
-  decision?: string;
-  source?: string;
-  tool_parameters?: string;
-  provenance?: "live" | "backfill" | "backfill-history";
-  /** Price-table match quality behind cost_usd. Omitted when no cost was estimated. */
-  pricing_source?: PricingMatchQuality;
-}
-
-interface MetricRow {
-  timestamp: string;
-  user_id: string;
-  session_id: string;
-  metric_name: string;
-  value: number;
-  model?: string;
-  token_type?: string;
-  line_type?: string;
-  terminal_type?: string;
-  app_version?: string;
-  account_uuid?: string;
-  tool?: string;
-  decision?: string;
-  language?: string;
-  provenance?: "live" | "backfill" | "backfill-history";
-  /** Price-table match quality behind a cost.usage value. Omitted for token metrics. */
-  pricing_source?: PricingMatchQuality;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// JSONL → row mapping
-// ─────────────────────────────────────────────────────────────────────────────
+type EventRow = ImportEventRow;
+type MetricRow = ImportMetricRow;
 
 interface MappedRows {
   events: EventRow[];
   metrics: MetricRow[];
-}
-
-/** Format a JS Date as ClickHouse DateTime64(3): "YYYY-MM-DD HH:MM:SS.sss" (UTC) */
-function fmtTs(d: Date): string {
-  const pad = (n: number, len = 2) => String(n).padStart(len, "0");
-  return (
-    `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +
-    `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}.` +
-    `${pad(d.getUTCMilliseconds(), 3)}`
-  );
-}
-
-function contentLength(content: unknown): number {
-  if (typeof content === "string") return content.length;
-  if (Array.isArray(content)) {
-    let n = 0;
-    for (const block of content) {
-      if (block && typeof block === "object" && "text" in block && typeof (block as any).text === "string") {
-        n += (block as any).text.length;
-      }
-    }
-    return n;
-  }
-  return 0;
 }
 
 /**
@@ -177,137 +116,6 @@ function contentLength(content: unknown): number {
  * cost is understated.
  */
 let rowsWithoutCacheBreakdown = 0;
-
-/**
- * USD cost from token usage + model. Returns dollars (Float64) plus how the
- * price was looked up, so the row can carry its own estimate quality.
- *
- * Cache creation is billed per TTL: 1h costs 2x input, 5m costs 1.25x. Pricing
- * everything at 5m (what this did before) understates cache-write cost by ~22%
- * on the current corpus, where 37% of cache-creation tokens are 1h.
- */
-function computeCostUsd(model: string, usage: any): { costUsd: number; pricingSource: PricingMatchQuality } {
-  const { pricing: p, matchQuality } = getModelPricingDetailed(model || "");
-  const input = Number(usage?.input_tokens ?? 0);
-  const output = Number(usage?.output_tokens ?? 0);
-  const cacheRead = Number(usage?.cache_read_input_tokens ?? 0);
-  const { tokens5m, tokens1h, fromFlatFallback } = splitCacheCreationTokens(usage);
-  if (fromFlatFallback) rowsWithoutCacheBreakdown++;
-  return {
-    costUsd:
-      (input * p.input +
-        output * p.output +
-        cacheRead * p.cacheRead +
-        tokens5m * p.cacheWrite5m +
-        tokens1h * p.cacheWrite1h) / 1_000_000,
-    pricingSource: matchQuality,
-  };
-}
-
-/** Map one JSONL line (already JSON-parsed) into rows. Returns nothing for unmappable lines. */
-function mapLine(line: any, sessionFallback: string, isSubagentFile: boolean): MappedRows {
-  const out: MappedRows = { events: [], metrics: [] };
-
-  const tsStr: string | undefined = line?.timestamp;
-  if (!tsStr) return out;
-  const ts = new Date(tsStr);
-  if (isNaN(ts.getTime())) return out;
-
-  const sessionId: string = line?.sessionId || sessionFallback;
-  const timestamp = fmtTs(ts);
-  const base = { timestamp, user_id: USER_ID, session_id: sessionId, provenance: "backfill" as const };
-
-  const type: string | undefined = line?.type;
-  const isSidechain: boolean = line?.isSidechain === true;
-
-  if (type === "user") {
-    // Only emit user_prompt for top-level human-typed prompts. Subagent files
-    // and isSidechain=true lines carry orchestrator-internal prompts (Task
-    // tool delegations) which live OTEL does NOT emit as user_prompt events.
-    if (isSubagentFile || isSidechain) return out;
-    const content = line?.message?.content;
-    out.events.push({
-      ...base,
-      event_name: "claude_code.user_prompt",
-      prompt_length: contentLength(content),
-    });
-    return out;
-  }
-
-  if (type === "assistant") {
-    const usage = line?.message?.usage;
-    const model: string = line?.message?.model || "";
-
-    // Claude Code writes model="<synthetic>" for locally-generated assistant
-    // messages (interrupts, error placeholders) that never hit the API. Every
-    // one of them carries all-zero usage, so they add $0 — but emitting them as
-    // api_request events inflates the API-calls-per-prompt agentic ratio.
-    if (model === "<synthetic>") return out;
-    if (usage && (usage.input_tokens != null || usage.output_tokens != null)) {
-      const inputTokens = Number(usage.input_tokens ?? 0);
-      const outputTokens = Number(usage.output_tokens ?? 0);
-      const cacheRead = Number(usage.cache_read_input_tokens ?? 0);
-      const cacheWrite = Number(usage.cache_creation_input_tokens ?? 0);
-      const { costUsd, pricingSource } = computeCostUsd(model, usage);
-
-      out.events.push({
-        ...base,
-        event_name: "claude_code.api_request",
-        model,
-        cost_usd: costUsd,
-        pricing_source: pricingSource,
-        input_tokens: inputTokens,
-        output_tokens: outputTokens,
-        cache_read_tokens: cacheRead,
-        cache_write_tokens: cacheWrite,
-      });
-
-      const tokenMetricBase = {
-        ...base,
-        metric_name: "claude_code.token.usage",
-        model,
-      };
-      if (inputTokens > 0)
-        out.metrics.push({ ...tokenMetricBase, value: inputTokens, token_type: "input" });
-      if (outputTokens > 0)
-        out.metrics.push({ ...tokenMetricBase, value: outputTokens, token_type: "output" });
-      if (cacheRead > 0)
-        out.metrics.push({ ...tokenMetricBase, value: cacheRead, token_type: "cacheRead" });
-      if (cacheWrite > 0)
-        out.metrics.push({ ...tokenMetricBase, value: cacheWrite, token_type: "cacheCreation" });
-      // Emit cost.usage metric so getUserTotals total_cost_usd aggregates correctly.
-      // Note: this is *estimated* cost from token counts × pricing table, not measured.
-      // pricing_source records how well the model id matched the price table, so a
-      // fallback-priced row is traceable instead of blending into the totals.
-      if (costUsd > 0) {
-        out.metrics.push({
-          ...base,
-          metric_name: "claude_code.cost.usage",
-          value: costUsd,
-          model,
-          pricing_source: pricingSource,
-        });
-      }
-    }
-
-    // Tool uses inside an assistant message → tool_result events. Best-effort.
-    const blocks = line?.message?.content;
-    if (Array.isArray(blocks)) {
-      for (const block of blocks) {
-        if (block && typeof block === "object" && (block as any).type === "tool_use") {
-          out.events.push({
-            ...base,
-            event_name: "claude_code.tool_result",
-            tool_name: String((block as any).name || ""),
-          });
-        }
-      }
-    }
-    return out;
-  }
-
-  return out;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // File walking + checkpoint
@@ -592,37 +400,21 @@ async function runInsert(args: Args): Promise<void> {
 
 /** Read one JSONL file, filter by date window, map to rows. */
 async function mapFile(file: string, args: Args): Promise<MappedRows> {
-  const out: MappedRows = { events: [], metrics: [] };
   let raw: string;
   try {
     raw = await readFile(file, "utf-8");
   } catch {
-    return out;
+    return { events: [], metrics: [] };
   }
-  // Derive sessionId fallback from filename "<sessionId>.jsonl"
-  const sessionFallback = file.split("/").pop()?.replace(/\.jsonl$/, "") || "";
-  const isSubagentFile = file.includes("/subagents/");
-  const lines = raw.split("\n");
-  for (const line of lines) {
-    if (!line) continue;
-    let parsed: any;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    // Date filter
-    const tsStr: string | undefined = parsed?.timestamp;
-    if (!tsStr) continue;
-    const ts = new Date(tsStr);
-    if (args.from && ts < args.from) continue;
-    if (args.to && ts >= args.to) continue;
-
-    const mapped = mapLine(parsed, sessionFallback, isSubagentFile);
-    out.events.push(...mapped.events);
-    out.metrics.push(...mapped.metrics);
-  }
-  return out;
+  const mapped = mapJsonlText(raw, {
+    userId: USER_ID,
+    provenance: "backfill",
+    from: args.from,
+    to: args.to,
+    ...describeTranscriptPath(file),
+  });
+  rowsWithoutCacheBreakdown += mapped.flatCacheFallbacks;
+  return { events: mapped.events, metrics: mapped.metrics };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -647,72 +439,22 @@ async function runFromHistory(args: Args): Promise<void> {
   console.log(`[from-history] Source: ${HISTORY_PATH}\n`);
 
   const raw = await readFile(HISTORY_PATH, "utf-8");
-  const lines = raw.split("\n").filter((l) => l.length > 0);
 
-  // Phase 1: parse + filter + dedupe in memory.
-  type Entry = { ts: Date; sessionId: string; display: string };
-  const seen = new Map<string, Entry>();
-  let parsed = 0;
-  let droppedSlash = 0;
-  let droppedEmpty = 0;
-  let droppedOutOfWindow = 0;
-  let droppedDup = 0;
-
-  for (const line of lines) {
-    let rec: any;
-    try {
-      rec = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    parsed++;
-    if (typeof rec.timestamp !== "number" || typeof rec.display !== "string") continue;
-    const display = rec.display.trim();
-    if (display.length === 0) {
-      droppedEmpty++;
-      continue;
-    }
-    if (display.startsWith("/")) {
-      droppedSlash++;
-      continue;
-    }
-    const ts = new Date(rec.timestamp);
-    if (isNaN(ts.getTime())) continue;
-    if (ts < args.from) {
-      droppedOutOfWindow++;
-      continue;
-    }
-    if (ts >= to) {
-      droppedOutOfWindow++;
-      continue;
-    }
-    // Dedupe per-minute bucket to collapse up-arrow repeats with the same content.
-    const sessionId = typeof rec.sessionId === "string" ? rec.sessionId : "";
-    const minuteBucket = Math.floor(rec.timestamp / 60000);
-    const key = `${sessionId}|${display.slice(0, 200)}|${minuteBucket}`;
-    if (seen.has(key)) {
-      droppedDup++;
-      continue;
-    }
-    seen.set(key, { ts, sessionId, display });
-  }
+  // `drop-all` keeps this script's historical behaviour: every slash entry is
+  // dropped. `clawdgg import` uses 'drop-builtin' instead, which keeps custom
+  // / skill / MCP commands — see the note in src/lib/session-import.ts.
+  const mapped = mapHistoryText(raw, {
+    userId: USER_ID,
+    provenance: "backfill-history",
+    from: args.from,
+    to,
+    slashPolicy: "drop-all",
+  });
+  const rows = mapped.events;
 
   console.log(
-    `[from-history] parsed=${parsed}  in-window=${seen.size}  dropped: slash=${droppedSlash} empty=${droppedEmpty} out-of-window=${droppedOutOfWindow} dup=${droppedDup}`
+    `[from-history] parsed=${mapped.parsed}  in-window=${rows.length}  dropped: slash=${mapped.droppedSlash} empty=${mapped.droppedEmpty} out-of-window=${mapped.droppedOutOfWindow} dup=${mapped.droppedDuplicate}`
   );
-
-  // Phase 2: emit rows.
-  const rows: EventRow[] = [];
-  for (const e of seen.values()) {
-    rows.push({
-      timestamp: fmtTs(e.ts),
-      user_id: USER_ID,
-      session_id: e.sessionId,
-      event_name: "claude_code.user_prompt",
-      prompt_length: e.display.length,
-      provenance: "backfill-history",
-    });
-  }
 
   // Daily breakdown for sanity.
   const byDay = new Map<string, number>();
