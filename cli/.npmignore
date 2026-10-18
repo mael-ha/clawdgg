@@ -1,5 +1,8 @@
+# `files` in package.json is the whitelist; this is belt and braces for the
+# source that must never be published alongside the bundle.
+*.ts
+!dist/*.js
 *.log
 .DS_Store
 node_modules/
 tsconfig.json
-README.md

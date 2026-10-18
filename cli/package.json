@@ -1,14 +1,16 @@
 {
   "name": "clawdgg",
   "version": "1.0.0",
-  "description": "Track your Claude Code usage - leaderboard, stats, and real-time streaming",
+  "description": "Track your Claude Code usage — leaderboard, stats, and real-time streaming",
   "type": "module",
   "bin": {
-    "clawdgg": "./index.ts"
+    "clawdgg": "./dist/clawdgg.js"
   },
   "scripts": {
-    "build": "bun build ./index.ts --outdir ./dist --target node",
-    "dev": "bun run ./index.ts"
+    "build": "bun ../scripts/build-cli.ts --bundle",
+    "build:binaries": "bun ../scripts/build-cli.ts --all --checksums",
+    "dev": "bun ./index.ts",
+    "prepack": "bun ../scripts/build-cli.ts --bundle"
   },
   "keywords": [
     "claude",
@@ -26,16 +28,17 @@
   "homepage": "https://clawd.gg",
   "repository": {
     "type": "git",
-    "url": "https://github.com/mael-ha/clawdgg"
+    "url": "git+https://github.com/mael-ha/clawdgg.git",
+    "directory": "cli"
   },
   "bugs": {
     "url": "https://github.com/mael-ha/clawdgg/issues"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "bun": ">=1.1.0"
   },
   "files": [
-    "index.ts",
+    "dist/clawdgg.js",
     "README.md"
   ],
   "dependencies": {},

@@ -2,84 +2,91 @@
 
 Track your Claude Code usage. See how much you've invested, compete on the leaderboard, and flex your stats.
 
-## Quick Start
+## Install
 
 ```bash
-npx clawdgg gg
+curl -fsSL https://clawd.gg/install | sh
 ```
 
-That's it. One command does everything:
-1. Links your GitHub account
-2. Syncs your historical Claude Code usage
-3. Enables real-time streaming
+A single standalone binary lands in `~/.clawdgg/bin/clawdgg` — no Node, no Bun, no npm. The installer verifies the download's SHA-256 against the release checksums before it installs anything, and never uses `sudo`.
 
-After running, **restart Claude Code** to activate streaming.
+Already a Bun user? `bunx clawdgg setup` works too.
 
-Then visit [clawd.gg](https://clawd.gg) to see your stats.
+## Quick start
 
-## What It Does
+```bash
+clawdgg setup
+```
 
-- **Parses your local Claude Code sessions** from `~/.claude/projects/`
-- **Calculates your stats**: prompts, tokens, cost, lines written, commits
-- **Uploads to the leaderboard** at [clawd.gg](https://clawd.gg)
-- **Streams real-time telemetry** so your stats update automatically
+One command, and it asks before each step:
+
+1. links your GitHub account
+2. shows you exactly what gets sent, and waits for your yes
+3. points Claude Code's telemetry at clawd.gg
+4. offers to import the history you already have locally
+
+Then **restart Claude Code** and visit [clawd.gg](https://clawd.gg).
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `clawdgg gg` | **Do everything** - login, sync history, enable streaming |
-| `clawdgg status` | See your current stats and rank |
+| `clawdgg setup` | Everything above (alias: `clawdgg gg`) |
+| `clawdgg status` | Your stats and rank |
+| `clawdgg doctor` | Why isn't my data showing up? |
+| `clawdgg import` | Backfill history from your local transcripts |
 | `clawdgg login` | Link your GitHub account |
-| `clawdgg sync` | Manually sync history (usually not needed) |
-| `clawdgg setup` | Enable OTEL streaming (usually not needed) |
-| `clawdgg disable` | Turn off streaming |
-| `clawdgg logout` | Unlink your account |
+| `clawdgg logout` | Revoke the token and clear local state |
+| `clawdgg disable` | Stop streaming (`--purge` also deletes `~/.config/clawdgg`) |
+| `clawdgg version` | Print the version |
 
-## How It Works
+Flags: `--yes` assumes yes for every prompt (scripts, CI), `--no-import` skips the import step during setup.
 
-### Before OTEL (historical data)
-The CLI parses your local `.jsonl` session files to calculate usage statistics.
+Two more commands exist for Claude Code to call, not you: `statusline` (reports your Pro/Max limit windows) and `otel-headers` (prints the Authorization header for the exporter).
 
-### After OTEL (real-time)
-Once you run `clawdgg gg`, Claude Code streams telemetry directly to clawd.gg. Your stats update in real-time as you use Claude Code.
+## How it works
+
+`clawdgg setup` writes an OpenTelemetry block into `~/.claude/settings.json`, and Claude Code streams usage events to clawd.gg from then on.
+
+Auth goes through `otelHeadersHelper`, Claude Code's hook for dynamic headers: it runs `clawdgg otel-headers` at startup and every 29 minutes, and that command prints your bearer token from `~/.config/clawdgg/config.json` (mode 0600). No credential is ever written into `settings.json`.
+
+That indirection is the point. The old design baked a token into `OTEL_EXPORTER_OTLP_HEADERS`; when the token was revoked, the exporter 401'd forever in silence and months of data went missing. A helper that exits non-zero makes Claude Code show a startup warning instead. `clawdgg doctor` checks the same thing from the other end, including whether the server has actually received anything recently.
+
+`clawdgg import` reads the transcripts Claude Code already keeps in `~/.claude/projects/` (and `~/.claude/history.jsonl` for days whose transcripts have rotated away) and sends the metrics telemetry would have sent. It only covers time before telemetry was switched on, the server enforces that boundary, and running it twice imports nothing the second time.
 
 ## Privacy
 
-- Your **prompts and code are never sent** - only aggregate metrics
-- Metrics include: token counts, costs, lines written, tool usage
-- All data is tied to your GitHub username
-- You can disable streaming anytime with `clawdgg disable`
+What gets sent:
 
-## Installation Options
+- timestamps, model names, session ids
+- token counts (input / output / cache) and the cost they imply
+- how long your prompts were — the character count, not the text
+- which tools ran, whether they succeeded, how long they took
+- lines added/removed, commit counts
+- your Claude Code version, terminal, and Pro/Max limit percentages
 
-```bash
-# Easiest - run directly with npx
-npx clawdgg gg
+What never leaves your machine:
 
-# Or install globally
-npm install -g clawdgg
-clawdgg gg
+- your prompts (we store the length, never the words)
+- file contents, code, diffs, file paths
+- tool arguments, environment variables, secrets
 
-# Or with bun
-bun install -g clawdgg
-clawdgg gg
-```
+`clawdgg setup` prints this list and waits for you to agree. `clawdgg disable` turns streaming off and restores any OpenTelemetry settings you had before — it remembers what it replaced. Your settings.json is backed up to `settings.json.clawdgg-backup-<timestamp>` before the first change, and if that file ever fails to parse, clawdgg aborts rather than overwrite it.
 
-## Requirements
+## Files
 
-- Node.js 18+ or Bun
-- Claude Code with session data in `~/.claude/projects/`
+| Path | What |
+|------|------|
+| `~/.clawdgg/bin/clawdgg` | the binary |
+| `~/.config/clawdgg/config.json` | auth token, mode 0600 |
+| `~/.claude/settings.json` | the OTEL block and the two hooks |
 
-## Configuration
+## Environment variables
 
-- Auth token stored in: `~/.config/clawdgg/config.json`
-- Stats cache: `~/.config/clawdgg/cache.json`
-- OTEL config written to: `~/.claude/settings.json`
-
-## Environment Variables
-
-- `CLAWDGG_API_URL` - Override the API URL (default: `https://clawd.gg`)
+- `CLAWDGG_API_URL` — override the API URL (default: `https://clawd.gg`)
+- `CLAWDGG_BIN` — override the path clawdgg registers for its own hooks
+- `CLAWDGG_INSTALL_DIR` — where `install.sh` puts the binary
+- `CLAWDGG_VERSION` — install a specific release
 
 ## Links
 
