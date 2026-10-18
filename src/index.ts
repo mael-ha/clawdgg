@@ -4,6 +4,7 @@ import { logger } from 'hono/logger';
 import { serveStatic } from 'hono/bun';
 import auth from './routes/auth';
 import api from './routes/api';
+import boards from './routes/boards';
 import cli from './routes/cli';
 import install from './routes/install';
 import otel from './routes/otel';
@@ -64,6 +65,8 @@ app.route('/install', install);
 app.route('/auth', auth);
 // Before /api so the CLI's own endpoints aren't shadowed by api's 404 handling.
 app.route('/api/cli', cli);
+// Before /api, same reason as /api/cli: api's own routing would shadow it.
+app.route('/api/boards', boards);
 app.route('/api', api);
 app.route('/u', profile);
 app.route('/about', about);
