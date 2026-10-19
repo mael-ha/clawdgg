@@ -63,6 +63,83 @@ export interface QueryOptions {
   timeoutMs?: number;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Read Concurrency
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * HOW MANY READS MAY BE INSIDE CLICKHOUSE AT ONCE. Not a tuning knob — this is
+ * what stops a profile render from taking the server down.
+ *
+ * Every read here is `... FINAL`, which means merging the ReplacingMergeTree
+ * parts in memory, and the sorting key now ends in `row_id` (32 hex chars) so
+ * the merge carries that column too. One profile query over a 1.5M-event user
+ * costs 116–285 MiB, measured from system.query_log. A single profile render
+ * fires ~25–30 of them at once through nested `Promise.all`s (src/routes/
+ * profile.tsx, src/lib/fingerprint.ts, src/lib/profile-data.ts), and prod's
+ * `max_server_memory_usage` is under 3 GiB with ~660 MiB already resident. The
+ * fan-out therefore did not run slowly, it ran out of memory: ClickHouse's
+ * OvercommitTracker killed the queries with MEMORY_LIMIT_EXCEEDED and the page
+ * answered 503. Four at a time fits; raising the server cap alone does not,
+ * because 30 x 150 MiB exceeds any cap this box can hold.
+ *
+ * INSERTS DO NOT TAKE A PERMIT. Ingestion is the one thing that must never
+ * queue behind somebody's profile — a slow OTLP route makes exporters retry,
+ * and a retry storm is how a read problem becomes a write problem.
+ *
+ * The queue is FIFO, so a page that waits is served before a page that arrives
+ * later: a lifo queue starves the first request under sustained load.
+ */
+const DEFAULT_MAX_CONCURRENT_READS = 4;
+
+/** Exported for the test — the parse is the part worth asserting on. */
+export function resolveReadConcurrency(raw: string | undefined): number {
+  if (raw === undefined || raw === '') return DEFAULT_MAX_CONCURRENT_READS;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    console.error(
+      `[ClickHouse] ignoring CLICKHOUSE_MAX_CONCURRENT_READS=${raw}; using ${DEFAULT_MAX_CONCURRENT_READS}`
+    );
+    return DEFAULT_MAX_CONCURRENT_READS;
+  }
+  return parsed;
+}
+
+const MAX_CONCURRENT_READS = resolveReadConcurrency(process.env.CLICKHOUSE_MAX_CONCURRENT_READS);
+
+/** Permits GRANTED, held or handed over — never the number of running fetches. */
+let readsInFlight = 0;
+const readQueue: (() => void)[] = [];
+
+/**
+ * Run `fn` holding one of MAX_CONCURRENT_READS permits.
+ *
+ * The permit is handed STRAIGHT to the next waiter rather than released and
+ * re-acquired: resolving a promise only schedules a microtask, so a decrement
+ * here would let a caller arriving in between see a free slot that the waiter
+ * is about to take, and briefly run MAX+1 reads. Which is exactly the state
+ * this exists to prevent. A waiter therefore inherits its permit and does not
+ * increment.
+ *
+ * The release is in a `finally`, so it happens on success, throw, timeout and
+ * abort alike. A leaked permit would deadlock every page on the site.
+ */
+async function withReadPermit<T>(fn: () => Promise<T>): Promise<T> {
+  if (readsInFlight >= MAX_CONCURRENT_READS) {
+    await new Promise<void>(resolve => readQueue.push(resolve));
+  } else {
+    readsInFlight++;
+  }
+
+  try {
+    return await fn();
+  } finally {
+    const next = readQueue.shift();
+    if (next) next();
+    else readsInFlight--;
+  }
+}
+
 export async function query<T = any>(
   sql: string,
   params?: Record<string, any>,
@@ -81,17 +158,29 @@ export async function query<T = any>(
     }
   }
 
-  const response = await fetch(url.toString(), {
-    method: 'POST',
-    body: sql,
-    headers: {
-      'Content-Type': 'text/plain',
-    },
-    signal: AbortSignal.timeout(options?.timeoutMs ?? QUERY_TIMEOUT_MS),
+  // THE TIMEOUT STARTS WHEN THE QUERY DOES, not when it was asked for: the
+  // signal is created inside the permit, so the 10s budget covers the HTTP
+  // exchange only. Counting the queue wait against it would mean the 25th
+  // query of a profile render fails for being 25th — the queue exists to make
+  // the fan-out survivable, and a budget that the queue itself can exhaust
+  // just moves the 503 from ClickHouse to here. The wait is bounded anyway:
+  // four reads at a 10s ceiling each.
+  const { ok, body } = await withReadPermit(async () => {
+    const response = await fetch(url.toString(), {
+      method: 'POST',
+      body: sql,
+      headers: {
+        'Content-Type': 'text/plain',
+      },
+      signal: AbortSignal.timeout(options?.timeoutMs ?? QUERY_TIMEOUT_MS),
+    });
+    // Drained while we still hold the permit: an unread body is a query the
+    // server is still streaming.
+    return { ok: response.ok, body: await response.text() };
   });
 
-  if (!response.ok) {
-    const errorText = await response.text();
+  if (!ok) {
+    const errorText = body;
 
     // A STORED TIMEZONE MUST NEVER TAKE A PROFILE DOWN.
     //
@@ -107,7 +196,9 @@ export async function query<T = any>(
     // is not already UTC, and only on an error that names a time zone. Anything
     // else throws as before. The write-path probe passes its candidate under a
     // DIFFERENT parameter name for exactly this reason — it needs the truth,
-    // not a fallback.
+    // not a fallback. The retry re-enters query() with the permit already
+    // released, so it queues like any other read instead of deadlocking
+    // against itself.
     if (params?.tz && String(params.tz) !== DEFAULT_TIMEZONE && /time zone/i.test(errorText)) {
       console.error(
         `[ClickHouse] timezone ${params.tz} is unusable; re-reading in ${DEFAULT_TIMEZONE}:`,
@@ -120,11 +211,10 @@ export async function query<T = any>(
     throw new Error('Database query failed');
   }
 
-  const text = await response.text();
-  if (!text.trim()) return [];
+  if (!body.trim()) return [];
 
   // Parse JSONEachRow format (one JSON object per line)
-  return text.trim().split('\n').map(line => JSON.parse(line)) as T[];
+  return body.trim().split('\n').map(line => JSON.parse(line)) as T[];
 }
 
 /**
@@ -166,6 +256,10 @@ function sanitizeRow(row: Record<string, any>): Record<string, any> {
 
 /**
  * Insert rows into a ClickHouse table
+ *
+ * DELIBERATELY NOT under withReadPermit: see the note on
+ * DEFAULT_MAX_CONCURRENT_READS. An insert is cheap (no FINAL, no merge) and
+ * ingestion must never wait behind a profile render.
  */
 export async function insert(table: string, rows: Record<string, any>[]): Promise<void> {
   if (rows.length === 0) return;
