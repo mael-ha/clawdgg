@@ -38,7 +38,7 @@ Then **restart Claude Code** and visit [clawd.gg](https://clawd.gg).
 | `clawdgg login` | Link your GitHub account |
 | `clawdgg logout` | Revoke **this machine's** token and clear local state |
 | `clawdgg devices` | List your machines (`revoke <id>`, `revoke --all`, `rename <id> <name>`) |
-| `clawdgg disable` | Stop streaming (`--purge` also deletes `~/.config/clawdgg`) |
+| `clawdgg disable` | Stop counting (`--purge` also deletes `~/.config/clawdgg`) |
 | `clawdgg version` | Print the version |
 
 Flags: `--yes` assumes yes for every prompt (scripts, CI), `--no-import` skips the import step during setup.
@@ -47,7 +47,7 @@ Two more commands exist for Claude Code to call, not you: `statusline` (reports 
 
 ## How it works
 
-`clawdgg setup` writes an OpenTelemetry block into `~/.claude/settings.json`, and Claude Code streams usage events to clawd.gg from then on.
+`clawdgg setup` writes an OpenTelemetry block into `~/.claude/settings.json`, and Claude Code sends its own counts to clawd.gg from then on.
 
 Auth goes through `otelHeadersHelper`, Claude Code's hook for dynamic headers: it runs `clawdgg otel-headers` at startup and every 29 minutes, and that command prints your bearer token from `~/.config/clawdgg/config.json` (mode 0600). No credential is ever written into `settings.json`.
 
@@ -108,7 +108,7 @@ Read this part. Some of it is more revealing than a number.
 
 `clawdgg import` sends the same fields and nothing more.
 
-`clawdgg disable` turns streaming off and restores any OpenTelemetry settings you had before — it remembers what it replaced, and it only ever touches a value it can recognise as its own. It stops the stream; it does not delete what is already on clawd.gg. Ask and we will.
+`clawdgg disable` turns counting off and restores any OpenTelemetry settings you had before — it remembers what it replaced, and it only ever touches a value it can recognise as its own. It stops the counting; it does not delete what is already on clawd.gg. Ask and we will.
 
 Your settings.json is copied to `settings.json.clawdgg-backup-<timestamp>` before **every** write (the last five are kept), and if that file ever fails to parse, clawdgg aborts rather than overwrite it.
 

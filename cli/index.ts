@@ -435,7 +435,7 @@ function showConsent(): void {
   console.log(dim("Importing your history sends the same fields, nothing more."));
   console.log(dim("This turns on Claude Code telemetry globally (~/.claude/settings.json)."));
   console.log(`${dim("Undo any time with")} ${colors.cyan}clawdgg disable${colors.reset}${dim(" — which also restores whatever")}`);
-  console.log(dim("OpenTelemetry settings you had before. It stops the stream; it does not"));
+  console.log(dim("OpenTelemetry settings you had before. It stops the counting; it does not"));
   console.log(dim("delete what is already on clawd.gg. Ask us and we will."));
   console.log();
 }
@@ -786,7 +786,7 @@ async function cmdSetup(flags: SetupFlags): Promise<void> {
 
   // 2. Consent — telemetry is global, so it is never implicit.
   showConsent();
-  if (!(await confirm("Stream your Claude Code usage to clawd.gg?", flags.assumeYes))) {
+  if (!(await confirm("Count your Claude Code usage on clawd.gg?", flags.assumeYes))) {
     log.info("Nothing changed. Run `clawdgg setup` whenever you're ready.");
     process.exit(1);
   }
@@ -837,7 +837,7 @@ async function cmdSetup(flags: SetupFlags): Promise<void> {
     const response = await apiFetch("/api/otel/enable", { method: "POST", token: config.token });
     if (!response.ok) log.warn(`Server didn't confirm OTEL enable (HTTP ${response.status}).`);
   } catch (error) {
-    log.warn(`Couldn't tell the server you're streaming (${error}). \`clawdgg doctor\` will retry.`);
+    log.warn(`Couldn't tell the server you're counting (${error}). \`clawdgg doctor\` will retry.`);
   }
 
   // 4b. And which clock to read the timestamps in. Every "when" on the profile
@@ -853,7 +853,22 @@ async function cmdSetup(flags: SetupFlags): Promise<void> {
   }
 
   console.log();
-  console.log(`  ${colors.yellow}${colors.bright}⚠  RESTART CLAUDE CODE${colors.reset}${colors.yellow} to start streaming${colors.reset}`);
+  // `written.unchanged` was computed from settings.json as it was BEFORE this
+  // run's writes, so it answers "was this already set up?" and not "did we just
+  // set it up?". A re-run gets the short ending; a first run gets the one that
+  // explains why an open session is still quiet.
+  if (written.unchanged) {
+    log.success("Already counting.");
+    // Only when the hook went in on THIS run: telling someone to restart for a
+    // counter they have had for weeks is noise that trains them to ignore us.
+    if (written.promptHook.action === "added") {
+      log.info("Restart open sessions to pick up the 🌈 ultrathink counter.");
+    }
+  } else {
+    log.success("clawd.gg is counting.");
+    log.info("New Claude Code sessions send their numbers on their own.");
+    log.dim("  Sessions already open join after a restart.");
+  }
   console.log();
   console.log(`  Then: ${colors.cyan}${colors.bright}clawd.gg/u/${profile?.username ?? config.username}${colors.reset}`);
   console.log();
@@ -880,7 +895,7 @@ function reportRestore(outcome: ReturnType<typeof restoreOtelSettings>): void {
 }
 
 async function cmdDisable(purge: boolean): Promise<void> {
-  log.title("Turning off streaming");
+  log.title("Turning off counting");
 
   const config = await loadConfig();
 
@@ -948,7 +963,7 @@ async function cmdLogout(): Promise<void> {
         log.dim("    at once — so any other clawdgg login is logged out too. Re-run");
         log.dim("    `clawdgg login` on each machine to get per-device tokens.");
       } else {
-        log.success("This device's token is revoked. Your other machines keep streaming.");
+        log.success("This device's token is revoked. Your other machines keep counting.");
         log.dim("    `clawdgg devices revoke --all` is the log-out-everywhere button.");
       }
     } else if (response.status === 401) {
@@ -1114,7 +1129,7 @@ async function revokeDevice(config: Config, args: string[]): Promise<void> {
     await forgetLocalCredentials();
   } else {
     log.success(`Revoked ${id}.`);
-    log.dim("    That machine stops streaming at its next Claude Code start.");
+    log.dim("    That machine stops counting at its next Claude Code start.");
   }
   console.log();
 }
@@ -1632,7 +1647,7 @@ async function cmdDoctor(): Promise<void> {
         checks.push({ status: "ok", label: `Token valid (${elapsed}ms)` });
 
         if (health.otelEnabled === false) {
-          checks.push({ status: "warn", label: "Server has you marked as not streaming", fix: "clawdgg setup" });
+          checks.push({ status: "warn", label: "Server has you marked as not counting", fix: "clawdgg setup" });
         }
         if (health.lastLiveEventAt) {
           const ageMs = Date.now() - new Date(health.lastLiveEventAt).getTime();
@@ -1978,9 +1993,9 @@ async function offerImport(config: Config, assumeYes: boolean): Promise<void> {
   try {
     await runLocalImport(config, assumeYes);
   } catch (error) {
-    // Streaming is already configured; a failed import must not undo that.
+    // Counting is already configured; a failed import must not undo that.
     log.warn(`History import failed (${error instanceof Error ? error.message : error}).`);
-    log.dim("    Streaming is on regardless. Retry any time with `clawdgg import`.");
+    log.dim("    Counting is on regardless. Retry any time with `clawdgg import`.");
   }
 }
 
@@ -2009,7 +2024,7 @@ function showHelp(): void {
 ${colors.bright}${colors.cyan}clawd.gg${colors.reset} ${colors.dim}— track your Claude Code usage${colors.reset}
 
 ${colors.bright}Quick start:${colors.reset}
-  ${colors.cyan}clawdgg setup${colors.reset}   ${colors.dim}login, consent, enable streaming, import history${colors.reset}
+  ${colors.cyan}clawdgg setup${colors.reset}   ${colors.dim}login, consent, start counting, import history${colors.reset}
 
 ${colors.bright}Commands:${colors.reset}
   ${colors.green}setup${colors.reset}         Do everything (alias: ${colors.green}gg${colors.reset})
@@ -2019,7 +2034,7 @@ ${colors.bright}Commands:${colors.reset}
   ${colors.green}login${colors.reset}         Link your GitHub account
   ${colors.green}logout${colors.reset}        Revoke THIS machine's token and clear local state
   ${colors.green}devices${colors.reset}       List your machines (${colors.dim}revoke <id>${colors.reset} / ${colors.dim}revoke --all${colors.reset} / ${colors.dim}rename${colors.reset})
-  ${colors.green}disable${colors.reset}       Stop streaming (${colors.dim}--purge${colors.reset} also deletes ~/.config/clawdgg)
+  ${colors.green}disable${colors.reset}       Stop counting (${colors.dim}--purge${colors.reset} also deletes ~/.config/clawdgg)
   ${colors.green}version${colors.reset}       Print the version
 
 ${colors.bright}Flags:${colors.reset}

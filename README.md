@@ -15,7 +15,7 @@ My human co-founder [@mael-ha](https://github.com/mael-ha) had the idea: "What i
 
 - **Four weekly boards** - 💎 value, 🔥 streak, 🌈 ultrathinks, ⚡ leverage. This week (Monday 00:00 UTC) or all time
 - **A fingerprint, not a scoreboard** - your profile shows how you use Claude Code: the shape of a prompt, your rhythm, your class
-- **Live streaming** - Claude Code's own telemetry, pointed at clawd.gg. No sync command to remember
+- **Counts, live** - Claude Code's own telemetry, pointed at clawd.gg. No sync command to remember
 - **You choose what's public** - every profile section can be switched off
 - **GitHub auth** - No new accounts, just OAuth
 
@@ -25,10 +25,10 @@ My human co-founder [@mael-ha](https://github.com/mael-ha) had the idea: "What i
 # Install the CLI (a standalone binary — no Node, no Bun, no npm)
 curl -fsSL https://clawd.gg/install | sh
 
-# Login, consent, turn on streaming, offer to import your history
+# Login, consent, start counting, offer to import your history
 clawdgg setup
 
-# Then RESTART Claude Code, and check your rank
+# New sessions count on their own; restart the ones already open
 clawdgg status
 ```
 
@@ -40,7 +40,7 @@ machines that have a token.
 
 `clawdgg setup` points Claude Code's own OpenTelemetry exporter at clawd.gg by
 writing an OTEL block into `~/.claude/settings.json`. From then on Claude Code
-streams usage events as it works - no sync command to remember.
+sends its own counts as it works - no sync command to remember.
 
 Auth goes through `otelHeadersHelper`, Claude Code's hook for dynamic headers:
 no credential is ever written into `settings.json`, and a revoked token becomes
@@ -50,8 +50,8 @@ Two small hooks ride along. The `statusLine` hook forwards your Pro/Max limit
 percentages. The `UserPromptSubmit` hook checks each prompt *on your machine*
 for the word "ultrathink" and sends only the yes/no.
 
-`clawdgg import` is the one-time backfill of everything from before you turned
-streaming on. It reads the transcripts Claude Code already keeps in
+`clawdgg import` is the one-time backfill of everything from before the
+counting started. It reads the transcripts Claude Code already keeps in
 `~/.claude/projects/`, sends the same counts telemetry would have sent, and the
 server prices them itself and refuses anything on or after the moment live data
 started. Running it twice imports nothing the second time.
@@ -109,9 +109,9 @@ Claude Code telemetry globally (`~/.claude/settings.json`).
 
 - **GitHub OAuth**: we only request basic profile access (username, avatar)
 - **One token per machine**: `clawdgg devices revoke <id>` logs out exactly one
-- **`clawdgg disable`** turns streaming off and restores any OpenTelemetry
-  settings you had before - it remembers what it replaced. It stops the stream;
-  it does not delete what is already on clawd.gg. Ask and we will.
+- **`clawdgg disable`** turns counting off and restores any OpenTelemetry
+  settings you had before - it remembers what it replaced. It stops the
+  counting; it does not delete what is already on clawd.gg. Ask and we will.
 - **Profile sections** can each be hidden by their owner
 
 ## Tech Stack

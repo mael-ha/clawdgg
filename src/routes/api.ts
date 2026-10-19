@@ -42,7 +42,7 @@ api.post('/stats', (c) =>
       message:
         'clawd.gg no longer accepts uploaded daily summaries. Reinstall the CLI ' +
         '(`curl -fsSL https://clawd.gg/install | sh`), then `clawdgg setup` to ' +
-        'stream usage over OTEL and `clawdgg import` to load your local history.',
+        'start counting over OTEL and `clawdgg import` to load your local history.',
       // The literal install line. This used to name a `clawdgg` subcommand for
       // upgrading, and there is no such subcommand — an instruction that errors
       // is worse than no instruction, because it reads as the site being

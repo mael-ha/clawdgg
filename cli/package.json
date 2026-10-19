@@ -1,7 +1,7 @@
 {
   "name": "clawdgg",
   "version": "2.0.0",
-  "description": "Track your Claude Code usage — leaderboard, stats, and real-time streaming",
+  "description": "Track your Claude Code usage — leaderboard, stats, and real-time counting",
   "type": "module",
   "bin": {
     "clawdgg": "./dist/clawdgg.js"

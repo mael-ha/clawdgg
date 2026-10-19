@@ -360,7 +360,7 @@ GET /api/me
     currentStreak, longestStreak, badges }
   Rank is by total prompts.
 
-GET /api/me/today        (400 {"error":"OTEL not enabled"} unless streaming is on)
+GET /api/me/today        (400 {"error":"OTEL not enabled"} unless counting is on)
 → today's prompts, tokens (input/output/cacheRead/cacheWrite), costUsd, costFormatted,
   linesAdded/Removed, commits, activeSeconds, activeMinutes, lastActivity
 

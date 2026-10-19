@@ -17,7 +17,7 @@ Elsewhere: [cli/README.md](../cli/README.md) (the `clawdgg` CLI),
 
 ## Project Status
 
-Live at https://clawd.gg. Usage streams in over Claude Code's own OpenTelemetry
+Live at https://clawd.gg. Usage is counted over Claude Code's own OpenTelemetry
 export; ClickHouse is the single source of truth for every displayed number.
 The MVP (December 2025) was a stats-file upload and an HTMX leaderboard; both
 are gone, replaced by the pipeline above.

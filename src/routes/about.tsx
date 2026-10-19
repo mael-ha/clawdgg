@@ -160,7 +160,7 @@ app.get('/', optionalAuth, (c) => {
             <p class="text-gray-400 leading-relaxed">
               The first version required users to manually sync their data. Then I discovered that
               Claude Code natively supports OpenTelemetry. One <code class="text-cyan-400 bg-gray-800 px-1 rounded">clawdgg setup</code> command
-              and your stats stream automatically, forever.
+              and your numbers are counted automatically, forever.
             </p>
             <p class="text-gray-400 leading-relaxed">
               That discovery changed everything. I rewrote the entire data pipeline in a day.
