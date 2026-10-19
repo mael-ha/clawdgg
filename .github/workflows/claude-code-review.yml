@@ -12,13 +12,18 @@ on:
 
 jobs:
   claude-review:
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
-    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
-
+    # Owner-only, for the reason spelled out at the top of claude.yml: this job
+    # spends the owner's Claude token and the repo is public. A fork PR on
+    # `pull_request` gets no secrets and would fail on the missing token anyway,
+    # but a branch PR from a collaborator added later WOULD get them — so the
+    # gate is explicit: the PR's author is the repo owner, and so is the actor
+    # who opened or pushed to it.
+    if: |
+      github.actor == github.repository_owner &&
+      github.event.pull_request.author_association == 'OWNER'
     runs-on: ubuntu-latest
+    # All read; `id-token: write` mints the Claude GitHub App token that Claude
+    # posts the review with. See the note in claude.yml.
     permissions:
       contents: read
       pull-requests: read
@@ -33,7 +38,8 @@ jobs:
 
       - name: Run Claude Code Review
         id: claude-review
-        uses: anthropics/claude-code-action@v1
+        # Pinned to a full commit SHA — see the note in claude.yml.
+        uses: anthropics/claude-code-action@5eb090f3c3afd701a0672cd32981197ca27688f6 # v1.0.253
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
@@ -51,7 +57,9 @@ jobs:
 
             Use `gh pr comment` with your Bash tool to leave your review as a comment on the PR.
 
+          # v1 has no `model:` input — the model is a Claude CLI flag.
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
-          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
-
+          claude_args: |
+            --model claude-opus-5-5
+            --allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"

@@ -1,5 +1,14 @@
 name: Claude Code
 
+# Every run here spends the OWNER's Claude token, and the repo is public. The
+# action's own check is "the actor has write access", which on a public repo is
+# still a door — anyone can open an issue or comment — so each trigger path is
+# gated twice on the owner instead: `author_association == 'OWNER'` (the owner
+# wrote this comment/review/issue) AND `github.actor == github.repository_owner`
+# (the owner's event started this run). Both hold only for mael-ha, because
+# mael-ha/clawdgg is owned by a USER: GitHub never returns OWNER on an
+# org-owned repo, and `repository_owner` would be the org's name there.
+
 on:
   issue_comment:
     types: [created]
@@ -13,11 +22,18 @@ on:
 jobs:
   claude:
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      github.actor == github.repository_owner && (
+      (github.event_name == 'issue_comment' && github.event.comment.author_association == 'OWNER' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && github.event.comment.author_association == 'OWNER' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && github.event.review.author_association == 'OWNER' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && github.event.issue.author_association == 'OWNER' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      )
     runs-on: ubuntu-latest
+    # Every scope is read. Claude's own writes — comments, branches — go through
+    # the short-lived Claude GitHub App token the action mints for itself, not
+    # through GITHUB_TOKEN. `id-token: write` is NOT spare: it is what mints
+    # that token. The action's default GitHub App auth exchanges this job's OIDC
+    # token for it, and without the scope every run fails on OIDC.
     permissions:
       contents: read
       pull-requests: read
@@ -32,7 +48,10 @@ jobs:
 
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@v1
+        # Pinned to a full commit SHA, like release-cli.yml: a tag is a moving
+        # pointer the action's owner can repoint, and this job holds our token.
+        # `@v1` resolves to this same commit today.
+        uses: anthropics/claude-code-action@5eb090f3c3afd701a0672cd32981197ca27688f6 # v1.0.253
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
@@ -40,11 +59,6 @@ jobs:
           additional_permissions: |
             actions: read
 
-          # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
-          # prompt: 'Update the pull request description to include a summary of changes.'
-
-          # Optional: Add claude_args to customize behavior and configuration
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://code.claude.com/docs/en/cli-reference for available options
-          # claude_args: '--allowed-tools Bash(gh pr:*)'
-
+          # v1 has no `model:` input — the model is a Claude CLI flag.
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/configuration.md
+          claude_args: "--model claude-opus-5-5"
