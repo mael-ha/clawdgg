@@ -12,10 +12,10 @@
  * before the link is posted, which means somebody has to build it who is not a
  * visitor.
  *
- * So: every five minutes, walk the users worth warming and rebuild the three
- * things a visitor and a crawler hit — the public page payload, the public
- * fingerprint API payload, and the card (SVG and PNG). Through the routes' own
- * build functions and the routes' own cache keys, which is the whole trick: a
+ * So: every five minutes, walk the users worth warming and rebuild what a
+ * visitor and a crawler hit — the shared public fingerprint, the public page
+ * payload, and the card (SVG and PNG). Through the same build functions and
+ * the same cache keys the routes themselves use, which is the whole trick: a
  * warmed entry under a key the route does not read is a second cache
  * pretending to be the first.
  *
@@ -44,8 +44,9 @@ import { desc, sql } from 'drizzle-orm';
 import { db } from '../db';
 import { users } from '../db/schema';
 import { fetchProfileUser } from './profile-data';
+import { hiddenFor } from './profile-settings';
+import { refreshPublicFingerprint } from './public-fingerprint';
 import { warmProfilePayload } from '../routes/profile';
-import { warmFingerprint } from '../routes/api';
 import { warmCard } from '../routes/og';
 
 const INTERVAL_MS = 5 * 60_000;
@@ -60,11 +61,10 @@ const FIRST_RUN_DELAY_MS = 30_000;
 /**
  * How many users one cycle will walk.
  *
- * A ceiling, not a target. Each user costs three fan-outs (the page, the API
- * payload and the card each build their own fingerprint today — see the note
- * at warmUser), so a cycle is minutes, not seconds, and the overlap guard will
- * happily skip ticks. The cap is what keeps "we signed up 500 users" from
- * turning this into a job that never finishes a cycle.
+ * A ceiling, not a target. One user is one ClickHouse fan-out (see warmUser)
+ * plus a rasterisation, so a cycle is still minutes rather than seconds for a
+ * heavy list and the overlap guard will skip ticks. The cap is what keeps "we
+ * signed up 500 users" from turning this into a job that never finishes.
  */
 const MAX_USERS = 100;
 
@@ -124,23 +124,24 @@ async function usersToWarm(): Promise<string[]> {
 }
 
 /**
- * The three things a visitor and a crawler hit, for one user, in that order.
+ * Everything a visitor and a crawler hit, for one user — and ONE fan-out.
  *
- * Sequentially inside the user too, for the same reason the users are
- * sequential: three fan-outs at once is three times the limiter pressure.
+ * The ORDER is the point. The public fingerprint goes first and is the only
+ * ClickHouse fan-out in here: the page payload and the card are both built
+ * from it (src/lib/public-fingerprint.ts), so by the time they are warmed they
+ * find it fresh and cost only what is their own — the year, the curve and the
+ * plan for the page, the rasterisation for the card. The fingerprint endpoint
+ * needs no warming of its own at all any more; it reads that same entry.
  *
- * It IS three fan-outs. The page payload, the fingerprint endpoint and the
- * card each call getFingerprint for themselves, so the same ~13 public reads
- * happen three times per user per cycle. Collapsing them onto one cached
- * fingerprint is the obvious next win and it is a change to how the three
- * routes share a cache, not to this job.
+ * Sequentially, for the reason the users are sequential: concurrent fan-outs
+ * are concurrent pressure on a 4-permit limiter that readers also need.
  */
 async function warmUser(username: string): Promise<void> {
   const user = await fetchProfileUser(username);
   if (!user) return;
 
+  await refreshPublicFingerprint(user, await hiddenFor(user.id));
   await warmProfilePayload(user);
-  await warmFingerprint(user);
   await warmCard(username);
 }
 

@@ -113,14 +113,29 @@ export function parseVisibilityPatch(body: unknown): VisibilityPatch | Visibilit
   return { patch };
 }
 
+/** The owner's settings row, or undefined when they have never set any. */
+export async function settingsFor(
+  userId: string,
+  database: AppDb = db
+): Promise<ProfileSettings | undefined> {
+  return database.select().from(profileSettings).where(eq(profileSettings.userId, userId)).get();
+}
+
 /** The owner's current settings, defaulted when they have never set any. */
 export async function getVisibility(userId: string, database: AppDb = db): Promise<Visibility> {
-  const row = await database
-    .select()
-    .from(profileSettings)
-    .where(eq(profileSettings.userId, userId))
-    .get();
-  return visibilityOf(row);
+  return visibilityOf(await settingsFor(userId, database));
+}
+
+/**
+ * What a visitor does not get to see — the list that is part of every public
+ * cache key. One read, so the page, the card, the API and the warmer cannot
+ * disagree about which list a payload was filtered by.
+ */
+export async function hiddenFor(
+  userId: string,
+  database: AppDb = db
+): Promise<FingerprintSection[]> {
+  return hiddenSections(await settingsFor(userId, database));
 }
 
 /**

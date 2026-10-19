@@ -1,22 +1,19 @@
 import { Hono } from 'hono';
 import { db } from '../db';
-import { users, planUsageSnapshots, profileSettings } from '../db/schema';
+import { users, planUsageSnapshots } from '../db/schema';
 import { eq, sql, desc, and, gte } from 'drizzle-orm';
 import { requireAuth, requireBearerAuth, optionalAuth } from '../lib/auth-middleware';
 import { normalizeEpochSeconds, parseRateLimits, shouldInsertSnapshot } from '../lib/plan-usage';
 import { getModelDisplayName } from '../lib/pricing';
 import { DEFAULT_TIMEZONE, canonicalTimezone, normalizeTimezone } from '../lib/timezone';
-import {
-  getFingerprint,
-  type FingerprintData,
-  type FingerprintSection,
-} from '../lib/fingerprint';
+import { getFingerprint, type FingerprintData } from '../lib/fingerprint';
 import {
   getVisibility,
-  hiddenSections,
+  hiddenFor,
   parseVisibilityPatch,
   setVisibility,
 } from '../lib/profile-settings';
+import { evictPublicFingerprint, publicFingerprint } from '../lib/public-fingerprint';
 import { TtlCache } from '../lib/ttl-cache';
 // Route modules, imported for one thing each: the caches a settings change has
 // to evict live next to the data they cache, not in a registry here.
@@ -301,77 +298,43 @@ api.post('/otel/enable', requireAuth, async (c) => {
 // the payload for everyone else rather than zeroed, and `sections` / `hidden`
 // name which is which — a viewer sees a gap, never a wrong number.
 //
-// The cache is short and never holds a failure: `getFingerprint` throws if
-// ClickHouse is unreachable, and the throw never reaches the cache, so the next
-// request retries instead of serving an empty fingerprint for a whole minute.
-// An all-zero fingerprint is indistinguishable from "this person has never
-// used Claude Code", which is the one thing it must not be able to say wrongly.
+// A VISITOR's payload is not cached here at all. It is the shared public
+// fingerprint (src/lib/public-fingerprint.ts), the same object the profile page
+// and the share card are built from: three surfaces asking ClickHouse the same
+// thirteen questions about the same person used to be three fan-outs, and is
+// now one. Everything that cache does — a minute fresh, thirty more of stale
+// window, single-flight, the hidden list in the key, never a cached failure —
+// is documented there.
 //
-// Behind the minute there are thirty more of stale window. The minute bounds
-// how old the figures may be; it never said the rebuild was cheap, and a
-// 13-query fan-out through a 4-permit limiter is seconds for a heavy user. In
-// the window a caller gets the last payload at once with a rebuild behind it,
-// and a rebuild that fails leaves the stale payload alone instead of turning
-// into a 503. Past the window the caller waits, as before — and an eviction
-// (the toggle below) is a hard miss, stale value and in-flight build included.
-const FINGERPRINT_TTL_MS = 60_000;
-const FINGERPRINT_STALE_MS = 30 * 60_000;
-const fingerprintCache = new TtlCache<FingerprintData>(FINGERPRINT_TTL_MS, 500, {
-  staleMs: FINGERPRINT_STALE_MS,
-  name: 'fingerprint',
+// What stays here is the OWNER's payload, which is a different payload: it
+// carries the sections they have taken down and their zone name. It is kept
+// apart from the public cache rather than keyed apart in it, so there is no
+// argument any caller could pass to get it served to a visitor.
+//
+// It never holds a failure either: `getFingerprint` throws if ClickHouse is
+// unreachable and the throw never reaches the cache, so the next request
+// retries instead of serving an empty fingerprint for a whole minute. An
+// all-zero fingerprint is indistinguishable from "this person has never used
+// Claude Code", which is the one thing it must not be able to say wrongly.
+const OWNER_FINGERPRINT_TTL_MS = 60_000;
+const OWNER_FINGERPRINT_STALE_MS = 30 * 60_000;
+const ownerFingerprintCache = new TtlCache<FingerprintData>(OWNER_FINGERPRINT_TTL_MS, 500, {
+  staleMs: OWNER_FINGERPRINT_STALE_MS,
+  name: 'owner-fingerprint',
 });
 
 /**
- * The fingerprint cache's key.
+ * The owner's key: the user, and nothing else.
  *
- * The owner's payload is a different payload, so it is a different key — and
- * so is a payload built under a different set of hidden sections.
- *
- * The hidden list is IN THE KEY, not just evicted on save. Eviction alone
- * loses a race it cannot see: a build that started before the toggle is still
- * in flight, finishes after the delete, and writes the pre-toggle payload back
- * under the same key for the rest of the TTL — so the section the owner just
- * hid is served to visitors for another minute, after the UI said it was
- * saved. Keyed this way, that build can only re-cache the key it was built
- * for. (TtlCache now also invalidates a build in flight when its key is
- * evicted, which is the same guard from the other side.)
- *
- * One function, because the route and the warmer below both name it.
+ * The hidden list is NOT in it, and that is not an oversight — the owner's
+ * payload is unfiltered, so it does not depend on the list, and keying by it
+ * would have cached an identical payload once per setting they ever tried. The
+ * list IS still in the public cache's key, where the payload really was
+ * filtered by it; see the note there. The `|` is kept so the evictions below
+ * can stay prefix matches.
  */
-function fingerprintKey(
-  userId: string,
-  isOwner: boolean,
-  hiddenFromOthers: readonly FingerprintSection[]
-): string {
-  return `${userId}|${isOwner ? 'owner' : 'public'}|${hiddenFromOthers.join(',')}`;
-}
-
-/**
- * Rebuild one user's PUBLIC fingerprint now, through this route's own key.
- *
- * For src/lib/warm.ts. `refresh`, not `remember`: the warmer must WAIT for its
- * own rebuilds — see the note on warmProfilePayload in src/routes/profile.tsx.
- */
-export async function warmFingerprint(user: {
-  id: string;
-  githubUsername: string;
-  timezone: string;
-}): Promise<void> {
-  const settings = await db
-    .select()
-    .from(profileSettings)
-    .where(eq(profileSettings.userId, user.id))
-    .get();
-  const hiddenFromOthers = hiddenSections(settings);
-
-  await fingerprintCache.refresh(fingerprintKey(user.id, false, hiddenFromOthers), () =>
-    getFingerprint(user.id, {
-      username: user.githubUsername,
-      timezone: user.timezone,
-      isOwner: false,
-      hidden: hiddenFromOthers,
-    })
-  );
+function ownerFingerprintKey(userId: string): string {
+  return `${userId}|owner`;
 }
 
 api.get('/u/:username/fingerprint', optionalAuth, async (c) => {
@@ -388,24 +351,19 @@ api.get('/u/:username/fingerprint', optionalAuth, async (c) => {
   const isOwner = c.get('user')?.githubUsername === row.githubUsername;
 
   try {
-    const settings = await db
-      .select()
-      .from(profileSettings)
-      .where(eq(profileSettings.userId, row.id))
-      .get();
-    const hiddenFromOthers = hiddenSections(settings);
+    const hiddenFromOthers = await hiddenFor(row.id);
 
-    const data = await fingerprintCache.remember(
-      fingerprintKey(row.id, isOwner, hiddenFromOthers),
-      () =>
-        getFingerprint(row.id, {
-          username: row.githubUsername,
-          timezone: row.timezone,
-          isOwner,
-          // The owner always sees everything, including what they have hidden.
-          hidden: isOwner ? [] : hiddenFromOthers,
-        })
-    );
+    const data = isOwner
+      ? await ownerFingerprintCache.remember(ownerFingerprintKey(row.id), () =>
+          getFingerprint(row.id, {
+            username: row.githubUsername,
+            timezone: row.timezone,
+            isOwner: true,
+            // The owner always sees everything, including what they have hidden.
+            hidden: [],
+          })
+        )
+      : await publicFingerprint(row, hiddenFromOthers);
 
     // `hidden` says what is missing from THIS payload; `hiddenFromOthers` says
     // what a visitor would not get. For a visitor they are the same list, and
@@ -448,16 +406,18 @@ api.put('/me/profile-settings', requireAuth, async (c) => {
 
   const sections = await setVisibility(user.id, parsed.patch);
 
-  // Every cache keyed on the hidden list, evicted together.
+  // Every cache that could be holding the figure they just took down, evicted
+  // together — the shared public fingerprint FIRST, because the page and the
+  // card are built from it and evicting them without it would only have them
+  // rebuild from the same stale payload.
   //
-  // The list being part of each key (see the GET above) is what makes the next
-  // read a miss by construction and stops an in-flight build re-caching a
-  // stale payload under it. This clears the keys the PREVIOUS list made, which
-  // would otherwise sit out their TTL unread — and only this user's, which is
-  // why each one is a prefix and not a clear(). All three were missed before:
-  // the toggle took effect on the fingerprint endpoint immediately and on the
-  // page, the curve and the share card up to ten minutes later.
-  fingerprintCache.deletePrefix(`${user.id}|`);
+  // The hidden list being part of each key (see the GET above) is what makes
+  // the next read a miss by construction and stops an in-flight build
+  // re-caching a stale payload under it. This clears the keys the PREVIOUS
+  // list made, which would otherwise sit out their window unread — and only
+  // this user's, which is why each one is a prefix and not a clear().
+  evictPublicFingerprint(user.id);
+  ownerFingerprintCache.deletePrefix(`${user.id}|`);
   evictProfileCaches(user.githubUsername, user.id);
   evictCardCache(user.id);
 
@@ -559,8 +519,15 @@ api.put('/me/timezone', requireAuth, async (c) => {
     .set({ timezone, updatedAt: new Date() })
     .where(eq(users.id, user.id));
 
-  // Every cached figure for this user was read in the OLD clock.
-  fingerprintCache.deletePrefix(`${user.id}|`);
+  // Every cached figure for this user was read in the OLD clock — every hour
+  // bucket, weekday and week boundary in the fingerprint converts with it. The
+  // page and the card are built from the same payload, so they go too; only
+  // the fingerprint endpoint was evicted here before, which left the profile
+  // and the share card printing the old zone's figures for their own TTLs.
+  evictPublicFingerprint(user.id);
+  ownerFingerprintCache.deletePrefix(`${user.id}|`);
+  evictProfileCaches(user.githubUsername, user.id);
+  evictCardCache(user.id);
 
   return c.json({ success: true, timezone });
 });

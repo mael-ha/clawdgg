@@ -24,11 +24,8 @@
  */
 
 import { Hono } from 'hono';
-import { eq } from 'drizzle-orm';
-import { db } from '../db';
-import { profileSettings } from '../db/schema';
-import { getFingerprint } from '../lib/fingerprint';
-import { hiddenSections } from '../lib/profile-settings';
+import { hiddenFor } from '../lib/profile-settings';
+import { publicFingerprint } from '../lib/public-fingerprint';
 import { fetchProfileUser } from '../lib/profile-data';
 import { shareCardFrom } from '../lib/share-card';
 import { cardPng } from '../lib/card-png';
@@ -101,22 +98,15 @@ async function cardSvgFor(username: string, rebuild = false): Promise<string | n
   const user = await fetchProfileUser(username);
   if (!user) return null;
 
-  const settings = await db
-    .select()
-    .from(profileSettings)
-    .where(eq(profileSettings.userId, user.id))
-    .get();
-  const hidden = hiddenSections(settings);
+  const hidden = await hiddenFor(user.id);
 
   const build = async () => {
-    const data = await getFingerprint(user.id, {
-      username: user.githubUsername,
-      timezone: user.timezone,
-      // Always the public view, whoever is asking — which also keeps the
-      // zone name out of the payload this card is built from.
-      isOwner: false,
-      hidden,
-    });
+    // The SHARED public fingerprint — the same payload the page and the API
+    // serve, so this card costs no fan-out of its own when either has been
+    // asked for recently. Always the public view, whoever is asking, which is
+    // structural rather than an argument here: src/lib/public-fingerprint.ts
+    // takes no owner flag and so keeps the zone name out of this drawing.
+    const data = await publicFingerprint(user, hidden);
 
     return String(ShareCard({ card: shareCardFrom(data, { username: user.githubUsername }) }));
   };

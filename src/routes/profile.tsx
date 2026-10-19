@@ -1,14 +1,12 @@
 import { Hono } from 'hono';
-import { eq } from 'drizzle-orm';
 import { Layout } from '../components/Layout';
-import { db } from '../db';
-import { profileSettings } from '../db/schema';
 import {
   getFingerprint,
   type FingerprintData,
   type FingerprintSection,
 } from '../lib/fingerprint';
-import { hiddenSections, visibilityOf } from '../lib/profile-settings';
+import { hiddenSections, settingsFor, visibilityOf } from '../lib/profile-settings';
+import { publicFingerprint } from '../lib/public-fingerprint';
 import { TtlCache } from '../lib/ttl-cache';
 import type { Island } from '../lib/assets';
 import type { SessionUser } from '../types';
@@ -136,11 +134,6 @@ const curveCache = new TtlCache<CurveView>(60_000, 1_000);
 /** The default view of ⚡ activity: value, by week, over the last year. */
 const DEFAULT_CURVE = { metric: 'value', period: '1y', groupBy: 'week' } as const;
 
-/** The owner's stored toggles, or undefined when they have never set any. */
-function settingsFor(userId: string) {
-  return db.select().from(profileSettings).where(eq(profileSettings.userId, userId)).get();
-}
-
 /**
  * Forget everything this route has cached for one user.
  *
@@ -176,6 +169,9 @@ function pageKey(
  *
  * The PUBLIC view only. The owner's payload carries the sections they have
  * hidden, and nothing but their own request should ever cause one to be built.
+ *
+ * The fingerprint inside it is the shared one, so when the warmer refreshes
+ * that first this rebuild only costs the year, the curve and the plan.
  */
 export async function warmProfilePayload(user: ProfileUser): Promise<void> {
   const settings = await settingsFor(user.id);
@@ -217,15 +213,21 @@ async function buildPayload(
   // THROWS, and the route lets it, because a profile with no fingerprint is
   // not a degraded profile, it is a page that should say "try again".
   const [fingerprint, year, curve, plan] = await Promise.all([
-    getFingerprint(user.id, {
-      username: user.githubUsername,
-      timezone: user.timezone,
-      // The payload now gates the zone name itself — a visitor's copy has no
-      // `timezone` at all. See FingerprintData.timezone.
-      isOwner,
-      // The owner always sees everything, including what they have hidden.
-      hidden: isOwner ? [] : [...hiddenFromOthers],
-    }),
+    // A VISITOR's fingerprint is the shared one — the same payload the card and
+    // the API serve, built once for all three (src/lib/public-fingerprint.ts).
+    // The OWNER's is built here and cached only in this route's `own` payload:
+    // it carries the sections they have hidden and their zone name (the payload
+    // gates that itself — see FingerprintData.timezone), so it must not go into
+    // a cache anything public reads.
+    isOwner
+      ? getFingerprint(user.id, {
+          username: user.githubUsername,
+          timezone: user.timezone,
+          isOwner: true,
+          // The owner always sees everything, including what they have hidden.
+          hidden: [],
+        })
+      : publicFingerprint(user, hiddenFromOthers),
     isOwner || visibility.year
       ? fetchYearSeries(user.id, user.timezone).catch(failed('year', null as ContributionDay[] | null))
       : Promise.resolve(null),
