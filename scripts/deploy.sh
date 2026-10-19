@@ -4,9 +4,9 @@
 #   scripts/deploy.sh --dry-run    # show exactly what would change
 #   scripts/deploy.sh              # sync, then `docker compose build app`
 #
-# It BUILDS ONLY. Nothing restarts, nothing swaps: the runbook
-# (.claude/memento/procedures/deploy.md) decides when to `up -d`, because that
-# is the step with the downtime and the rollback.
+# It BUILDS ONLY. Nothing restarts, nothing swaps — it PRINTS the roll-out and
+# the rollback instead, because that is the step with the downtime. The long
+# form of both is in docker/clickhouse/migrations/README-2026-10.md (step 2).
 #
 # What it syncs is exactly what the Dockerfile copies into the image, and
 # nothing else — the point of listing the paths instead of sending the whole
@@ -110,6 +110,21 @@ rsync "${RSYNC_FLAGS[@]}" \
 # The two that decide whether the site answers. Always itemized, dry run or
 # not: an unexpected line here means the server's copy was edited by hand and
 # this run is about to discard that edit.
+#
+# BACKED UP FIRST, on the server. The itemized listing tells you a hand edit is
+# about to be discarded, and it tells you AFTERWARDS — this script used to sync
+# these two and leave the backup to a step in a runbook, so by the time anyone
+# read the listing the only copy of the overwritten file was gone. `cp -n` does
+# not clobber an existing .bak, so the backup is the file as it stood before the
+# FIRST deploy that ran this — which is the copy you want when a deploy today
+# breaks something that worked last month.
+if [ "$DRY_RUN" = 0 ]; then
+  say "backing up the server's copies first   (cp -n: an existing .bak is kept)"
+  ssh "$HOST" "cd $REMOTE_DIR && for f in $COMPOSE_FILE Caddyfile; do \
+      [ -f \"\$f\" ] && cp -n \"\$f\" \"\$f.bak\"; \
+    done; ls -l *.bak 2>/dev/null || echo '    (nothing on the server to back up yet)'"
+fi
+
 say "the live compose file and Caddyfile → $HOST:$REMOTE_DIR/   (itemized)"
 echo "    a line below means the server's copy differs from this repo's."
 rsync "${RSYNC_FLAGS[@]}" --itemize-changes \
@@ -133,17 +148,33 @@ cat <<EOF
 $(printf '\033[1;32m✓\033[0m') Image built on $HOST. NOTHING IS LIVE YET.
 
   Roll it out when you're ready:
-    ssh $HOST 'cd $REMOTE_DIR && docker compose -f $COMPOSE_FILE up -d app'
+    ssh $HOST 'cd $REMOTE_DIR && docker compose -f $COMPOSE_FILE up -d --no-deps app'
 
   Then check it:
     curl -fsS https://clawd.gg/health
     curl -fsSL https://clawd.gg/install | head -5
 
+  ROLLBACK — one line, and it is this one:
+    ssh $HOST 'cd $REMOTE_DIR && docker tag clawdgg-app:<previous> clawdgg-app:latest \\
+      && docker compose -f $COMPOSE_FILE up -d --no-deps --force-recreate app'
+    (docker/clickhouse/migrations/README-2026-10.md, step 2, has the long form.)
+
+  --no-deps on every up -d: without it compose considers the service's
+  dependencies and will recreate ClickHouse as a side effect of restarting the
+  app. --force-recreate because a plain up -d is a no-op once a docker tag has
+  moved :latest under an unchanged service definition.
+
+  NOT 'docker compose down && docker compose up -d'. With no -f it reads the
+  SERVER's own docker-compose.yml (Caddy, not the app), and 'down' stops every
+  service in whichever file it picked — that is the site off the air, not a
+  container swap.
+
+  The compose file and Caddyfile this run overwrote are at
+  $REMOTE_DIR/$COMPOSE_FILE.bak and $REMOTE_DIR/Caddyfile.bak.
+
   NEVER add --remove-orphans to any compose command in $REMOTE_DIR. Until the
   server's own docker-compose.yml is retired (see below), Caddy is defined in
   a file this one does not know about, and --remove-orphans deletes it.
-
-  .claude/memento/procedures/deploy.md has the rollback.
 EOF
 
 # ---------------------------------------------------------------------------
@@ -170,8 +201,10 @@ $(printf '\033[1;33m!\033[0m') ONE-TIME SWITCH-OVER — Caddy moves into $COMPOS
      and clawdgg_caddy_config. Different names mean STOP: adopting would start
      a second Caddy with an empty /data, which orders a new certificate.
 
-  1. Back both files up on the server, BEFORE any sync overwrites them:
-       ssh $HOST 'cd $REMOTE_DIR && cp -n docker-compose.staging.yml docker-compose.staging.yml.bak && cp -n docker-compose.yml docker-compose.yml.bak'
+  1. Back up the SERVER's own compose file. This script already backs up the
+     other two before it syncs them (see above), and docker-compose.yml is
+     never synced, so it is the only one left to do by hand:
+       ssh $HOST 'cd $REMOTE_DIR && cp -n docker-compose.yml docker-compose.yml.bak'
 
   2. Check whether the Caddyfile about to be synced is the one running:
        ssh $HOST 'cat $REMOTE_DIR/Caddyfile' | diff - Caddyfile && echo IDENTICAL
@@ -179,7 +212,7 @@ $(printf '\033[1;33m!\033[0m') ONE-TIME SWITCH-OVER — Caddy moves into $COMPOS
      is what terminates TLS for clawd.gg.
 
   3. Sync and build (this script, no flags), then adopt Caddy:
-       ssh $HOST 'cd $REMOTE_DIR && docker compose -f $COMPOSE_FILE up -d caddy'
+       ssh $HOST 'cd $REMOTE_DIR && docker compose -f $COMPOSE_FILE up -d --no-deps caddy'
      Compose finds service \`caddy\` already running in project clawdgg. It
      either reports it up to date or recreates it in place — either way there
      is ONE container, keeping its name and its two volumes, so the
@@ -201,8 +234,8 @@ $(printf '\033[1;33m!\033[0m') ONE-TIME SWITCH-OVER — Caddy moves into $COMPOS
   ROLLBACK (at any point, Caddy's data volume is untouched throughout):
        ssh $HOST 'cd $REMOTE_DIR && cp docker-compose.staging.yml.bak docker-compose.staging.yml'
        ssh $HOST 'cd $REMOTE_DIR && [ -f docker-compose.yml ] || mv docker-compose.yml.retired docker-compose.yml'
-       ssh $HOST 'cd $REMOTE_DIR && docker compose -f docker-compose.yml up -d caddy'
-       ssh $HOST 'cd $REMOTE_DIR && docker compose -f docker-compose.staging.yml up -d app'
+       ssh $HOST 'cd $REMOTE_DIR && docker compose -f docker-compose.yml up -d --no-deps caddy'
+       ssh $HOST 'cd $REMOTE_DIR && docker compose -f docker-compose.staging.yml up -d --no-deps --force-recreate app'
 
   Set SHOW_SWITCHOVER=0 to stop printing this once it is done.
 EOF
