@@ -173,9 +173,6 @@ export const HomePage: FC<{ view: HomeView }> = ({ view }) => {
   const { board, scope, rows, total, comparedTo } = view;
   const nextOffset = rows.length;
   const remaining = Math.max(0, total - nextOffset);
-  // With three or fewer entrants the podium IS the board: a table of the same
-  // three people under their own cards is a scroll for no information.
-  const podiumIsEnough = total <= 3;
 
   return (
     <div class="min-h-screen bg-[#050508] font-mono text-[#e6e8ee]">
@@ -210,24 +207,27 @@ export const HomePage: FC<{ view: HomeView }> = ({ view }) => {
                 comparedTo={comparedTo}
                 scopeLabel={SCOPE_LABELS[scope]}
               />
-              {podiumIsEnough ? (
-                <p class="font-mono text-xs text-[#6f7686]">
-                  {total === 1
-                    ? 'one dev on this board so far'
-                    : `${total} devs on this board so far`}
-                  {comparedTo ? ` · ▲▼ vs ${comparedTo}` : ''}
-                </p>
-              ) : (
-                <BoardTable
-                  board={board}
-                  scope={scope}
-                  rows={rows}
-                  total={total}
-                  comparedTo={comparedTo}
-                  remaining={remaining}
-                  nextOffset={nextOffset}
-                />
-              )}
+              {/* The denominator, which nothing else on the page prints. The
+                  ▲▼ note is the table footer's — saying it twice on a board
+                  with one dev on it read as two different claims. */}
+              <p class="font-mono text-xs text-[#6f7686]">
+                {total === 1 ? 'one dev on this board so far' : `${total} devs on this board so far`}
+              </p>
+              {/* The table ALWAYS, from rank 1, however few entrants there are:
+                  the top three are on the podium as cards and in the table as
+                  rows, because a leaderboard with one person on it is still a
+                  leaderboard and has to look like one. Repeating three rows is
+                  a cheaper price than a page that reads as a podium until the
+                  fourth person signs up. */}
+              <BoardTable
+                board={board}
+                scope={scope}
+                rows={rows}
+                total={total}
+                comparedTo={comparedTo}
+                remaining={remaining}
+                nextOffset={nextOffset}
+              />
             </>
           )}
         </section>
