@@ -97,7 +97,7 @@ export function evictCardCache(userId: string): void {
  * Throws if the fingerprint cannot be built, which the routes turn into a
  * 503 — see the note on the placeholder below.
  */
-async function cardSvgFor(username: string): Promise<string | null> {
+async function cardSvgFor(username: string, rebuild = false): Promise<string | null> {
   const user = await fetchProfileUser(username);
   if (!user) return null;
 
@@ -108,11 +108,7 @@ async function cardSvgFor(username: string): Promise<string | null> {
     .get();
   const hidden = hiddenSections(settings);
 
-  // The hidden list is IN THE KEY, not just evicted on save — the reason is
-  // written out at the fingerprint cache in src/routes/api.ts: eviction alone
-  // loses the race against a build that was already in flight when the toggle
-  // was saved, and this cache holds the IMAGE that unfurlers go and fetch.
-  return cardCache.remember(`${user.id}|${hidden.join(',')}`, async () => {
+  const build = async () => {
     const data = await getFingerprint(user.id, {
       username: user.githubUsername,
       timezone: user.timezone,
@@ -123,7 +119,36 @@ async function cardSvgFor(username: string): Promise<string | null> {
     });
 
     return String(ShareCard({ card: shareCardFrom(data, { username: user.githubUsername }) }));
-  });
+  };
+
+  // The hidden list is IN THE KEY, not just evicted on save — the reason is
+  // written out at the fingerprint cache in src/routes/api.ts: eviction alone
+  // loses the race against a build that was already in flight when the toggle
+  // was saved, and this cache holds the IMAGE that unfurlers go and fetch.
+  const key = `${user.id}|${hidden.join(',')}`;
+  return rebuild ? cardCache.refresh(key, build) : cardCache.remember(key, build);
+}
+
+/** The PNG cache's key: the hash of the drawing, not the user. */
+function pngKey(svg: string): string {
+  return Bun.hash(svg).toString(36);
+}
+
+/**
+ * Rebuild one user's card now, through the routes' own builds and keys.
+ *
+ * For src/lib/warm.ts, and the reason the warmer exists at all: a cold card
+ * takes seconds and X's unfurler will not wait for it, so the card has to be
+ * warm BEFORE the link is posted rather than one fetch after.
+ *
+ * The SVG is forced; the PNG is not. `pngCache` is keyed by the hash of the
+ * markup it rasterised, so an unchanged card is already there and re-doing it
+ * would burn resvg on identical bytes.
+ */
+export async function warmCard(username: string): Promise<void> {
+  const svg = await cardSvgFor(username, true);
+  if (svg === null) return;
+  await pngCache.remember(pngKey(svg), async () => cardPng(svg));
 }
 
 /**
@@ -179,7 +204,7 @@ og.get('/:username/card.png', async (c) => {
     const svg = await cardSvgFor(username);
     if (svg === null) return c.text('No such user', 404);
 
-    const png = await pngCache.remember(Bun.hash(svg).toString(36), async () => cardPng(svg));
+    const png = await pngCache.remember(pngKey(svg), async () => cardPng(svg));
 
     return new Response(png, {
       headers: {

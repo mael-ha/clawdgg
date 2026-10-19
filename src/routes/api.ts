@@ -6,7 +6,11 @@ import { requireAuth, requireBearerAuth, optionalAuth } from '../lib/auth-middle
 import { normalizeEpochSeconds, parseRateLimits, shouldInsertSnapshot } from '../lib/plan-usage';
 import { getModelDisplayName } from '../lib/pricing';
 import { DEFAULT_TIMEZONE, canonicalTimezone, normalizeTimezone } from '../lib/timezone';
-import { getFingerprint, type FingerprintData } from '../lib/fingerprint';
+import {
+  getFingerprint,
+  type FingerprintData,
+  type FingerprintSection,
+} from '../lib/fingerprint';
 import {
   getVisibility,
   hiddenSections,
@@ -317,6 +321,59 @@ const fingerprintCache = new TtlCache<FingerprintData>(FINGERPRINT_TTL_MS, 500, 
   name: 'fingerprint',
 });
 
+/**
+ * The fingerprint cache's key.
+ *
+ * The owner's payload is a different payload, so it is a different key — and
+ * so is a payload built under a different set of hidden sections.
+ *
+ * The hidden list is IN THE KEY, not just evicted on save. Eviction alone
+ * loses a race it cannot see: a build that started before the toggle is still
+ * in flight, finishes after the delete, and writes the pre-toggle payload back
+ * under the same key for the rest of the TTL — so the section the owner just
+ * hid is served to visitors for another minute, after the UI said it was
+ * saved. Keyed this way, that build can only re-cache the key it was built
+ * for. (TtlCache now also invalidates a build in flight when its key is
+ * evicted, which is the same guard from the other side.)
+ *
+ * One function, because the route and the warmer below both name it.
+ */
+function fingerprintKey(
+  userId: string,
+  isOwner: boolean,
+  hiddenFromOthers: readonly FingerprintSection[]
+): string {
+  return `${userId}|${isOwner ? 'owner' : 'public'}|${hiddenFromOthers.join(',')}`;
+}
+
+/**
+ * Rebuild one user's PUBLIC fingerprint now, through this route's own key.
+ *
+ * For src/lib/warm.ts. `refresh`, not `remember`: the warmer must WAIT for its
+ * own rebuilds — see the note on warmProfilePayload in src/routes/profile.tsx.
+ */
+export async function warmFingerprint(user: {
+  id: string;
+  githubUsername: string;
+  timezone: string;
+}): Promise<void> {
+  const settings = await db
+    .select()
+    .from(profileSettings)
+    .where(eq(profileSettings.userId, user.id))
+    .get();
+  const hiddenFromOthers = hiddenSections(settings);
+
+  await fingerprintCache.refresh(fingerprintKey(user.id, false, hiddenFromOthers), () =>
+    getFingerprint(user.id, {
+      username: user.githubUsername,
+      timezone: user.timezone,
+      isOwner: false,
+      hidden: hiddenFromOthers,
+    })
+  );
+}
+
 api.get('/u/:username/fingerprint', optionalAuth, async (c) => {
   const username = c.req.param('username');
 
@@ -339,17 +396,7 @@ api.get('/u/:username/fingerprint', optionalAuth, async (c) => {
     const hiddenFromOthers = hiddenSections(settings);
 
     const data = await fingerprintCache.remember(
-      // The owner's payload is a different payload, so it is a different key —
-      // and so is a payload built under a different set of hidden sections.
-      //
-      // The hidden list is IN THE KEY, not just evicted on save. Eviction alone
-      // loses a race it cannot see: a build that started before the toggle is
-      // still in flight, finishes after the delete, and writes the pre-toggle
-      // payload back under the same key for the rest of the TTL — so the
-      // section the owner just hid is served to visitors for another minute,
-      // after the UI said it was saved. Keyed this way, that build can only
-      // re-cache the key it was built for.
-      `${row.id}|${isOwner ? 'owner' : 'public'}|${hiddenFromOthers.join(',')}`,
+      fingerprintKey(row.id, isOwner, hiddenFromOthers),
       () =>
         getFingerprint(row.id, {
           username: row.githubUsername,

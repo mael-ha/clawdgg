@@ -153,6 +153,41 @@ export function evictProfileCaches(username: string, userId: string): void {
   curveCache.deletePrefix(`${userId}|`);
 }
 
+/**
+ * The page cache's key. One function, because the route and the warmer below
+ * both have to name it and a warmed entry under a key nobody reads is a second
+ * cache pretending to be this one.
+ */
+function pageKey(
+  username: string,
+  isOwner: boolean,
+  hiddenFromOthers: readonly FingerprintSection[]
+): string {
+  return `${username}|${isOwner ? 'own' : 'public'}|${hiddenFromOthers.join(',')}`;
+}
+
+/**
+ * Rebuild one user's PUBLIC payload now, through the route's own build and key.
+ *
+ * For src/lib/warm.ts. `refresh` and not `remember` on purpose: the warmer
+ * walks users one at a time so it never holds more than its share of the read
+ * limiter, and `remember` on a stale entry returns immediately with a rebuild
+ * in the background — which would put every user's fan-out in flight at once.
+ *
+ * The PUBLIC view only. The owner's payload carries the sections they have
+ * hidden, and nothing but their own request should ever cause one to be built.
+ */
+export async function warmProfilePayload(user: ProfileUser): Promise<void> {
+  const settings = await settingsFor(user.id);
+  const hiddenFromOthers = hiddenSections(settings);
+
+  await pageCache.refresh(
+    pageKey(user.githubUsername, false, hiddenFromOthers),
+    () => buildPayload(user, false, visibilityOf(settings), hiddenFromOthers),
+    (built) => built.complete
+  );
+}
+
 async function buildPayload(
   user: ProfileUser,
   isOwner: boolean,
@@ -325,7 +360,7 @@ app.get('/:username', async (c) => {
   let payload: ProfilePayload;
   try {
     payload = await pageCache.remember(
-      `${user.githubUsername}|${isOwner ? 'own' : 'public'}|${hiddenFromOthers.join(',')}`,
+      pageKey(user.githubUsername, isOwner, hiddenFromOthers),
       () => buildPayload(user, isOwner, visibility, hiddenFromOthers),
       (built) => built.complete
     );
