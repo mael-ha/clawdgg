@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { Database } from 'bun:sqlite';
+import { eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/bun-sqlite';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -17,6 +18,7 @@ import {
   clampBoardOffset,
   boardMetricName,
   boardRankChanges,
+  boardSnapshotSentinel,
   boardRowFor,
   boardValue,
   classFromEvidence,
@@ -862,6 +864,77 @@ describe('boardRankChanges', () => {
     expect(
       (await boardRankChanges('value', 'week', [], new Map(), now, database)).changes.size
     ).toBe(0);
+  });
+});
+
+describe('the sentinel that says a day is already on record', () => {
+  /**
+   * It was hardcoded to `board:value:all`, so the day 🪙 shipped every day
+   * already snapshotted counted as done and the new board got no row until the
+   * next UTC midnight — and a board cannot show an arrow against a day it was
+   * not in, so its first ▲▼ was two days out rather than one.
+   */
+  it('follows the first board, so a new first board is on record the same day', () => {
+    expect(boardSnapshotSentinel()).toBe('board:tokens:all');
+    expect(boardSnapshotSentinel()).toBe(
+      boardMetricName(BOARD_KEYS[0], BOARDS[BOARD_KEYS[0]].defaultScope)
+    );
+  });
+
+  /**
+   * And it has to be a metric the job WRITES. A sentinel naming a scope no
+   * board offers is never written, so the skip check never fires and the whole
+   * fan-out runs again every five minutes, forever.
+   */
+  it('names a board and scope the snapshot actually covers', () => {
+    const written = new Set<string>();
+    for (const board of BOARD_KEYS) {
+      for (const scope of BOARDS[board].scopes) written.add(boardMetricName(board, scope));
+    }
+    expect(written.has(boardSnapshotSentinel())).toBe(true);
+  });
+
+  /**
+   * Re-running a day that is PARTLY on record — which is exactly what the new
+   * sentinel makes happen once, on the deploy that adds a board — must not
+   * duplicate the boards already there. The unique index on
+   * (user, day, metric) plus onConflictDoNothing is what guarantees it.
+   */
+  it('leaves a partly-snapshotted day alone and fills in only what is missing', async () => {
+    const day = '2026-10-15';
+    const existing = [
+      { userId: 'a', day, metric: boardMetricName('value', 'all'), rank: 1, value: 900 },
+      { userId: 'b', day, metric: boardMetricName('value', 'all'), rank: 2, value: 400 },
+    ];
+    await database.insert(rankSnapshots).values(existing);
+
+    // What the next pass would write: the same 💎 rows again, with different
+    // ranks and figures, plus the 🪙 rows that were not there.
+    await database
+      .insert(rankSnapshots)
+      .values([
+        { userId: 'a', day, metric: boardMetricName('value', 'all'), rank: 2, value: 1 },
+        { userId: 'b', day, metric: boardMetricName('value', 'all'), rank: 1, value: 2 },
+        { userId: 'a', day, metric: boardSnapshotSentinel(), rank: 1, value: 37_200_000_000 },
+        { userId: 'b', day, metric: boardSnapshotSentinel(), rank: 2, value: 9_800_000_000 },
+      ])
+      .onConflictDoNothing();
+
+    const rows = await database
+      .select({ userId: rankSnapshots.userId, metric: rankSnapshots.metric, rank: rankSnapshots.rank, value: rankSnapshots.value })
+      .from(rankSnapshots)
+      .where(eq(rankSnapshots.day, day));
+
+    expect(rows.length).toBe(4);
+    // The 💎 rows are the ORIGINAL ones, untouched.
+    const value = rows.filter((row) => row.metric === boardMetricName('value', 'all'));
+    expect(value.map((row) => [row.userId, row.rank, row.value]).sort()).toEqual([
+      ['a', 1, 900],
+      ['b', 2, 400],
+    ]);
+    // And 🪙 is now on record for the same day, which is what buys it an arrow
+    // tomorrow instead of the day after.
+    expect(rows.filter((row) => row.metric === boardSnapshotSentinel()).length).toBe(2);
   });
 });
 

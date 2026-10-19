@@ -879,6 +879,32 @@ export function boardMetricName(board: BoardKey, scope: BoardScope): string {
 }
 
 /**
+ * The one metric name whose presence means "today is already on record".
+ *
+ * Derived from the FIRST board rather than named, and from its default scope,
+ * which is the one scope of it a listed user is certain to be on. Two reasons,
+ * and the first is what used to be wrong: it was hardcoded to `board:value:all`,
+ * so the day 🪙 shipped, every day that had already been snapshotted was
+ * considered done and the new board got no row until the next UTC midnight —
+ * a board cannot show a ▲▼ against a day it was not in, so its arrows were two
+ * days away instead of one. With the sentinel following BOARD_KEYS[0], adding a
+ * board backfills the current day on the sync job's next pass.
+ *
+ * The second: a sentinel on a scope nobody is ranked on would never be written,
+ * and the job would then redo the whole fan-out every five minutes forever.
+ * 🪙 over all time is non-empty for everyone the board lists, by construction —
+ * LISTED is "ClickHouse has usage for them".
+ *
+ * Re-running a partly-snapshotted day is safe: every insert is
+ * onConflictDoNothing against the unique index on (user, day, metric), so the
+ * boards already on record keep the rows they have.
+ */
+export function boardSnapshotSentinel(): string {
+  const board = BOARD_KEYS[0];
+  return boardMetricName(board, BOARDS[board].defaultScope);
+}
+
+/**
  * Write today's ranks for all five boards, both scopes, unless today is already
  * on record.
  *
@@ -897,7 +923,7 @@ export async function snapshotBoardRanks(
   database: AppDb = db
 ): Promise<number> {
   const day = utcDay(now);
-  const sentinel = boardMetricName('value', 'all');
+  const sentinel = boardSnapshotSentinel();
 
   const existing = await database
     .select({ userId: rankSnapshots.userId })
