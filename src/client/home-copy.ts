@@ -1,10 +1,10 @@
 /**
  * The copy button on the homepage's install line.
  *
- * Separate from copy-share.ts, which copies a blurb the server rendered into a
- * data attribute and lives on profiles: this one is the only JavaScript the
- * homepage loads, and bundling it with that would ship the profile's island to
- * every first-time visitor.
+ * Separate from profile-share.ts, which hands the profile's URL to the share
+ * sheet and lives on profiles: this one is the only JavaScript the homepage
+ * loads, and bundling it with that would ship the profile's island to every
+ * first-time visitor.
  *
  * Delegated from document, so the button needs no id and no re-binding.
  */

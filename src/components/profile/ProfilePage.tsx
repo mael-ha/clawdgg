@@ -201,20 +201,16 @@ export const ProfilePage: FC<ProfileViewProps> = ({
               </>
             )}
           </span>
-          <div class="flex w-full items-center gap-2.5 sm:w-auto">
+          <div class="flex w-full sm:w-auto">
+            {/* One control: this page's URL unfurls into the card, so the
+                link is the share and a separate PNG button said it twice. */}
             <button
               type="button"
-              data-share-text={shareUrl}
-              class="min-h-[44px] grow rounded-xl border border-fp-edge bg-transparent px-4 font-mono text-[13px] text-fp-text transition-colors hover:border-cyan-400 sm:grow-0"
+              data-share-url={shareUrl}
+              class="flex min-h-[44px] grow items-center justify-center rounded-xl bg-cyan-400 px-4 font-mono text-[13px] font-extrabold text-fp-ground sm:grow-0"
             >
-              copy link
+              share
             </button>
-            <a
-              href={`/u/${identity.username}/card.png`}
-              class="flex min-h-[44px] grow items-center justify-center rounded-xl bg-cyan-400 px-4 font-mono text-[13px] font-extrabold text-fp-ground no-underline sm:grow-0"
-            >
-              share my card
-            </a>
           </div>
         </footer>
       </div>

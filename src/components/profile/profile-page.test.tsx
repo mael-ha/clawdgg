@@ -259,6 +259,17 @@ describe('ProfilePage · empty and partial states', () => {
     expect(html).not.toContain('reads low');
   });
 
+  test('the footer offers one share control, carrying the page URL', () => {
+    // The URL unfurls into the card through og:image, so the share is the
+    // link — a second control pointing at card.png offered the same thing.
+    const props = fixtureProfile();
+    const html = render(<ProfilePage {...props} />);
+    expect(html.match(/<button[^>]*data-share-url/g)).toHaveLength(1);
+    expect(html).toContain(`data-share-url="${props.shareUrl}"`);
+    expect(html).toContain('>share</button>');
+    expect(html).not.toContain('card.png');
+  });
+
   test('an owner on the default timezone is told their hours are UTC', () => {
     const props = fixtureProfile({ owner: true });
     props.identity.timezone = 'UTC';

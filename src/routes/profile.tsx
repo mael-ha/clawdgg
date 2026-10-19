@@ -332,7 +332,7 @@ app.get('/:username', async (c) => {
       ])
     : [null, null];
 
-  const islands: Island[] = ['copy-share'];
+  const islands: Island[] = ['profile-share'];
   if (payload.year) islands.push('contribution-tooltip');
   if (payload.curve) islands.push('profile-curve');
   if (isOwner) islands.push('profile-visibility');

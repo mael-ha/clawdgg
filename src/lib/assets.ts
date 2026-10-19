@@ -15,11 +15,11 @@ try {
 
 export type Island =
   | 'contribution-tooltip'
-  | 'copy-share'
   | 'device-code-input'
   | 'home-copy'
   | 'leaderboard-more'
   | 'profile-curve'
+  | 'profile-share'
   | 'profile-visibility';
 
 function url(name: string): string {
