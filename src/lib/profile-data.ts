@@ -92,12 +92,21 @@ export async function fetchYearSeries(userId: string, tz: string): Promise<Contr
        GROUP BY date`,
       params
     ),
-    query<{ date: string; value: number; lines: number; estimated: number }>(
+    query<{ date: string; cost: number; lines_added: number; cost_estimated: number }>(
+      // NO ALIAS HERE MAY BE CALLED `value`, even though the shape it fills
+      // is. `value` is metrics_raw's own column, and prod runs the analyzer
+      // (`allow_experimental_analyzer = 1`, the 24.3 default) with
+      // `prefer_column_name_to_alias = 0` — so a later `sumIf(value, …)`
+      // resolves `value` to the ALIAS rather than the column, which is an
+      // aggregate inside an aggregate: Code 184, ILLEGAL_AGGREGATION. The
+      // whole year graph was missing from every profile, and the failure also
+      // stopped the route caching the page (src/routes/profile.tsx), so every
+      // view rebuilt from scratch.
       `SELECT
          toString(toDate(${LOCAL_TS_SQL})) AS date,
-         toFloat64(sumIf(value, metric_name = 'claude_code.cost.usage')) AS value,
-         toUInt64(sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added')) AS lines,
-         toFloat64(sumIf(value, metric_name = 'claude_code.cost.usage' AND ${ESTIMATED_SQL})) AS estimated
+         toFloat64(sumIf(value, metric_name = 'claude_code.cost.usage')) AS cost,
+         toUInt64(sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added')) AS lines_added,
+         toFloat64(sumIf(value, metric_name = 'claude_code.cost.usage' AND ${ESTIMATED_SQL})) AS cost_estimated
        FROM metrics_raw FINAL
        WHERE user_id = {userId:String}
          AND toDate(timestamp) >= today() - {days:UInt32}
@@ -136,9 +145,13 @@ export async function fetchYearSeries(userId: string, tz: string): Promise<Contr
 
   for (const row of metrics) {
     const entry = day(row.date);
-    entry.value = Number(row.value) || 0;
-    entry.lines = Number(row.lines) || 0;
-    if (entry.prompts === 0 && entry.value > 0 && (Number(row.estimated) || 0) * 2 > entry.value) {
+    entry.value = Number(row.cost) || 0;
+    entry.lines = Number(row.lines_added) || 0;
+    if (
+      entry.prompts === 0 &&
+      entry.value > 0 &&
+      (Number(row.cost_estimated) || 0) * 2 > entry.value
+    ) {
       entry.estimated = true;
     }
   }
@@ -321,10 +334,13 @@ export async function fetchToday(userId: string, tz: string): Promise<TodayData>
          AND toDate(timestamp) >= today() - 2`,
       params
     ),
-    query<{ value: number; lines: number }>(
+    query<{ cost: number; lines_added: number }>(
+      // `AS cost`, not `AS value`, for the reason fetchYearSeries spells out:
+      // an alias named after the column makes the second sumIf read the alias
+      // and fail with ILLEGAL_AGGREGATION. Same bug, same query shape.
       `SELECT
-         toFloat64(sumIf(value, metric_name = 'claude_code.cost.usage' AND ${today})) AS value,
-         toUInt64(sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added' AND ${today})) AS lines
+         toFloat64(sumIf(value, metric_name = 'claude_code.cost.usage' AND ${today})) AS cost,
+         toUInt64(sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added' AND ${today})) AS lines_added
        FROM metrics_raw FINAL
        WHERE user_id = {userId:String}
          AND toDate(timestamp) >= today() - 2`,
@@ -336,8 +352,8 @@ export async function fetchToday(userId: string, tz: string): Promise<TodayData>
   return {
     prompts: Number(event?.prompts) || 0,
     ultrathinks: Number(event?.ultrathinks) || 0,
-    value: Number(metrics[0]?.value) || 0,
-    lines: Number(metrics[0]?.lines) || 0,
+    value: Number(metrics[0]?.cost) || 0,
+    lines: Number(metrics[0]?.lines_added) || 0,
     lastEventAt: isoOrNull(event?.last_event),
   };
 }
