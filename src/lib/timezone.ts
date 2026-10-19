@@ -175,6 +175,18 @@ export function weekBounds(instant: Date, timeZone: string, weeksAgo = 0): WeekB
   };
 }
 
+/**
+ * 'YYYY-MM-DD' for the local calendar DAY of an instant.
+ *
+ * The same spelling ClickHouse hands back for `toDate(toTimeZone(timestamp,
+ * tz))`, which is what makes it comparable with the active-day set a streak is
+ * counted over — see calculateStreaks in src/jobs/sync-clickhouse.ts.
+ */
+export function localDate(instant: Date, timeZone: string): string {
+  const { year, month, day } = localParts(instant, normalizeTimezone(timeZone));
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
 /** 'YYYY-MM' for the local calendar month of an instant. */
 export function localMonth(instant: Date, timeZone: string): string {
   const { year, month } = localParts(instant, normalizeTimezone(timeZone));

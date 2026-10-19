@@ -23,7 +23,7 @@
 import { db } from '../db';
 import { users } from '../db/schema';
 import { clickhouse, query, LOCAL_TS_SQL, NO_LEGACY_SQL, PROMPT_EVENT_SQL } from '../db/clickhouse';
-import { normalizeTimezone } from '../lib/timezone';
+import { localDate, normalizeTimezone } from '../lib/timezone';
 import { pruneRankSnapshots, snapshotRanks } from '../lib/rank-snapshots';
 import { snapshotBoardRanks } from '../lib/boards';
 import { computeBadges } from '../lib/badges';
@@ -44,10 +44,27 @@ let isSyncing = false;
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Calculate current and longest streaks from a list of dates
- * A streak is consecutive days with activity
+ * Current and longest streaks over a set of ACTIVE LOCAL DAYS.
+ *
+ * `dates` are 'YYYY-MM-DD' calendar days in the user's own zone — what
+ * clickhouse.getUserActiveLocalDays returns — so every comparison here happens
+ * in calendar-day space, not in instants. `today` has to be in that same space
+ * or the last comparison is between two different clocks.
+ *
+ * THAT WAS THE BUG. `today` was `Date.now() / 86_400_000`, the UTC day number,
+ * against local calendar days: for a user in Tokyo, 09:00 on the 19th local is
+ * the 19th in their active-day set and still the 18th in UTC, so their run read
+ * as "active yesterday" — it survived, one day short, and broke outright the
+ * moment they missed a day. For Los Angeles the error has the opposite sign and
+ * is worse: 18:00 on the 18th local is the 19th in UTC, so a user who prompted
+ * today and yesterday had a last active day of today - 2 and NO current streak
+ * at all. Half the world's 🔥 was wrong by one day in one direction or the
+ * other, every evening and every morning.
  */
-function calculateStreaks(dates: string[]): { currentStreak: number; longestStreak: number } {
+export function calculateStreaks(
+  dates: string[],
+  today: string
+): { currentStreak: number; longestStreak: number } {
   if (dates.length === 0) {
     return { currentStreak: 0, longestStreak: 0 };
   }
@@ -56,10 +73,7 @@ function calculateStreaks(dates: string[]): { currentStreak: number; longestStre
   const sorted = [...new Set(dates)].sort();
 
   // Parse dates to day numbers (days since epoch)
-  const dayNumbers = sorted.map((dateStr) => {
-    const d = new Date(dateStr);
-    return Math.floor(d.getTime() / (24 * 60 * 60 * 1000));
-  });
+  const dayNumbers = sorted.map(dayNumber);
 
   // Calculate longest streak
   let longestStreak = 1;
@@ -78,12 +92,14 @@ function calculateStreaks(dates: string[]): { currentStreak: number; longestStre
     }
   }
 
-  // Calculate current streak (must include today or yesterday)
-  const today = Math.floor(Date.now() / (24 * 60 * 60 * 1000));
+  // Calculate current streak (must include today or yesterday). Yesterday
+  // counts because a day is not over until it is over: somebody who last
+  // prompted at 23:00 is on a streak at 08:00 the next morning.
+  const todayNumber = dayNumber(today);
   const lastActiveDay = dayNumbers[dayNumbers.length - 1]!;
 
   let currentStreak = 0;
-  if (lastActiveDay === today || lastActiveDay === today - 1) {
+  if (lastActiveDay === todayNumber || lastActiveDay === todayNumber - 1) {
     // Start from the last day and count backwards
     currentStreak = 1;
     for (let i = dayNumbers.length - 2; i >= 0; i--) {
@@ -98,6 +114,17 @@ function calculateStreaks(dates: string[]): { currentStreak: number; longestStre
   }
 
   return { currentStreak, longestStreak };
+}
+
+/**
+ * A 'YYYY-MM-DD' CALENDAR day as its index since the epoch.
+ *
+ * Read as UTC midnight deliberately: the input is already a local calendar
+ * date, so this is a numbering of calendar days and not a conversion of
+ * instants. Both sides of every comparison above go through it.
+ */
+function dayNumber(date: string): number {
+  return Math.floor(Date.parse(`${date.slice(0, 10)}T00:00:00Z`) / 86_400_000);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -261,7 +288,8 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         // day and broke the streak of anyone who works late. One definition,
         // shared with the profile's streak milestones — see the helper.
         const activeDates = await clickhouse.getUserActiveLocalDays(userId, timezone, 365);
-        const streaks = calculateStreaks(activeDates);
+        // Today in the USER's zone, because the days above are in it too.
+        const streaks = calculateStreaks(activeDates, localDate(new Date(), timezone));
 
         const hourCounts = await getUserHourlyCounts(userId, timezone);
         const longestSession = await getLongestSessionMessages(userId);
