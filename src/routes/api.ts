@@ -753,6 +753,10 @@ api.get('/me/insights', requireAuth, async (c) => {
       costPerCommit: userData.totalCommits && userData.totalCommits > 0
         ? (totalCostDollars / userData.totalCommits).toFixed(2)
         : '0',
+      // Every token type over lines added, because `tokens` means one thing on
+      // this response and it is users.total_tokens (TOTAL_TOKENS_SQL). It got
+      // about twenty times larger when that column started counting cache
+      // reads, which is the figure it now names.
       tokensPerLine: totalLines > 0
         ? Math.round((userData.totalTokens || 0) / totalLines)
         : 0,
@@ -761,6 +765,14 @@ api.get('/me/insights', requireAuth, async (c) => {
     // Format model diet. getModelDisplayName, not a second label chain: the
     // label has to name the tier the cost was actually priced at, and it has to
     // be the same label the profile page shows for the same model.
+    // The share is of the DIET'S OWN total, not of users.total_tokens: the two
+    // are different populations (this query reads input + output over rows that
+    // name a model, that column is every token type over every row), so the
+    // percentages used to add up to a number that was not 100 — and once
+    // total_tokens became every token type they would have added up to about 5.
+    // A share of the models listed is a figure a reader can check by adding the
+    // column up.
+    const dietTokens = modelUsage.reduce((sum, m) => sum + m.input_tokens + m.output_tokens, 0);
     const modelDiet = modelUsage.map(m => ({
       model: m.model,
       displayName: getModelDisplayName(m.model),
@@ -768,8 +780,8 @@ api.get('/me/insights', requireAuth, async (c) => {
       outputTokens: m.output_tokens,
       totalTokens: m.input_tokens + m.output_tokens,
       costUsd: m.cost_usd,
-      percentage: userData.totalTokens && userData.totalTokens > 0
-        ? ((m.input_tokens + m.output_tokens) / userData.totalTokens * 100).toFixed(1)
+      percentage: dietTokens > 0
+        ? ((m.input_tokens + m.output_tokens) / dietTokens * 100).toFixed(1)
         : '0',
     }));
 

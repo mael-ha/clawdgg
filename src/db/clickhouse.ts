@@ -458,8 +458,10 @@ export interface DailyMetrics {
 export interface UserTotals {
   user_id: string;
   total_prompts: number;
+  /** Every token type, summed — TOTAL_TOKENS_SQL. */
   total_tokens: number;
-  // Token breakdown, for the profile's token-flow bar
+  // Token breakdown, for the profile's token-flow bar. These add up to
+  // total_tokens above; none of them is it.
   total_input_tokens: number;
   total_output_tokens: number;
   total_cache_read_tokens: number;
@@ -828,6 +830,32 @@ export function cappedUltrathinksSql(within?: string): string {
 export const CAPPED_ULTRATHINKS_SQL = cappedUltrathinksSql();
 
 /**
+ * A user's TOTAL TOKENS. THE ONE DEFINITION — every figure the UI, the API or
+ * the CLI labels "tokens" is this expression, and nothing else is.
+ *
+ * EVERY token type: input, output, cacheRead and cacheCreation. Claude Code
+ * emits one `claude_code.token.usage` datapoint per type, so a sum with no
+ * `token_type` filter is the whole of what moved. This used to be
+ * `input + output` in getUserTotals and getLeaderboard and the unfiltered sum
+ * in getUserRank and getUserProvenanceBreakdown, which meant /api/me reported
+ * one number, the rank it reported beside it was computed from another, and
+ * the two were about twenty times apart — roughly 95% of tokens are cache
+ * reads. The board that ranks on this figure is what made the disagreement
+ * visible; it was always a bug.
+ *
+ * NO provenance filter. NO_LEGACY_SQL is for queries that read the SHAPE of a
+ * day; a pre-OTEL row is honest about HOW MANY tokens moved, and excluding it
+ * would take a user's first months off their own lifetime total.
+ *
+ * It is an AGGREGATE EXPRESSION and not a predicate on purpose: a predicate
+ * can be handed an extra `AND token_type = …` by the next caller, which is
+ * exactly how the two definitions grew apart. The PER-TYPE columns beside it
+ * (total_input_tokens and friends, the profile's token-flow bar) stay as they
+ * are — they are a breakdown OF this sum, and they add up to it.
+ */
+export const TOTAL_TOKENS_SQL = `sumIf(value, metric_name = 'claude_code.token.usage')`;
+
+/**
  * `timestamp` in the user's own wall clock. Every hour-of-day, weekday and
  * week-boundary read goes through this, never bare `toHour(timestamp)`.
  *
@@ -905,6 +933,7 @@ export async function getUserTotals(userId?: string): Promise<UserTotals[]> {
           sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'output') as total_output_tokens,
           sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheRead') as total_cache_read_tokens,
           sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheCreation') as total_cache_write_tokens,
+          ${TOTAL_TOKENS_SQL} as total_tokens,
           sumIf(value, metric_name = 'claude_code.cost.usage') as total_cost_usd,
           sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added') as total_lines_added,
           sumIf(value, metric_name = 'claude_code.commit.count') as total_commits,
@@ -917,7 +946,9 @@ export async function getUserTotals(userId?: string): Promise<UserTotals[]> {
     SELECT
       COALESCE(e.user_id, m.user_id) as user_id,
       toUInt64(COALESCE(e.total_prompts, 0)) as total_prompts,
-      toUInt64(COALESCE(m.total_input_tokens + m.total_output_tokens, 0)) as total_tokens,
+      -- The sum itself, not the two types added back up: cache reads are the
+      -- bulk of it (TOTAL_TOKENS_SQL).
+      toUInt64(COALESCE(m.total_tokens, 0)) as total_tokens,
       toUInt64(COALESCE(m.total_input_tokens, 0)) as total_input_tokens,
       toUInt64(COALESCE(m.total_output_tokens, 0)) as total_output_tokens,
       toUInt64(COALESCE(m.total_cache_read_tokens, 0)) as total_cache_read_tokens,
@@ -1081,7 +1112,7 @@ export async function getUserHourlyActivity(
     SELECT
       toUInt8(toHour(${LOCAL_TS_SQL})) as hour,
       toUInt8(toDayOfWeek(${LOCAL_TS_SQL})) as day_of_week,
-      toUInt64(sumIf(value, metric_name = 'claude_code.token.usage')) as activity
+      toUInt64(${TOTAL_TOKENS_SQL}) as activity
     FROM metrics_raw FINAL
     WHERE user_id = {userId:String}
       AND ${NO_LEGACY_SQL}
@@ -1142,6 +1173,7 @@ export async function getLeaderboard(
           sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'output') as total_output_tokens,
           sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheRead') as total_cache_read_tokens,
           sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'cacheCreation') as total_cache_write_tokens,
+          ${TOTAL_TOKENS_SQL} as total_tokens,
           sumIf(value, metric_name = 'claude_code.cost.usage') as total_cost_usd,
           sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added') as total_lines_added,
           sumIf(value, metric_name = 'claude_code.commit.count') as total_commits,
@@ -1154,7 +1186,9 @@ export async function getLeaderboard(
     SELECT
       COALESCE(e.user_id, m.user_id) as user_id,
       toUInt64(COALESCE(e.total_prompts, 0)) as total_prompts,
-      toUInt64(COALESCE(m.total_input_tokens + m.total_output_tokens, 0)) as total_tokens,
+      -- The sum itself, not the two types added back up: cache reads are the
+      -- bulk of it (TOTAL_TOKENS_SQL).
+      toUInt64(COALESCE(m.total_tokens, 0)) as total_tokens,
       toUInt64(COALESCE(m.total_input_tokens, 0)) as total_input_tokens,
       toUInt64(COALESCE(m.total_output_tokens, 0)) as total_output_tokens,
       toUInt64(COALESCE(m.total_cache_read_tokens, 0)) as total_cache_read_tokens,
@@ -1231,7 +1265,7 @@ export async function getUserRank(
       metric_stats AS (
         SELECT
           user_id,
-          sumIf(value, metric_name = 'claude_code.token.usage') as total_tokens,
+          ${TOTAL_TOKENS_SQL} as total_tokens,
           sumIf(value, metric_name = 'claude_code.cost.usage') as total_cost_usd,
           sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added') as total_lines_added
         FROM metrics_raw FINAL
@@ -1511,7 +1545,7 @@ export async function getUserVelocityTrend(userId: string, days: number = 30): P
       daily_metrics AS (
         SELECT
           toDate(timestamp) as date,
-          sumIf(value, metric_name = 'claude_code.token.usage') as tokens,
+          ${TOTAL_TOKENS_SQL} as tokens,
           sumIf(value, metric_name = 'claude_code.cost.usage') as costUsd,
           sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added') as lines
         FROM metrics_raw FINAL
@@ -1883,7 +1917,7 @@ export async function getUserProvenanceBreakdown(userId: string): Promise<Proven
       ),
       metric_parts AS (
         SELECT provenance,
-               sumIf(value, metric_name = 'claude_code.token.usage') as tokens,
+               ${TOTAL_TOKENS_SQL} as tokens,
                sumIf(value, metric_name = 'claude_code.cost.usage') as cost_usd
         FROM metrics_raw FINAL
         WHERE user_id = {userId:String}

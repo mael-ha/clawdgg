@@ -6,6 +6,7 @@ import {
   METRIC_IDENTITY_COLUMNS,
   MODEL_ID_SQL,
   PROMPT_EVENT_SQL,
+  TOTAL_TOKENS_SQL,
   eventRowId,
   identitySqlExpr,
   metricRowId,
@@ -322,6 +323,66 @@ describe('PROMPT_EVENT_SQL', () => {
     // 14 call sites at the time of writing; the guard is that none regressed
     // to a bare event_name check, which the test above enforces.
     expect(source.match(/\$\{PROMPT_EVENT_SQL\}/g)?.length).toBeGreaterThanOrEqual(14);
+  });
+});
+
+describe('TOTAL_TOKENS_SQL', () => {
+  const clickhouse = readFileSync(join(import.meta.dir, 'clickhouse.ts'), 'utf8');
+  const boards = readFileSync(join(REPO_ROOT, 'src/lib/boards.ts'), 'utf8');
+
+  it('sums every token type, with no provenance filter', () => {
+    expect(TOTAL_TOKENS_SQL).toBe("sumIf(value, metric_name = 'claude_code.token.usage')");
+    expect(TOTAL_TOKENS_SQL).not.toContain('token_type');
+    expect(TOTAL_TOKENS_SQL).not.toContain('provenance');
+  });
+
+  /**
+   * THE bug this constant exists for: getUserTotals and getLeaderboard read
+   * `input + output` while getUserRank and getUserProvenanceBreakdown read the
+   * unfiltered sum, so /api/me reported one token count and the rank printed
+   * beside it was computed from another about twenty times larger (~95% of
+   * tokens are cache reads). Every "total tokens" is now one expression.
+   */
+  it('is the only unfiltered token sum in either file', () => {
+    const SUM = "sumIf(value, metric_name = 'claude_code.token.usage'";
+    const offenders: string[] = [];
+
+    for (const [name, source] of [
+      ['clickhouse.ts', clickhouse],
+      ['boards.ts', boards],
+    ] as const) {
+      for (let at = source.indexOf(SUM); at !== -1; at = source.indexOf(SUM, at + 1)) {
+        // A window, not a line: the ⚡ sum wraps, and its `token_type` sits on
+        // the line after the one that opens the sumIf.
+        const window = source.slice(at, at + 200);
+        // A sum that names a token_type is a per-type BREAKDOWN column, which
+        // is allowed to stay — they add up to this constant.
+        if (window.includes('token_type')) continue;
+        // The declaration itself is the one legitimate unfiltered sum.
+        if (source.slice(Math.max(0, at - 40), at).includes('TOTAL_TOKENS_SQL = ')) continue;
+        offenders.push(`${name}: ${window.split('\n')[0]!.trim()}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('is what every total-tokens figure is read with', () => {
+    // getUserTotals, getLeaderboard, getUserRank, getUserHourlyActivity,
+    // getUserVelocityTrend, getUserProvenanceBreakdown.
+    expect(clickhouse.match(/\$\{TOTAL_TOKENS_SQL\}/g)?.length).toBeGreaterThanOrEqual(6);
+    // And the 🪙 board, which is the figure a reader compares to their own.
+    expect(boards).toContain('toUInt64(${TOTAL_TOKENS_SQL}) AS tokens');
+  });
+
+  /**
+   * `users.total_tokens` is this sum as the sync job stores it, so nothing may
+   * rebuild it out of the per-type columns — that was the old definition.
+   */
+  it('is not reassembled from the per-type columns anywhere', () => {
+    for (const source of [clickhouse, boards]) {
+      expect(source).not.toContain('total_input_tokens + m.total_output_tokens');
+      expect(source).not.toContain('m.total_input_tokens + m.total_output_tokens');
+    }
   });
 });
 

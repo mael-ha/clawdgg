@@ -354,7 +354,7 @@ All `auth`. Figures come from ClickHouse.
 ```
 GET /api/me
 → { username, avatarUrl, rank, totalUsers, percentile, archetype, archetypeDescription,
-    totalPrompts, totalTokens, totalCostCents,
+    totalPrompts, totalTokens, totalCostCents,   // totalTokens = EVERY token type
     totalInputTokens, totalOutputTokens, totalCacheReadTokens, totalCacheCreationTokens,
     totalLines, totalCommits, outputLeverage, cacheEfficiency,
     currentStreak, longestStreak, badges }

@@ -28,7 +28,7 @@ export const users = sqliteTable('users', {
   // OTel V2: Cached totals (synced from ClickHouse every 5 min)
   // ═══════════════════════════════════════════════════════════════════════
   totalPrompts: integer('total_prompts').default(0),
-  totalTokens: integer('total_tokens').default(0),          // input + output (bigint in practice)
+  totalTokens: integer('total_tokens').default(0),          // EVERY token type — TOTAL_TOKENS_SQL (bigint in practice)
   totalInputTokens: integer('total_input_tokens').default(0),
   totalOutputTokens: integer('total_output_tokens').default(0),
   totalCacheReadTokens: integer('total_cache_read_tokens').default(0),

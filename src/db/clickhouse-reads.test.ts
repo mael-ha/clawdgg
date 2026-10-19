@@ -716,6 +716,52 @@ suite('every ClickHouse read resolves against 24.3', () => {
       expect(typeof pulse.valueUsd).toBe('number');
       expect(typeof pulse.ultrathinks).toBe('number');
     });
+
+    /**
+     * ONE TOKEN COUNT, three readers, against real rows.
+     *
+     * src/db/clickhouse.test.ts asserts they share TOTAL_TOKENS_SQL by reading
+     * the source; this asserts the three paths come back with the same NUMBER,
+     * which is the claim that matters. They did not: getUserTotals summed
+     * input + output (what users.total_tokens and /api/me reported) while the
+     * rank query summed every type, about twenty times more.
+     *
+     * The fixture's per-prompt datapoints are 4,200 input + 980 output +
+     * 31,000 cacheRead + 2,100 cacheCreation = 38,280, and the four per-type
+     * columns have to add up to the total by construction.
+     */
+    it('reports the same token total through getUserTotals, the rank query and the 🪙 board', async () => {
+      const totals = (await clickhouse.getUserTotals(USER_A))[0]!;
+      const total = Number(totals.total_tokens);
+
+      expect(total).toBe(
+        Number(totals.total_input_tokens) +
+          Number(totals.total_output_tokens) +
+          Number(totals.total_cache_read_tokens) +
+          Number(totals.total_cache_write_tokens)
+      );
+      expect(total).toBeGreaterThan(0);
+
+      // The leaderboard's token sort reads the same figure for the same user.
+      const { entries } = await clickhouse.getLeaderboard('all', 'tokens', 100, 0);
+      const mine = entries.find(entry => entry.user_id === USER_A)!;
+      expect(Number(mine.total_tokens)).toBe(total);
+
+      // And the 🪙 board, which is what a reader compares to their own page.
+      const page = await boards.getBoardPage({
+        board: 'tokens',
+        scope: 'all',
+        limit: 100,
+        offset: 0,
+        viewerId: USER_A,
+      });
+      expect(page.rows.find(row => row.userId === USER_A)!.value).toBe(total);
+
+      // The provenance breakdown's parts add up to it too — that is the
+      // "traceable" half of the data-integrity rule.
+      const parts = await clickhouse.getUserProvenanceBreakdown(USER_A);
+      expect(parts.reduce((sum, part) => sum + Number(part.tokens), 0)).toBe(total);
+    }, 120_000);
   });
 
   // ─────────────────────────────────────────────────────────────────────────

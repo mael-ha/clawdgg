@@ -1126,25 +1126,22 @@ describe('the 🪙 board', () => {
   });
 
   /**
-   * ONE DEFINITION, read off the source. The 🪙 sum names no token_type and no
-   * provenance — which is the same sum getUserProvenanceBreakdown reports as
-   * `tokens`, and the same one getUserRank sorts its token leaderboard by. A
-   * provenance filter here would take a pre-OTEL user's first months off their
-   * own lifetime total; NO_LEGACY_SQL is for queries that read the SHAPE of a
-   * day, and a legacy row is honest about HOW MANY tokens moved.
+   * ONE DEFINITION, and it is not this file's. The board reads the shared
+   * TOTAL_TOKENS_SQL, which is what `users.total_tokens`, /api/me, the
+   * leaderboard's token sort and the provenance breakdown all read — so the
+   * figure a user is ranked on here is the figure on their own page.
+   * src/db/clickhouse.test.ts holds the constant itself to its terms, and the
+   * executed-read sweep asserts the three paths come back with the same NUMBER.
    */
-  it('is the same sum ClickHouse already answers "tokens" with', async () => {
-    const SUM = "sumIf(value, metric_name = 'claude_code.token.usage')";
-    const [boards, clickhouse] = await Promise.all([
-      readFile(join(REPO_ROOT, 'src/lib/boards.ts'), 'utf-8'),
-      readFile(join(REPO_ROOT, 'src/db/clickhouse.ts'), 'utf-8'),
-    ]);
+  it('reads the shared token sum rather than one of its own', async () => {
+    const boards = await readFile(join(REPO_ROOT, 'src/lib/boards.ts'), 'utf-8');
 
-    expect(boards).toContain(`toUInt64(${SUM}) AS tokens`);
-    expect(clickhouse).toContain(`${SUM} as tokens`);
-    // And nothing narrows it afterwards: the 🪙 sum is one expression, with no
-    // token_type and no provenance clause bolted onto its line.
-    const line = boards.split('\n').find((text) => text.includes(`toUInt64(${SUM}) AS tokens`))!;
+    expect(boards).toContain('toUInt64(${TOTAL_TOKENS_SQL}) AS tokens');
+    // And nothing narrows it on the way past: no token_type and no provenance
+    // clause bolted onto the 🪙 line, which would be a second definition.
+    const line = boards
+      .split('\n')
+      .find((text) => text.includes('toUInt64(${TOTAL_TOKENS_SQL}) AS tokens'))!;
     expect(line).not.toContain('token_type');
     expect(line).not.toContain('NO_LEGACY_SQL');
   });

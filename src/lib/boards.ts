@@ -38,6 +38,7 @@ import {
   CAPPED_ULTRATHINKS_SQL,
   NO_LEGACY_SQL,
   PROMPT_EVENT_SQL,
+  TOTAL_TOKENS_SQL,
   query,
 } from '../db/clickhouse';
 import { compact } from './format';
@@ -260,8 +261,9 @@ export interface BoardFigures {
   userId: string;
   /**
    * Every token Claude moved — input, output, cache reads and cache writes
-   * together, which is the same sum getUserProvenanceBreakdown reports.
-   * NOT `users.total_tokens`, which is input + output only.
+   * together. TOTAL_TOKENS_SQL, which is also what `users.total_tokens`,
+   * /api/me and every rank path read, so the figure on this board is the
+   * figure on that user's own page.
    */
   tokens: number;
   /** API-equivalent dollars. */
@@ -643,20 +645,13 @@ async function fetchFigures(
     query<Pick<FigureRow, 'user_id' | 'tokens' | 'value_usd' | 'output_tokens'>>(
       `SELECT
          user_id,
-         -- 🪙 — EVERY token type, which is what makes it "tokens" and not
-         -- "tokens of one kind": no token_type filter, so input, output,
-         -- cacheRead and cacheCreation all land in it. The same sum
-         -- getUserProvenanceBreakdown and getUserRank's token sort read, and
-         -- the sum the four per-type figures in getUserTotals add up to.
-         --
-         -- NO provenance filter, deliberately, and for the same reason 💎
-         -- above has none: NO_LEGACY_SQL exists for queries that read the
-         -- SHAPE of a day, and a pre-OTEL row is honest about HOW MANY tokens
-         -- moved. Excluding it would take a user's first months off their own
-         -- lifetime total. The ⚡ sum below is the only one that drops them,
-         -- because it is one side of a RATIO whose other side a legacy row
-         -- cannot contribute to.
-         toUInt64(sumIf(value, metric_name = 'claude_code.token.usage')) AS tokens,
+         -- 🪙 — THE shared definition, so this board cannot drift from the
+         -- figure the same user's own page and /api/me print. Every token
+         -- type, no provenance filter; src/db/clickhouse.ts says why.
+         -- The ⚡ sum below is the only token count on this page that is
+         -- narrower, because it is one side of a RATIO whose other side a
+         -- legacy row cannot contribute to.
+         toUInt64(${TOTAL_TOKENS_SQL}) AS tokens,
          toFloat64(sumIf(value, metric_name = 'claude_code.cost.usage')) AS value_usd,
          -- NO_LEGACY_SQL, to match the characters typed on the other side of
          -- the ⚡ ratio: prompt_chars above is summed over measured prompts
