@@ -27,7 +27,12 @@ import {
   WEEKDAY_INITIALS,
   WEEKDAY_NAMES,
 } from './palette';
-import type { ModelFamilyShare, RingItem } from '../../lib/fingerprint';
+import type {
+  MilestoneKind,
+  ModelFamilyShare,
+  NextMilestone,
+  RingItem,
+} from '../../lib/fingerprint';
 
 export const VIEW = 240;
 const CX = VIEW / 2;
@@ -532,72 +537,51 @@ export function cellFill(cell: GridCell): string {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * The thresholds a milestone can be, DUPLICATED from MILESTONE_SPECS in
- * src/lib/fingerprint.ts.
+ * The one `nextMilestones` entry the page points at, and the two figures the
+ * bar needs that the payload does not carry.
  *
- * The payload carries the milestones already CROSSED and says nothing about
- * what comes next, so the only way to draw a progress bar is to know the
- * ladder. Kept narrow on purpose — only the three kinds whose running total
- * the payload also carries, so a bar can never be drawn against a total this
- * page had to guess. See the hand-off note in the track report: this belongs in
- * the payload.
+ * The thresholds themselves USED TO LIVE HERE, duplicated from
+ * MILESTONE_SPECS. They are in the payload now (`nextMilestones`, one entry
+ * per unfinished ladder, with the figure each target is measured against), so
+ * all that is left is arithmetic over what arrived.
  */
-const LADDERS = {
-  prompts: { emoji: '💬', thresholds: [1_000, 10_000, 25_000, 50_000, 100_000], noun: 'prompts' },
-  lines: { emoji: '📝', thresholds: [100_000, 1_000_000, 10_000_000], noun: 'lines written' },
-  ultrathink: { emoji: '🌈', thresholds: [100, 1_000, 5_000], noun: 'ultrathinks' },
-} as const;
-
-export type LadderKind = keyof typeof LADDERS;
-
-export interface NextMilestone {
-  kind: LadderKind;
-  emoji: string;
-  label: string;
-  target: number;
-  current: number;
+export interface ShownMilestone extends NextMilestone {
   /** 0–100. */
   progressPct: number;
-  /** Weeks at the last 30 days' pace, or null when the pace is zero. */
+  /** Weeks at the last 30 days' pace, or null when there is no pace to use. */
   weeksAway: number | null;
 }
 
-function compact(value: number): string {
-  if (value >= 1_000_000) return `${value / 1_000_000}M`;
-  if (value >= 1_000) return `${value / 1_000}K`;
-  return String(value);
-}
-
 /**
- * The nearest unreached threshold across the three ladders.
+ * The unfinished ladder CLOSEST TO COMPLETION, in progress rather than in
+ * absolute distance.
  *
- * "Nearest" is measured in PROGRESS, not in absolute distance: 48,000 of 50,000
- * prompts and 90 of 100 ultrathinks are both nearly there, and the one the page
- * should point at is whichever is nearer in proportion. An absolute comparison
- * would always pick the ultrathink ladder, whose numbers are simply smaller.
+ * 48,000 of 50,000 prompts and 90 of 100 ultrathinks are both nearly there,
+ * and the one to point at is whichever is nearer in proportion. An absolute
+ * comparison would always pick the ultrathink ladder, whose numbers are simply
+ * smaller. A tie keeps the payload's order (prompts, lines, streak,
+ * ultrathink), so the same profile always names the same milestone.
+ *
+ * `ratePerWeek` covers only the kinds the page has a pace for; a kind without
+ * one — the streak — gets a bar and no forecast rather than a guessed week.
  */
-export function nextMilestone(
-  totals: { prompts: number; lines: number; ultrathink: number },
-  ratePerWeek: Partial<Record<LadderKind, number>> = {}
-): NextMilestone | null {
-  let best: NextMilestone | null = null;
+export function pickNextMilestone(
+  next: readonly NextMilestone[],
+  ratePerWeek: Partial<Record<MilestoneKind, number>> = {}
+): ShownMilestone | null {
+  let best: ShownMilestone | null = null;
 
-  for (const kind of Object.keys(LADDERS) as LadderKind[]) {
-    const ladder = LADDERS[kind];
-    const current = Math.max(0, Math.floor(totals[kind] ?? 0));
-    const target = ladder.thresholds.find((threshold) => current < threshold);
-    if (target === undefined) continue;
+  for (const milestone of next) {
+    if (milestone.target <= 0) continue;
 
-    const progressPct = (current / target) * 100;
-    const rate = ratePerWeek[kind] ?? 0;
-    const candidate: NextMilestone = {
-      kind,
-      emoji: ladder.emoji,
-      label: `${compact(target)} ${ladder.noun}`,
-      target,
+    const current = Math.max(0, Math.min(milestone.current, milestone.target));
+    const rate = ratePerWeek[milestone.kind] ?? 0;
+    const candidate: ShownMilestone = {
+      ...milestone,
       current,
-      progressPct,
-      weeksAway: rate > 0 ? Math.max(1, Math.ceil((target - current) / rate)) : null,
+      progressPct: (current / milestone.target) * 100,
+      weeksAway:
+        rate > 0 ? Math.max(1, Math.ceil((milestone.target - current) / rate)) : null,
     };
     if (!best || candidate.progressPct > best.progressPct) best = candidate;
   }

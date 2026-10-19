@@ -49,13 +49,17 @@ function figuresOf(section: FingerprintSection): string[] {
         '✍️ you type',
         'it ships',
         'API-equivalent, per prompt',
+        'long tail to 778',
+        'Bash · Read · Edit · Grep',
       ];
     case 'conversation':
       return ['THE CONVERSATION', 'Claude sent back', 'for every character you type', '~558M'];
     case 'rings':
       return ['TypeScript 46%', 'Opus 54%', 'peak hour', 'Opus · 5.5'];
     case 'class':
-      return ['class history', '38% before noon', 'orchestrator'];
+      // The last string is a PAST month's evidence: every row carries its own,
+      // not just the current one.
+      return ['class history', '38% before noon', 'orchestrator', '42% after 22h'];
     case 'milestones':
       return ['🏁 milestones', '1K ultrathinks', '30-day streak', 'next ·'];
     case 'ultrathink':
@@ -228,7 +232,8 @@ describe('ProfilePage · empty and partial states', () => {
     const quiet = render(<ProfilePage {...clean} />);
     expect(quiet).not.toContain('reads low');
     expect(quiet).toContain('characters typed ');
-    expect(quiet).toContain('median, per prompt');
+    // The caption keeps its p95 either way; the caveat is what comes and goes.
+    expect(quiet).toContain('median · long tail to 778');
   });
 
   test('the caveat is not shown when conversation is hidden but anatomy is not', () => {
@@ -236,7 +241,7 @@ describe('ProfilePage · empty and partial states', () => {
     // nothing to claim, so the median is printed plainly rather than with an
     // asterisk pointing at a footnote that is no longer on the page.
     const html = page({ hide: ['conversation'] });
-    expect(html).toContain('median, per prompt');
+    expect(html).toContain('median · long tail to 778');
     expect(html).not.toContain('reads low');
   });
 

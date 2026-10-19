@@ -12,7 +12,13 @@
  * an hour curve with a real peak, and a year with a gap in it.
  */
 
-import type { FingerprintData, FingerprintSection } from '../../lib/fingerprint';
+import type {
+  FingerprintData,
+  FingerprintSection,
+  PastVerdict,
+  RhythmClass,
+  StyleClass,
+} from '../../lib/fingerprint';
 import type { ContributionDay } from './geometry';
 import { bucketLabel } from '../../lib/chart-buckets';
 import type { CurveView } from './curve';
@@ -34,6 +40,52 @@ const HOUR_SHAPE = [
 const WEEKDAY_SHAPE = [1, 1.06, 1.1, 1.04, 0.86, 0.36, 0.3];
 
 export const FIXTURE_TODAY = '2026-10-18';
+
+const RHYTHMS: RhythmClass[] = ['early-bird', 'morning', 'afternoon', 'evening', 'night-owl'];
+
+/**
+ * A past month's verdict WITH the evidence beside it, which is what the class
+ * history reads to explain each row.
+ *
+ * Only `share` and the two style figures are ever displayed, so the four other
+ * buckets are spread evenly around the named one rather than invented per row
+ * — the alternative is twenty more numbers nobody looks at.
+ */
+function pastVerdict(
+  month: string,
+  rhythm: RhythmClass | null,
+  style: StyleClass | null,
+  evidence: {
+    share: number;
+    peakHour: number | null;
+    subagentSharePct: number;
+    toolCallsPerPrompt: number;
+    prompts: number;
+  }
+): PastVerdict {
+  const rest = (100 - evidence.share) / (RHYTHMS.length - 1);
+  const fill = (named: number, other: number) =>
+    Object.fromEntries(
+      RHYTHMS.map((bucket) => [bucket, bucket === rhythm ? named : other])
+    ) as Record<RhythmClass, number>;
+
+  return {
+    month,
+    rhythm,
+    style,
+    rhythm_evidence: {
+      shares: fill(evidence.share, rest),
+      density: fill(2.1, 0.72),
+      peakHour: evidence.peakHour,
+      prompts: evidence.prompts,
+    },
+    style_evidence: {
+      subagentSharePct: evidence.subagentSharePct,
+      toolCallsPerPrompt: evidence.toolCallsPerPrompt,
+      prompts: evidence.prompts,
+    },
+  };
+}
 
 export function fixtureFingerprint(): FingerprintData {
   const prompts = 9_975;
@@ -108,6 +160,7 @@ export function fixtureFingerprint(): FingerprintData {
       allTime: {
         prompts,
         medianPromptChars: 170,
+        p95PromptChars: 778,
         toolCallsPerPrompt: 9.6,
         linesPerPrompt: 36,
         valuePerPrompt: 1.13,
@@ -115,10 +168,17 @@ export function fixtureFingerprint(): FingerprintData {
       last30d: {
         prompts: 1_480,
         medianPromptChars: 184,
+        p95PromptChars: 842,
         toolCallsPerPrompt: 11.2,
         linesPerPrompt: 41,
         valuePerPrompt: 1.31,
       },
+      topTools: [
+        { name: 'Bash', count: 34_120 },
+        { name: 'Read', count: 21_440 },
+        { name: 'Edit', count: 14_980 },
+        { name: 'Grep', count: 9_260 },
+      ],
     },
     conversation: {
       charsTyped: 3_700_000,
@@ -164,11 +224,11 @@ export function fixtureFingerprint(): FingerprintData {
       },
       style_evidence: { subagentSharePct: 34.2, toolCallsPerPrompt: 11.2, prompts: 1_480 },
       history: [
-        { month: '2026-09', rhythm: 'night-owl', style: 'autopilot' },
-        { month: '2026-08', rhythm: 'morning', style: 'orchestrator' },
-        { month: '2026-07', rhythm: 'afternoon', style: 'pair-programmer' },
-        { month: '2026-06', rhythm: 'morning', style: 'autopilot' },
-        { month: '2026-05', rhythm: null, style: null },
+        pastVerdict('2026-09', 'night-owl', 'autopilot', { share: 41.8, peakHour: 23, subagentSharePct: 18.4, toolCallsPerPrompt: 14.1, prompts: 1_240 }),
+        pastVerdict('2026-08', 'morning', 'orchestrator', { share: 35.2, peakHour: 10, subagentSharePct: 31.7, toolCallsPerPrompt: 10.8, prompts: 610 }),
+        pastVerdict('2026-07', 'afternoon', 'pair-programmer', { share: 33.9, peakHour: 15, subagentSharePct: 9.2, toolCallsPerPrompt: 4.6, prompts: 1_390 }),
+        pastVerdict('2026-06', 'morning', 'autopilot', { share: 40.1, peakHour: 9, subagentSharePct: 12.5, toolCallsPerPrompt: 15.8, prompts: 1_510 }),
+        pastVerdict('2026-05', null, null, { share: 0, peakHour: null, subagentSharePct: 0, toolCallsPerPrompt: 0, prompts: 38 }),
       ],
     },
     milestones: [
@@ -181,6 +241,15 @@ export function fixtureFingerprint(): FingerprintData {
       { key: 'prompts:10000', label: '10K prompts', emoji: '💬', kind: 'prompts', date: '2026-07-08', value: 10_000 },
       { key: 'ultrathink:1000', label: '1K ultrathinks', emoji: '🌈', kind: 'ultrathink', date: '2026-09-14', value: 1_000 },
       { key: 'streak:30', label: '30-day streak', emoji: '🔥', kind: 'streak', date: '2026-09-30', value: 30 },
+    ],
+    // One per unfinished ladder, in the payload's own order. Prompts (99.8%)
+    // just edges out ultrathinks (98.8%), which is the tie the page's
+    // "closest to completion" rule is there to break.
+    nextMilestones: [
+      { key: 'prompts_10000', kind: 'prompts', emoji: '💬', label: '10K prompts', target: 10_000, current: prompts },
+      { key: 'lines_1000000', kind: 'lines', emoji: '📝', label: '1M lines written', target: 1_000_000, current: 359_100 },
+      { key: 'streak_100', kind: 'streak', emoji: '🔥', label: '100-day streak', target: 100, current: 30 },
+      { key: 'ultrathink_5000', kind: 'ultrathink', emoji: '🌈', label: '5K ultrathinks', target: 5_000, current: 4_941 },
     ],
     ultrathink: { count: 4_941, sharePct: 49.5, firstSeen: '2026-01-24' },
   };
@@ -392,6 +461,7 @@ export function emptyFingerprint(): FingerprintData {
   const zeroFigures = {
     prompts: 0,
     medianPromptChars: 0,
+    p95PromptChars: 0,
     toolCallsPerPrompt: 0,
     linesPerPrompt: 0,
     valuePerPrompt: 0,
@@ -412,7 +482,7 @@ export function emptyFingerprint(): FingerprintData {
     ],
     hidden: [],
     value: { thisWeek: 0, lastWeek: 0, deltaPct: null, allTime: 0, weekStart: `${FIXTURE_TODAY}T00:00:00.000Z` },
-    anatomy: { allTime: { ...zeroFigures }, last30d: { ...zeroFigures } },
+    anatomy: { allTime: { ...zeroFigures }, last30d: { ...zeroFigures }, topTools: [] },
     conversation: {
       charsTyped: 0,
       outputTokens: 0,
@@ -445,6 +515,13 @@ export function emptyFingerprint(): FingerprintData {
       history: [],
     },
     milestones: [],
+    // The first rung of every ladder, nothing against any of it.
+    nextMilestones: [
+      { key: 'prompts_1000', kind: 'prompts', emoji: '💬', label: '1K prompts', target: 1_000, current: 0 },
+      { key: 'lines_100000', kind: 'lines', emoji: '📝', label: '100K lines written', target: 100_000, current: 0 },
+      { key: 'streak_7', kind: 'streak', emoji: '🔥', label: '7-day streak', target: 7, current: 0 },
+      { key: 'ultrathink_100', kind: 'ultrathink', emoji: '🌈', label: '100 ultrathinks', target: 100, current: 0 },
+    ],
     ultrathink: { count: 0, sharePct: 0, firstSeen: null },
   };
 }

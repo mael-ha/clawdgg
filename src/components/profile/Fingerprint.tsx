@@ -225,7 +225,17 @@ export const Anatomy: FC<{
             color="text-cyan-300"
             figure={group(figures.medianPromptChars)}
             unit={caveat ? 'chars*' : 'chars'}
-            note={caveat ? 'median · recovered lengths read low' : 'median, per prompt'}
+            // The p95 beside the median is the whole shape of the
+            // distribution in two numbers. It only says something when it is
+            // above the median — equal or below means too few lengths were
+            // recorded to have a tail.
+            note={
+              `median · ${
+                figures.p95PromptChars > figures.medianPromptChars
+                  ? `long tail to ${group(figures.p95PromptChars)}`
+                  : 'per prompt'
+              }${caveat ? ' · reads low' : ''}`
+            }
             title={caveat}
           />
           <Arrow />
@@ -234,7 +244,14 @@ export const Anatomy: FC<{
             color="text-amber-400"
             figure={perPrompt(figures.toolCallsPerPrompt)}
             unit="tool calls"
-            note="per prompt"
+            // The tools those calls went to, biggest first — counted from the
+            // same event the ratio is, so the names and the figure above them
+            // describe one measurement.
+            note={
+              anatomy.topTools.length > 0
+                ? anatomy.topTools.map((tool) => tool.name).join(' · ')
+                : 'per prompt'
+            }
           />
           <Arrow />
           <AnatomyFigure

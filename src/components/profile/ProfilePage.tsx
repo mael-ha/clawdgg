@@ -144,11 +144,9 @@ export const ProfilePage: FC<ProfileViewProps> = ({
                 {fingerprint.milestones && (
                   <Milestones
                     milestones={fingerprint.milestones}
-                    totals={{
-                      prompts,
-                      lines: Math.round((fingerprint.anatomy?.allTime.linesPerPrompt ?? 0) * prompts),
-                      ultrathink: fingerprint.ultrathink?.count ?? 0,
-                    }}
+                    // Hidden with `milestones`, so it is present whenever the
+                    // list above is. Absent only in an older payload.
+                    nextMilestones={fingerprint.nextMilestones ?? []}
                     ratePerWeek={{
                       prompts: perWeek(last30d?.prompts ?? 0),
                       lines: perWeek((last30d?.linesPerPrompt ?? 0) * (last30d?.prompts ?? 0)),

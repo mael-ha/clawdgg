@@ -266,17 +266,17 @@ export interface Ultrathink {
  *
  * THE THRESHOLDS LIVE IN ONE PLACE. `milestones` only carries what has already
  * been crossed, so a progress bar toward the next one needed the ladder — and
- * the UI had its own copy of it (`LADDERS` in src/components/profile/
- * geometry.ts), which is two lists of numbers that have to agree about what
- * "10K prompts" means. They are MILESTONE_SPECS here, and this is how the page
- * gets them.
+ * the UI used to keep its own copy, which is two lists of numbers that have to
+ * agree about what "10K prompts" means. They are MILESTONE_SPECS here, and
+ * this is how the page gets them.
  *
  * `current` is the figure the threshold is compared against, so progress is
  * `current / target` and nothing has to be reassembled from other sections.
  * One entry per ladder with anything left to reach; a ladder that has been
  * finished is absent rather than present-and-complete. The order is stable
  * (prompts, lines, streak, ultrathink), and which one to SHOW is a
- * presentation choice the page keeps.
+ * presentation choice the page keeps — pickNextMilestone in
+ * src/components/profile/geometry.ts takes the one closest to completion.
  */
 export interface NextMilestone {
   /** `${kind}_${target}`, matching the crossed milestone it will become. */

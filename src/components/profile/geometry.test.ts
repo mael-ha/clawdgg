@@ -9,14 +9,14 @@ import {
   languagesRing,
   linePath,
   modelsRing,
-  nextMilestone,
+  pickNextMilestone,
   polar,
   sawtooth,
   weekRing,
   type ContributionDay,
 } from './geometry';
 import { CONTRIB_BEFORE, CONTRIB_RAMP, quadrantOf } from './palette';
-import type { ModelFamilyShare, RingItem } from '../../lib/fingerprint';
+import type { ModelFamilyShare, NextMilestone, RingItem } from '../../lib/fingerprint';
 
 /**
  * The rings are arithmetic, so they are tested as arithmetic.
@@ -318,40 +318,66 @@ describe('contributionGrid', () => {
   });
 });
 
-describe('nextMilestone', () => {
+describe('pickNextMilestone', () => {
+  /**
+   * The thresholds come from the payload now (`nextMilestones`), so what is
+   * left to test is WHICH of the arriving entries gets drawn and the two
+   * figures the bar derives from it — not a ladder this file used to own.
+   */
+  const entry = (
+    kind: NextMilestone['kind'],
+    target: number,
+    current: number
+  ): NextMilestone => ({
+    key: `${kind}_${target}`,
+    kind,
+    emoji: '•',
+    label: `${target} ${kind}`,
+    target,
+    current,
+  });
+
   test('picks the nearest in PROGRESS, not in absolute distance', () => {
     // 48K of 50K prompts (96%) beats 10 of 100 ultrathinks (10%), even though
     // the ultrathink gap is 90 and the prompt gap is 2,000.
-    const next = nextMilestone({ prompts: 48_000, lines: 0, ultrathink: 10 });
+    const next = pickNextMilestone([
+      entry('prompts', 50_000, 48_000),
+      entry('ultrathink', 100, 10),
+    ]);
     expect(next?.kind).toBe('prompts');
     expect(next?.target).toBe(50_000);
-    expect(next?.label).toBe('50K prompts');
     expect(next?.progressPct).toBeCloseTo(96, 5);
   });
 
-  test('turns a weekly pace into weeks, and stays silent without one', () => {
-    const paced = nextMilestone({ prompts: 9_000, lines: 0, ultrathink: 0 }, { prompts: 250 });
-    expect(paced?.weeksAway).toBe(4);
-    expect(nextMilestone({ prompts: 9_000, lines: 0, ultrathink: 0 })?.weeksAway).toBeNull();
+  test('a tie keeps the payload order', () => {
+    const next = pickNextMilestone([
+      entry('lines', 1_000_000, 500_000),
+      entry('streak', 100, 50),
+    ]);
+    expect(next?.kind).toBe('lines');
   });
 
-  test('a ladder that has been topped out is skipped', () => {
-    const next = nextMilestone({ prompts: 200_000, lines: 50_000_000, ultrathink: 20 });
-    expect(next?.kind).toBe('ultrathink');
-    expect(next?.target).toBe(100);
+  test('turns a weekly pace into weeks, and stays silent without one', () => {
+    const prompts = [entry('prompts', 10_000, 9_000)];
+    expect(pickNextMilestone(prompts, { prompts: 250 })?.weeksAway).toBe(4);
+    expect(pickNextMilestone(prompts)?.weeksAway).toBeNull();
+    // The streak has no pace in the payload, so it gets a bar and no forecast.
+    expect(pickNextMilestone([entry('streak', 100, 30)], { prompts: 250 })?.weeksAway).toBeNull();
   });
 
   test('nothing left to reach returns nothing', () => {
-    expect(
-      nextMilestone({ prompts: 200_000, lines: 50_000_000, ultrathink: 10_000 })
-    ).toBeNull();
+    expect(pickNextMilestone([])).toBeNull();
   });
 
   test('a brand-new account aims at the first rung', () => {
-    const next = nextMilestone({ prompts: 0, lines: 0, ultrathink: 0 });
+    const next = pickNextMilestone([entry('prompts', 1_000, 0)]);
     expect(next).not.toBeNull();
     expect(next!.progressPct).toBe(0);
     expect(Number.isFinite(next!.progressPct)).toBe(true);
+  });
+
+  test('a target of zero is skipped rather than divided by', () => {
+    expect(pickNextMilestone([entry('streak', 0, 0)])).toBeNull();
   });
 });
 
