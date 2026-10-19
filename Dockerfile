@@ -1,5 +1,8 @@
 # Build stage
-FROM oven/bun:1 AS builder
+# Pinned exactly: the floating `1` tag moved to Bun 1.4.3, whose node-gyp builds
+# against Node v26 headers, and better-sqlite3@12.5.0 fails to compile there.
+# Keep in step with bun-version in .github/workflows/{ci,release-cli}.yml.
+FROM oven/bun:1.3.4 AS builder
 
 WORKDIR /app
 
@@ -19,7 +22,8 @@ COPY . .
 RUN bun run build
 
 # Production stage
-FROM oven/bun:1-slim
+# Same pin as the builder — the runtime has to run what built node_modules.
+FROM oven/bun:1.3.4-slim
 
 WORKDIR /app
 
