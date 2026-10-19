@@ -1,13 +1,36 @@
-import { Context, Next } from 'hono';
+/**
+ * Fixed-window rate limiting, in process.
+ *
+ * Two budgets, and they are separate on purpose (see the exports at the
+ * bottom): a tight one for `/api/*`, and a looser one for the public profile
+ * surface under `/u/*`, where one reader's visit is a page, a card and a chart
+ * fetch per click rather than one request.
+ *
+ * In-process means per server instance and lost on restart, which is right for
+ * what this is: a brake on one client's bursts, not a quota. Nothing here is a
+ * security boundary — the budgets are keyed on an identity the client partly
+ * controls (see clientIp) and a distributed caller gets a budget per address.
+ */
+
+import type { Context, MiddlewareHandler, Next } from 'hono';
 import { createMiddleware } from 'hono/factory';
 
-// In-memory store for rate limiting
-// Key: user ID or IP, Value: { count, resetTime }
+/** One window per key, in one store — the scope is part of the key. */
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
 
-// Configuration
-const WINDOW_MS = 60 * 1000; // 1 minute window
-const MAX_REQUESTS = 60; // 60 requests per minute (more generous for interactive charts)
+const WINDOW_MS = 60 * 1000;
+/** `/api/*`: generous enough for the interactive charts, which poll on a click. */
+const MAX_REQUESTS = 60;
+/**
+ * `/u/*`: four times that.
+ *
+ * One reader opening a profile costs a page, a share card and a curve fetch
+ * for every control they touch, and these are PAGES — a human clicking around
+ * must never meet a 429. It is still a ceiling: the curve is a ClickHouse scan
+ * per uncached view, and this surface used to have no limit at all, so a loop
+ * over `?metric=&period=&groupBy=` was an unmetered way to spend the database.
+ */
+const MAX_PAGE_REQUESTS = 240;
 
 // Clean up expired entries periodically (every 5 minutes)
 setInterval(() => {
@@ -19,72 +42,93 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-// Get identifier for rate limiting (user ID if authenticated, IP otherwise)
-function getIdentifier(c: Context): string {
-  // Try to get user from context (set by auth middleware)
-  const user = c.get('user');
-  if (user?.id) {
-    return `user:${user.id}`;
-  }
-
-  // Fall back to IP address
+/**
+ * The client's address as Caddy saw it — the LAST `X-Forwarded-For` entry.
+ *
+ * Caddy APPENDS the immediate peer to whatever the request already carried, so
+ * the list is `<whatever the client claimed>, …, <the real peer>`. Reading the
+ * FIRST entry, which this used to do, reads the client's own header: anyone
+ * could send `X-Forwarded-For: <random>` and get a fresh budget on every
+ * request, which is not a weaker limit but no limit. The last entry is the one
+ * hop we trust, because our own proxy wrote it.
+ *
+ * Direct (no proxy, as in `bun run dev`) there is no header and Hono's
+ * connection info is the answer.
+ */
+export function clientIp(c: Context): string {
   const forwarded = c.req.header('x-forwarded-for');
-  const ip = forwarded?.split(',')[0]?.trim() || 'unknown';
-  return `ip:${ip}`;
+  if (forwarded) {
+    const hops = forwarded.split(',');
+    const peer = hops[hops.length - 1]?.trim();
+    if (peer) return peer;
+  }
+  // Caddy sets this one to a single address, so it needs no unpicking.
+  const real = c.req.header('x-real-ip')?.trim();
+  if (real) return real;
+  return 'unknown';
 }
 
-// Rate limiting middleware
-export const rateLimit = createMiddleware(async (c: Context, next: Next) => {
-  const identifier = getIdentifier(c);
-  const now = Date.now();
+/** Per user when we know who they are, per address when we do not. */
+function identify(c: Context, scope: string): string {
+  const user = c.get('user');
+  if (user?.id) return `${scope}:user:${user.id}`;
+  return `${scope}:ip:${clientIp(c)}`;
+}
 
-  let record = rateLimitStore.get(identifier);
+export interface RateLimitOptions {
+  /** Namespace for the key, so two budgets never share one window. */
+  scope: string;
+  max: number;
+  windowMs?: number;
+}
 
-  // If no record or window expired, create new record
-  if (!record || now > record.resetTime) {
-    record = {
-      count: 1,
-      resetTime: now + WINDOW_MS,
-    };
-    rateLimitStore.set(identifier, record);
+export function createRateLimit(options: RateLimitOptions): MiddlewareHandler {
+  const { scope, max } = options;
+  const windowMs = options.windowMs ?? WINDOW_MS;
 
-    // Set rate limit headers
-    c.header('X-RateLimit-Limit', MAX_REQUESTS.toString());
-    c.header('X-RateLimit-Remaining', (MAX_REQUESTS - 1).toString());
+  return createMiddleware(async (c: Context, next: Next) => {
+    const identifier = identify(c, scope);
+    const now = Date.now();
+
+    let record = rateLimitStore.get(identifier);
+    if (!record || now > record.resetTime) {
+      record = { count: 0, resetTime: now + windowMs };
+      rateLimitStore.set(identifier, record);
+    }
+    record.count++;
+
+    c.header('X-RateLimit-Limit', max.toString());
+    c.header('X-RateLimit-Remaining', Math.max(0, max - record.count).toString());
     c.header('X-RateLimit-Reset', Math.ceil(record.resetTime / 1000).toString());
 
+    if (record.count > max) {
+      const retryAfter = Math.ceil((record.resetTime - now) / 1000);
+      c.header('Retry-After', retryAfter.toString());
+
+      return c.json(
+        {
+          error: 'Too many requests',
+          message: `Rate limit exceeded. Please try again in ${retryAfter} seconds.`,
+          retryAfter,
+        },
+        429
+      );
+    }
+
     await next();
-    return;
-  }
+  });
+}
 
-  // Increment count
-  record.count++;
+/** `/api/*` — the original budget, unchanged. */
+export const rateLimit = createRateLimit({ scope: 'api', max: MAX_REQUESTS });
 
-  // Calculate remaining requests
-  const remaining = Math.max(0, MAX_REQUESTS - record.count);
-
-  // Set rate limit headers
-  c.header('X-RateLimit-Limit', MAX_REQUESTS.toString());
-  c.header('X-RateLimit-Remaining', remaining.toString());
-  c.header('X-RateLimit-Reset', Math.ceil(record.resetTime / 1000).toString());
-
-  // Check if rate limit exceeded
-  if (record.count > MAX_REQUESTS) {
-    const retryAfter = Math.ceil((record.resetTime - now) / 1000);
-    c.header('Retry-After', retryAfter.toString());
-
-    return c.json(
-      {
-        error: 'Too many requests',
-        message: `Rate limit exceeded. Please try again in ${retryAfter} seconds.`,
-        retryAfter,
-      },
-      429
-    );
-  }
-
-  await next();
-});
+/**
+ * `/u/*` — the profile page, its curve endpoint and its share card.
+ *
+ * A separate scope as well as a separate ceiling: a reader browsing profiles
+ * must not spend the budget their API client is also using, and vice versa.
+ */
+export const pageRateLimit = createRateLimit({ scope: 'u', max: MAX_PAGE_REQUESTS });
 
 // Export for testing purposes
-export { rateLimitStore, WINDOW_MS, MAX_REQUESTS };
+export { rateLimitStore, WINDOW_MS, MAX_REQUESTS, MAX_PAGE_REQUESTS };

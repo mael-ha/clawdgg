@@ -12,7 +12,7 @@ import otel from './routes/otel';
 import pages from './routes/index';
 import profile from './routes/profile';
 import about from './routes/about';
-import { rateLimit } from './lib/rate-limit';
+import { pageRateLimit, rateLimit } from './lib/rate-limit';
 import { optionalAuth } from './lib/auth-middleware';
 import { startSyncJob, stopSyncJob } from './jobs/sync-clickhouse';
 import { healthCheck as clickhouseHealthCheck } from './db/clickhouse';
@@ -43,6 +43,13 @@ app.use('*', optionalAuth);
 
 // Apply rate limiting to API routes
 app.use('/api/*', rateLimit);
+
+// And a looser one to the public profile surface. /u/:username is a page, but
+// /u/:username/curve is a ClickHouse scan per uncached view and card.png is a
+// rasterisation — all three were reachable without a budget of any kind, by
+// anyone, as fast as they could be asked for. Keyed on the address Caddy saw
+// (see clientIp), not on the first X-Forwarded-For hop the client wrote.
+app.use('/u/*', pageRateLimit);
 
 // Build output is content-hashed (public/build/app-<hash>.css), so a new
 // build is a new URL and the old one can be cached forever.

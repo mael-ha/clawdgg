@@ -15,7 +15,10 @@ import type { SessionUser } from '../types';
 import {
   BOARDS,
   BOARD_KEYS,
+  DEFAULT_BOARD_LIMIT,
+  MAX_BOARD_LIMIT,
   boardCaption,
+  clampBoardLimit,
   getBoardPage,
   getGlobalPulse,
   parseBoard,
@@ -28,9 +31,6 @@ type Variables = {
 
 const app = new Hono<{ Variables: Variables }>();
 
-const MAX_LIMIT = 100;
-const DEFAULT_LIMIT = 25;
-
 function intParam(raw: string | undefined, fallback: number, max: number): number {
   const parsed = parseInt(raw ?? '', 10);
   if (!Number.isFinite(parsed)) return fallback;
@@ -40,7 +40,10 @@ function intParam(raw: string | undefined, fallback: number, max: number): numbe
 app.get('/', optionalAuth, async (c) => {
   const board = parseBoard(c.req.query('board'));
   const scope = parseScope(c.req.query('scope'), board);
-  const limit = Math.max(1, intParam(c.req.query('limit'), DEFAULT_LIMIT, MAX_LIMIT));
+  // Both bounds are getBoardPage's to enforce — it is the one place that knows
+  // how long the board is — and the limit is clamped here too so the `limit`
+  // this response REPORTS is the one it was served with.
+  const limit = clampBoardLimit(intParam(c.req.query('limit'), DEFAULT_BOARD_LIMIT, MAX_BOARD_LIMIT));
   const offset = intParam(c.req.query('offset'), 0, Number.MAX_SAFE_INTEGER);
 
   const page = await getBoardPage({
@@ -64,6 +67,7 @@ app.get('/', optionalAuth, async (c) => {
         scopes: BOARDS[board].scopes,
       },
       total: page.total,
+      // The CLAMPED offset, which is what the rows came from.
       offset: page.offset,
       limit,
       weekStart: page.weekStart,

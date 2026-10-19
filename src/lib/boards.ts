@@ -587,7 +587,15 @@ async function fetchFigures(
       `SELECT
          user_id,
          toFloat64(sumIf(value, metric_name = 'claude_code.cost.usage')) AS value_usd,
-         toUInt64(sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'output')) AS output_tokens
+         -- NO_LEGACY_SQL, to match the characters typed on the other side of
+         -- the ⚡ ratio: prompt_chars above is summed over measured prompts
+         -- only, and a legacy row has no prompt_length. Counting its output
+         -- tokens anyway made every pre-OTEL user look like they typed a word
+         -- and got a novel back — and ranked them above everyone on a board
+         -- that is a RATIO. src/lib/fingerprint.ts has the same predicate on
+         -- the same sum, which is why the board and the profile disagreed.
+         toUInt64(sumIf(value, metric_name = 'claude_code.token.usage'
+                               AND token_type = 'output' AND ${NO_LEGACY_SQL})) AS output_tokens
        FROM metrics_raw FINAL
        WHERE ${window}
        GROUP BY user_id`,
@@ -993,41 +1001,76 @@ export interface BoardQuery {
   now?: Date;
 }
 
+/** Rows per page. A caller may ask for fewer; it may not ask for more. */
+export const MAX_BOARD_LIMIT = 100;
+export const DEFAULT_BOARD_LIMIT = 25;
+
+export function clampBoardLimit(raw: number): number {
+  if (!Number.isFinite(raw)) return DEFAULT_BOARD_LIMIT;
+  return Math.min(MAX_BOARD_LIMIT, Math.max(1, Math.floor(raw)));
+}
+
+/**
+ * An offset no further than the end of the board.
+ *
+ * `?offset=9999999` used to be a cache key of its own, and every one of them a
+ * full fan-out: loadBoardUsers, both ClickHouse figure queries, the ranking.
+ * Clamping to the length means the pages past the end are ONE key and the key
+ * space is bounded by the number of users there are, not by what a URL can
+ * hold. (The slice is then empty, which is the right answer: `remaining` goes
+ * to zero and the load-more button stops.)
+ */
+export function clampBoardOffset(raw: number, total: number): number {
+  if (!Number.isFinite(raw)) return 0;
+  return Math.min(Math.max(0, total), Math.max(0, Math.floor(raw)));
+}
+
+/**
+ * The ranking, which is the whole cost of a board, cached per BOARD AND SCOPE.
+ *
+ * Eight keys in total — four boards, two scopes each — and not one per page,
+ * which is what the cache used to hold. Pagination is a SLICE of this, so a
+ * request for page 400 of a board nobody has 400 pages of now costs a slice of
+ * a list that is already in memory instead of the fan-out that built it.
+ */
+interface BoardRanking {
+  ranked: RankedEntry[];
+  usersById: Map<string, BoardUser>;
+  figures: Map<string, BoardFigures>;
+  weekStart: string;
+  /** False when a figures query failed — never cached, see getRanking. */
+  complete: boolean;
+}
+
 // 60s: long enough that a burst of homepage loads costs one query fan-out,
 // short enough that a board feels live. Errors are never cached (see `complete`).
+const rankingCache = new TtlCache<BoardRanking>(60_000, 16);
+/**
+ * The DECORATED page — the ranking's slice plus each row's clock, class and
+ * arrow. Still per (board, scope, limit, offset), because the decoration is
+ * per page, but a miss here is now two queries for 25 users rather than the
+ * whole board: the expensive part is in rankingCache above.
+ */
 const boardCache = new TtlCache<BoardPage>(60_000, 200);
 const pulseCache = new TtlCache<GlobalPulse>(60_000, 8);
 
-export async function getBoardPage(options: BoardQuery): Promise<BoardPage> {
-  const { board, scope, limit, offset, viewerId } = options;
-  const key = `${board}|${scope}|${limit}|${offset}`;
-  const page = await boardCache.remember(
-    key,
-    () => buildBoardPage(options),
+async function getRanking(
+  board: BoardKey,
+  scope: BoardScope,
+  now: Date
+): Promise<BoardRanking> {
+  return rankingCache.remember(
+    `${board}|${scope}`,
+    () => buildRanking(board, scope, now),
     (built) => built.complete
   );
-  // The viewer mark is per-request, so it is applied AFTER the cache: one
-  // signed-in user must not get their highlight baked into everyone's page.
-  if (!viewerId) return page;
-  return {
-    ...page,
-    rows: page.rows.map((row) =>
-      row.userId === viewerId ? { ...row, isViewer: true } : row
-    ),
-  };
 }
 
-async function buildBoardPage(options: BoardQuery): Promise<BoardPage> {
-  const { board, scope, limit, offset } = options;
-  const now = options.now ?? new Date();
-  const base = {
-    board,
-    scope,
-    offset,
-    weekStart: weekStartUtc(now).toISOString(),
-    resetIn: formatCountdown(now),
-  };
-
+async function buildRanking(
+  board: BoardKey,
+  scope: BoardScope,
+  now: Date
+): Promise<BoardRanking> {
   const boardUsers = await loadBoardUsers();
 
   // A ClickHouse outage is not a reason to show nothing: the streak board is
@@ -1043,13 +1086,64 @@ async function buildBoardPage(options: BoardQuery): Promise<BoardPage> {
     complete = false;
   }
 
-  const ranked = rankBoard(board, scope, boardUsers, figures);
-  const usersById = new Map(boardUsers.map((u) => [u.userId, u]));
+  return {
+    ranked: rankBoard(board, scope, boardUsers, figures),
+    usersById: new Map(boardUsers.map((u) => [u.userId, u])),
+    figures,
+    weekStart: weekStartUtc(now).toISOString(),
+    complete,
+  };
+}
+
+export async function getBoardPage(options: BoardQuery): Promise<BoardPage> {
+  const { board, scope, viewerId } = options;
+  const now = options.now ?? new Date();
+  const limit = clampBoardLimit(options.limit);
+
+  // The ranking first, because it is what the offset is bounded by — and it is
+  // the cached part, so asking for it costs nothing the next caller repeats.
+  const ranking = await getRanking(board, scope, now);
+  const offset = clampBoardOffset(options.offset, ranking.ranked.length);
+
+  const page = await boardCache.remember(
+    `${board}|${scope}|${limit}|${offset}`,
+    () => decorateBoardPage(board, scope, ranking, limit, offset, now),
+    (built) => built.complete
+  );
+  // The viewer mark is per-request, so it is applied AFTER the cache: one
+  // signed-in user must not get their highlight baked into everyone's page.
+  if (!viewerId) return page;
+  return {
+    ...page,
+    rows: page.rows.map((row) =>
+      row.userId === viewerId ? { ...row, isViewer: true } : row
+    ),
+  };
+}
+
+async function decorateBoardPage(
+  board: BoardKey,
+  scope: BoardScope,
+  ranking: BoardRanking,
+  limit: number,
+  offset: number,
+  now: Date
+): Promise<BoardPage> {
+  const { ranked, usersById, figures } = ranking;
+  const base = {
+    board,
+    scope,
+    offset,
+    weekStart: ranking.weekStart,
+    resetIn: formatCountdown(now),
+  };
+
   const slice = ranked.slice(offset, offset + limit);
   const pageUsers = slice
     .map((entry) => usersById.get(entry.userId))
     .filter((user): user is BoardUser => !!user);
 
+  let complete = ranking.complete;
   let evidence = new Map<string, ClassEvidence>();
   try {
     evidence = await fetchClassEvidence(pageUsers, now);

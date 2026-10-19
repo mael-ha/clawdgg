@@ -24,8 +24,16 @@ until its holder logs in again.
 ## Rate limiting
 
 All `/api/*` routes (including `/api/cli/*` and `/api/boards`): **60 requests
-per minute**, per user (or per client IP when anonymous). `/otel/*`, `/auth/*`,
-`/install/*` and pages are not covered.
+per minute**, per user (or per client IP when anonymous).
+
+`/u/*` — the profile page, `/u/:username/curve` and the share card — has its own,
+looser budget: **240 requests per minute**, same key, counted separately so one
+surface cannot spend the other's. `/otel/*`, `/auth/*`, `/install/*` and the
+remaining pages are not covered.
+
+The client IP is the LAST `X-Forwarded-For` entry, which is the hop Caddy wrote.
+The first entry is whatever the client claimed, and keying on it meant no limit
+at all.
 
 ```
 X-RateLimit-Limit: 60
@@ -205,13 +213,18 @@ Four weekly boards, ranked per UTC week (Monday 00:00 UTC) or all time. The
 homepage renders from the same function, so page and API cannot disagree. A user
 who hid the profile section behind a board is left off that board.
 
+`offset` and `limit` are CLAMPED rather than refused, and the response reports
+the values it was served with: an offset past the end of the board comes back
+as `offset: total` with no rows. The ranking is cached per (board, scope) for
+60 s and a page is a slice of it, so pagination does not re-rank.
+
 ```
 GET /api/boards?board=value&scope=week&limit=25&offset=0
 
   board   value | streak | ultrathinks | leverage        (default value; unknown → value)
   scope   week | all                                     (default week; anything else → week)
-  limit   1..100                                         (default 25)
-  offset  >= 0                                           (default 0)
+  limit   1..100                                         (default 25; clamped, not refused)
+  offset  >= 0                                           (default 0; clamped to `total`)
 
 200 (503 with the same body if any underlying query failed)
 {

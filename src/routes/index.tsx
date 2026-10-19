@@ -73,6 +73,10 @@ async function featuredProfile(): Promise<string | null> {
 app.get('/rows', optionalAuth, async (c) => {
   const user = c.get('user');
   const { board, scope } = pageArgs(c);
+  // Parsed, not trusted. getBoardPage clamps it to the end of the board (see
+  // clampBoardOffset), and `page.offset` is the clamped value — so the next
+  // button is built from where the rows actually came from rather than from
+  // whatever the query string said.
   const offset = Math.max(0, parseInt(c.req.query('offset') || '0', 10) || 0);
 
   const page = await getBoardPage({
@@ -82,7 +86,7 @@ app.get('/rows', optionalAuth, async (c) => {
     offset,
     viewerId: user?.id ?? null,
   });
-  const nextOffset = offset + page.rows.length;
+  const nextOffset = page.offset + page.rows.length;
 
   return c.html(
     <BoardRowList

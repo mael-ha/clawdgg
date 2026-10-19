@@ -9,8 +9,12 @@ import { rankSnapshots } from '../db/schema';
 import {
   BOARDS,
   BOARD_KEYS,
+  DEFAULT_BOARD_LIMIT,
+  MAX_BOARD_LIMIT,
   SCOPE_LABELS,
   boardCaption,
+  clampBoardLimit,
+  clampBoardOffset,
   boardMetricName,
   boardRankChanges,
   boardRowFor,
@@ -836,5 +840,98 @@ describe('boardRankChanges', () => {
     expect(
       (await boardRankChanges('value', 'week', [], new Map(), now, database)).changes.size
     ).toBe(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pagination is a slice, and its bounds are not the caller's to choose
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('clampBoardLimit', () => {
+  it('keeps a sane limit', () => {
+    expect(clampBoardLimit(25)).toBe(25);
+    expect(clampBoardLimit(1)).toBe(1);
+    expect(clampBoardLimit(MAX_BOARD_LIMIT)).toBe(MAX_BOARD_LIMIT);
+  });
+
+  it('refuses a page bigger than the maximum, however it is asked for', () => {
+    expect(clampBoardLimit(101)).toBe(MAX_BOARD_LIMIT);
+    expect(clampBoardLimit(1e9)).toBe(MAX_BOARD_LIMIT);
+    expect(clampBoardLimit(Number.MAX_SAFE_INTEGER)).toBe(MAX_BOARD_LIMIT);
+    expect(clampBoardLimit(Infinity)).toBe(DEFAULT_BOARD_LIMIT);
+  });
+
+  it('refuses a page of nothing, which would never finish paginating', () => {
+    expect(clampBoardLimit(0)).toBe(1);
+    expect(clampBoardLimit(-5)).toBe(1);
+    expect(clampBoardLimit(0.4)).toBe(1);
+    expect(clampBoardLimit(NaN)).toBe(DEFAULT_BOARD_LIMIT);
+  });
+});
+
+describe('clampBoardOffset', () => {
+  it('leaves an offset inside the board alone', () => {
+    expect(clampBoardOffset(0, 120)).toBe(0);
+    expect(clampBoardOffset(75, 120)).toBe(75);
+    expect(clampBoardOffset(120, 120)).toBe(120);
+  });
+
+  /**
+   * The finding: every distinct `?offset=` was a cache key of its own and
+   * every miss a full fan-out, so a loop over offsets was a free way to make
+   * the server re-rank the whole board thousands of times. Past the end they
+   * are ONE key now, and the key space is bounded by how many users there are.
+   */
+  it('collapses every offset past the end onto the end', () => {
+    for (const absurd of [121, 10_000, 1e21, Number.MAX_SAFE_INTEGER]) {
+      expect(clampBoardOffset(absurd, 120)).toBe(120);
+    }
+    expect(clampBoardOffset(5, 0)).toBe(0);
+  });
+
+  it('refuses a negative or unparseable offset', () => {
+    expect(clampBoardOffset(-1, 120)).toBe(0);
+    expect(clampBoardOffset(NaN, 120)).toBe(0);
+    expect(clampBoardOffset(-Infinity, 120)).toBe(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⚡ leverage: the board and the profile count the same rows
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('the leverage ratio is read over one population', () => {
+  /**
+   * A legacy row records that prompts happened and nothing about their length,
+   * so it contributes 0 characters to the typed side of the ratio. Counting
+   * its output tokens anyway made every pre-OTEL user look like they typed a
+   * word and got a novel back — and this is a board that RANKS on the ratio,
+   * so it put them at the top. src/lib/fingerprint.ts has carried the
+   * exclusion since the figure existed; the board did not.
+   */
+  it('excludes legacy rows from the output-token sum, as the fingerprint does', async () => {
+    const [boards, fingerprint] = await Promise.all([
+      readFile(join(REPO_ROOT, 'src/lib/boards.ts'), 'utf-8'),
+      readFile(join(REPO_ROOT, 'src/lib/fingerprint.ts'), 'utf-8'),
+    ]);
+
+    const outputSum = /sumIf\(value, metric_name = 'claude_code\.token\.usage'[\s\S]{0,160}?\)\)/g;
+    for (const [name, source] of [['boards.ts', boards], ['fingerprint.ts', fingerprint]] as const) {
+      const sums = source.match(outputSum) ?? [];
+      expect(sums.length).toBeGreaterThan(0);
+      for (const sum of sums) {
+        expect(sum).toContain("token_type = 'output'");
+        expect(sum, `${name}: ${sum}`).toContain('${NO_LEGACY_SQL}');
+      }
+    }
+  });
+
+  it('measures the typed side over measured prompts only', async () => {
+    const boards = await readFile(join(REPO_ROOT, 'src/lib/boards.ts'), 'utf-8');
+    // The other half of the same decision: `prompt_chars` is summed over
+    // prompts that HAVE a length, which is what makes the exclusion above the
+    // matching one rather than an extra filter.
+    expect(boards).toContain('const measured = `${PROMPT_EVENT_SQL} AND prompt_length > 0`');
+    expect(boards).toContain('sumIf(prompt_length, ${measured})');
   });
 });
