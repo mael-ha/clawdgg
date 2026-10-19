@@ -807,7 +807,7 @@ async function fetchUltrathinkDays(userId: string): Promise<Set<string>> {
 const IMPORT_RUN_TTL_MS = 30 * 60 * 1000;
 const RUN_ID_RE = /^[0-9a-zA-Z-]{1,64}$/;
 
-interface RunCoverage {
+export interface RunCoverage {
   days: Set<string>;
   ultrathinkDays: Set<string>;
 }
@@ -842,6 +842,47 @@ async function coveredDaysForRun(userId: string, runId: unknown): Promise<RunCov
 }
 
 /**
+ * What this user's import would be allowed to add, as a question answerable
+ * BEFORE the upload.
+ *
+ * The CLI's preview used to be a count of its own local rows, which overstated
+ * what would land by however much of that history the server already held —
+ * for the owner's first real run, 37 of 68 days were already covered by a
+ * legacy import and the preview said nothing about it.
+ *
+ * The honesty requirement is that this cannot drift from the guard: both sides
+ * read `fetchRunCoverage`, `computeImportCutoff` and `computeFlagCutoff`, and
+ * the response is these four values and nothing derived. The one difference
+ * that remains is time — this is the live set, while an import snapshots it at
+ * its first batch (see `coveredDaysForRun`) — so a day that goes live in
+ * between is reported new here and skipped there. That is the right direction
+ * to be wrong in: the preview never promises less skipping than happens.
+ */
+export interface ImportCoverage {
+  /** UTC days that already hold a measured row of any provenance (rule 7). */
+  days: string[];
+  /** UTC days that already hold an ultrathink flag — a separate set (rule 8). */
+  ultrathinkDays: string[];
+  /** Measured rows at or after this are refused (rule 6). */
+  cutoff: string;
+  /** Flags at or after this are refused — not the same instant. */
+  flagCutoff: string;
+}
+
+export function buildImportCoverage(
+  coverage: RunCoverage,
+  cutoffMs: number,
+  flagCutoffMs: number
+): ImportCoverage {
+  return {
+    days: [...coverage.days].sort(),
+    ultrathinkDays: [...coverage.ultrathinkDays].sort(),
+    cutoff: new Date(cutoffMs).toISOString(),
+    flagCutoff: new Date(flagCutoffMs).toISOString(),
+  };
+}
+
+/**
  * A budget for /import on top of the global /api/* limiter.
  *
  * The global one (60/min) is what a browsing user hits; this one bounds how
@@ -873,6 +914,47 @@ export function checkImportRate(
   }
   return { ok: true, retryAfterSeconds: 0 };
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET /api/cli/import/coverage — what the import would skip, before it runs
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Two DISTINCT scans of this user's rows, so it answers to the import's own
+// budget as well as the global /api/* limiter. It is also the preview for an
+// upload, and a client that asks for it is about to spend that budget anyway.
+cli.get('/import/coverage', requireBearerAuth, async (c) => {
+  const user = c.get('user');
+  if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+  const rate = checkImportRate(user.id);
+  if (!rate.ok) {
+    c.header('Retry-After', String(rate.retryAfterSeconds));
+    return c.json({ error: 'Too many import requests', retryAfter: rate.retryAfterSeconds }, 429);
+  }
+
+  const row = await db
+    .select({ otelSetupAt: users.otelSetupAt })
+    .from(users)
+    .where(eq(users.id, user.id))
+    .get();
+
+  try {
+    // The live set, deliberately NOT coveredDaysForRun: seeding a run's
+    // snapshot from a preview the user may never confirm would freeze a
+    // coverage set for half an hour on the strength of a question.
+    const [cutoffMs, flagCutoffMs, coverage] = await Promise.all([
+      computeImportCutoff(user.id, row?.otelSetupAt ?? null),
+      computeFlagCutoff(user.id),
+      fetchRunCoverage(user.id),
+    ]);
+    return c.json(buildImportCoverage(coverage, cutoffMs, flagCutoffMs));
+  } catch (error) {
+    console.error('[cli/import/coverage] failed:', error);
+    // The CLI falls back to its old preview on anything but a 200, so this
+    // never blocks an import.
+    return c.json({ error: 'Coverage unavailable' }, 500);
+  }
+});
 
 cli.post(
   '/import',

@@ -44,7 +44,8 @@ HTTP 429  Retry-After: 45
 { "error": "Too many requests", "message": "Rate limit exceeded. Please try again in 45 seconds.", "retryAfter": 45 }
 ```
 
-Extra per-user budgets: `POST /api/cli/import` 300 per 10 minutes,
+Extra per-user budgets: `/api/cli/import` and `/api/cli/import/coverage`
+share 300 per 10 minutes,
 `POST /api/cli/ultrathink` 60 per minute (both `429` with `Retry-After`).
 
 ## Index
@@ -84,6 +85,7 @@ Extra per-user budgets: `POST /api/cli/import` 300 per 10 minutes,
 | PATCH | `/api/cli/devices/:id` | bearer |
 | POST | `/api/cli/logout` | bearer |
 | POST | `/api/cli/import` | bearer |
+| GET | `/api/cli/import/coverage` | bearer |
 | POST | `/api/cli/ultrathink` | bearer |
 | POST | `/api/admin/sync` | admin |
 | POST | `/api/stats` | none. **410 Gone**, retired |
@@ -503,6 +505,31 @@ The client's claims are not trusted:
 6. Cutoff = `min(users.otel_setup_at, first live event)`. Rows at or after it are refused.
 7. A UTC day that already holds rows of *any* provenance is skipped whole, so a
    re-import inserts nothing. Ultrathink flags have their own coverage check.
+
+### Import coverage
+
+What rules 6–8 above would do to an import, answerable before it runs — so
+`clawdgg import` can preview "742 new" rather than "1,629 found".
+
+```
+GET /api/cli/import/coverage
+
+200
+{
+  "days": ["2026-01-01", …],            // UTC days already holding a measured row, any provenance
+  "ultrathinkDays": ["2026-01-02", …],  // the separate set the flags answer to
+  "cutoff": "2026-05-06T…Z",            // measured rows at or after this are refused
+  "flagCutoff": "2026-10-01T…Z"         // flags at or after this are refused — a LATER instant
+}
+429 { "error": "Too many import requests", "retryAfter": N }
+500 { "error": "Coverage unavailable" }
+```
+
+Read with the same functions the import's guard uses, so the two cannot drift.
+The one difference is time: this is the live set, while an import snapshots it
+at its first batch, so a day that goes live in between reads as new here and is
+skipped there. The CLI treats anything but a 200 as "no answer" and falls back
+to its local-only preview with a note — it never blocks the import on this.
 
 ### Ultrathink
 

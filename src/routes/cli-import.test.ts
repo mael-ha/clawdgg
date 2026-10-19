@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
-import {
+import cli, {
+  buildImportCoverage,
   buildUltrathinkRow,
   checkImportRate,
   checkUltrathinkRate,
@@ -886,5 +887,104 @@ describe('checkUltrathinkRate', () => {
     for (let i = 0; i < 61; i++) checkUltrathinkRate(a, now);
     expect(checkUltrathinkRate(a, now).ok).toBe(false);
     expect(checkUltrathinkRate(b, now).ok).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET /api/cli/import/coverage
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('GET /api/cli/import/coverage', () => {
+  it('refuses a request with no bearer token', async () => {
+    const response = await cli.request('http://localhost/import/coverage');
+    expect(response.status).toBe(401);
+    expect(await response.json()).toMatchObject({ error: 'Unauthorized' });
+  });
+
+  it('refuses a cookie session, like every other /api/cli route', async () => {
+    const response = await cli.request('http://localhost/import/coverage', {
+      headers: { cookie: 'session=whatever' },
+    });
+    expect(response.status).toBe(401);
+  });
+
+  it('refuses a bearer token that is not one of ours', async () => {
+    const response = await cli.request('http://localhost/import/coverage', {
+      headers: { Authorization: 'Bearer not-a-clawdgg-token' },
+    });
+    expect(response.status).toBe(401);
+  });
+
+  it('answers with sorted day lists and both cutoffs as ISO instants', () => {
+    const body = buildImportCoverage(
+      {
+        days: new Set(['2026-03-02', '2026-01-01', '2026-02-01']),
+        ultrathinkDays: new Set(['2026-02-01']),
+      },
+      CUTOFF,
+      FLAG_CUTOFF
+    );
+
+    expect(body).toEqual({
+      days: ['2026-01-01', '2026-02-01', '2026-03-02'],
+      ultrathinkDays: ['2026-02-01'],
+      cutoff: '2026-05-06T00:00:00.000Z',
+      flagCutoff: '2026-09-01T00:00:00.000Z',
+    });
+  });
+
+  it('keeps the two day sets apart, because the guard does', () => {
+    // A day with a flag on it but no measured row is NOT covered for prompts,
+    // and a day with prompts on it is NOT covered for flags. Collapsing them
+    // is the bug ImportDeps.ultrathinkDays exists to prevent.
+    const body = buildImportCoverage(
+      { days: new Set(['2026-01-01']), ultrathinkDays: new Set(['2026-02-02']) },
+      CUTOFF,
+      FLAG_CUTOFF
+    );
+    expect(body.days).toEqual(['2026-01-01']);
+    expect(body.ultrathinkDays).toEqual(['2026-02-02']);
+  });
+
+  it('reports exactly the set the import guard then drops rows by', async () => {
+    // The point of the endpoint: a day the preview calls covered is a day the
+    // import skips whole, and a day it does not is a day the import keeps. Both
+    // halves asserted through the real guard, so the two cannot drift.
+    const covered = ['2026-03-01'];
+    const uncovered = '2026-03-02';
+    const { deps, events } = stubStore(covered, covered);
+
+    const body = buildImportCoverage(
+      { days: deps.coveredDays, ultrathinkDays: deps.ultrathinkDays },
+      deps.cutoffMs,
+      deps.flagCutoffMs
+    );
+
+    const result = await runImport(
+      USER,
+      {
+        events: [
+          event({ timestamp: '2026-03-01 10:00:00.000' }),
+          event({ timestamp: `${uncovered} 10:00:00.000` }),
+          event({ timestamp: '2026-03-01 11:00:00.000', event_name: ULTRATHINK_EVENT_NAME }),
+          event({ timestamp: `${uncovered} 11:00:00.000`, event_name: ULTRATHINK_EVENT_NAME }),
+        ],
+      },
+      deps
+    );
+
+    for (const day of body.days) expect(covered).toContain(day);
+    expect(body.days).not.toContain(uncovered);
+    expect(result.skippedCoveredDay).toBe(2);
+    expect(events.map((row) => row.timestamp.slice(0, 10))).toEqual([uncovered, uncovered]);
+  });
+
+  it('states the flag cutoff separately, because flags answer to their own', () => {
+    const body = buildImportCoverage(
+      { days: new Set(), ultrathinkDays: new Set() },
+      CUTOFF,
+      FLAG_CUTOFF
+    );
+    expect(Date.parse(body.flagCutoff)).toBeGreaterThan(Date.parse(body.cutoff));
   });
 });

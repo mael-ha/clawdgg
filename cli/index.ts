@@ -84,7 +84,14 @@ import {
 } from "./otel-headers";
 import { clearTokenRevoked, isTokenRevoked, markTokenRevoked } from "./token-state";
 import { createProgress } from "./progress";
-import { countRows } from "./import-preview";
+import {
+  countRows,
+  previewTotals,
+  splitByCoverage,
+  type ImportCoverage,
+  type PreviewSplit,
+  type PreviewTotals,
+} from "./import-preview";
 import { version } from "./version";
 
 // ANSI color codes
@@ -1715,35 +1722,6 @@ interface ImportBatchResult {
   skippedDays: string[];
 }
 
-/**
- * The cost the server will compute for these rows.
- *
- * Deliberately NOT the mapper's own `cost_usd`: the server recomputes cost from
- * model + token counts (it does not trust a client's arithmetic about money).
- * Pricing the preview from exactly the fields we are about to upload — the
- * cache-creation total AND its 1h share — is what keeps "we'll upload $X" and
- * "clawd.gg says $X" the same number.
- */
-function previewCostUsd(events: ImportEventRow[]): number {
-  let total = 0;
-  for (const event of events) {
-    if (event.event_name !== "claude_code.api_request") continue;
-    const cacheWrite = event.cache_write_tokens ?? 0;
-    const cacheWrite1h = Math.min(event.cache_write_1h_tokens ?? 0, cacheWrite);
-    total += computeCostUsd(event.model ?? "", {
-      input_tokens: event.input_tokens ?? 0,
-      output_tokens: event.output_tokens ?? 0,
-      cache_read_input_tokens: event.cache_read_tokens ?? 0,
-      cache_creation_input_tokens: cacheWrite,
-      cache_creation: {
-        ephemeral_1h_input_tokens: cacheWrite1h,
-        ephemeral_5m_input_tokens: cacheWrite - cacheWrite1h,
-      },
-    }).costUsd;
-  }
-  return total;
-}
-
 async function findTranscripts(dir: string): Promise<string[]> {
   const found: string[] = [];
 
@@ -1778,6 +1756,50 @@ async function fetchImportCutoff(token: string): Promise<Date> {
   return new Date();
 }
 
+/**
+ * What clawd.gg already holds, so the preview can say what is NEW rather than
+ * what is local.
+ *
+ * Null on anything but a well-formed 200 — an older server with no such route,
+ * a network error, a rate limit. The import must never depend on it: it is a
+ * better preview, not a precondition, and the server enforces the same rules
+ * whether or not the CLI managed to ask about them first.
+ */
+async function fetchImportCoverage(
+  token: string,
+  fallbackCutoff: Date
+): Promise<ImportCoverage | null> {
+  try {
+    const response = await apiFetch("/api/cli/import/coverage", { token });
+    if (!response.ok) return null;
+    const body = (await response.json()) as {
+      days?: unknown;
+      ultrathinkDays?: unknown;
+      cutoff?: unknown;
+      flagCutoff?: unknown;
+    };
+    if (!Array.isArray(body.days) || !Array.isArray(body.ultrathinkDays)) return null;
+
+    const strings = (value: unknown[]) => value.filter((day): day is string => typeof day === "string");
+    const instant = (value: unknown, fallback: number) => {
+      const ms = typeof value === "string" ? Date.parse(value) : NaN;
+      return Number.isNaN(ms) ? fallback : ms;
+    };
+
+    return {
+      days: new Set(strings(body.days)),
+      ultrathinkDays: new Set(strings(body.ultrathinkDays)),
+      cutoffMs: instant(body.cutoff, fallbackCutoff.getTime()),
+      // Flags have their own boundary and it is LATER than the measured one, so
+      // "now" is the conservative stand-in: it is where the gap the hook never
+      // recorded ends.
+      flagCutoffMs: instant(body.flagCutoff, Date.now()),
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function postImportBatch(
   token: string,
   batch: { events: unknown[]; runId: string },
@@ -1808,6 +1830,34 @@ async function postImportBatch(
   }
 
   throw new Error("Gave up after repeated rate limiting — try again later.");
+}
+
+/**
+ * The headline of the preview: what was found, and how much of it is new.
+ *
+ * Two shapes rather than one, because "1,629 prompts found · 1,629 new · 0 on
+ * days clawd.gg already has" is three numbers to say what one says. The split
+ * appears exactly when there is a split to report.
+ */
+function reportPreviewTotals(found: PreviewTotals, split: PreviewSplit | null): void {
+  const b = (text: string) => `${colors.bright}${text}${colors.reset}`;
+  const sep = `  ${colors.dim}·${colors.reset}  `;
+
+  if (!split || split.landing.prompts === found.prompts) {
+    console.log(
+      `  ${b(found.prompts.toLocaleString())} prompts${sep}${b(found.apiRequests.toLocaleString())} API calls${sep}${b(`$${found.costUsd.toFixed(2)}`)} ${colors.dim}(estimated)${colors.reset}`
+    );
+    return;
+  }
+
+  const already = found.prompts - split.landing.prompts;
+  const days = split.coveredDays.length;
+  console.log(
+    `  ${b(found.prompts.toLocaleString())} prompts found${sep}${b(split.landing.prompts.toLocaleString())} new${sep}${b(already.toLocaleString())} on ${days.toLocaleString()} day${days === 1 ? "" : "s"} clawd.gg already has`
+  );
+  log.dim(
+    `  the new ones: ${split.landing.apiRequests.toLocaleString()} API calls · $${split.landing.costUsd.toFixed(2)} (estimated), of $${found.costUsd.toFixed(2)} found`
+  );
 }
 
 async function runLocalImport(config: Config, assumeYes: boolean): Promise<boolean> {
@@ -1925,16 +1975,22 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
   // server's double-count guard works a whole day at a time.
   events.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
 
-  const { prompts, apiRequests, rows: total } = countRows(events);
-  const costUsd = previewCostUsd(events);
+  const found = previewTotals(events);
+  const total = found.rows;
 
   if (total === 0) {
     log.info("Nothing to import — your local history is all after telemetry started.");
     return true;
   }
 
+  // The server skips any UTC day it already holds rows for, of any provenance,
+  // so a preview counted purely from local files overstates what will land —
+  // for the owner's first real run, by 37 of its 68 days.
+  const coverage = await fetchImportCoverage(token, cutoff);
+  const split = coverage ? splitByCoverage(events, coverage) : null;
+
   console.log();
-  console.log(`  ${colors.bright}${prompts.toLocaleString()}${colors.reset} prompts  ${colors.dim}·${colors.reset}  ${colors.bright}${apiRequests.toLocaleString()}${colors.reset} API calls  ${colors.dim}·${colors.reset}  ${colors.bright}$${costUsd.toFixed(2)}${colors.reset} ${colors.dim}(estimated)${colors.reset}`);
+  reportPreviewTotals(found, split);
   if (historyPrompts > 0) {
     log.dim(`  ${historyPrompts.toLocaleString()} of those prompts come from history.jsonl`);
   }
@@ -1944,10 +2000,20 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
   if (lateFlags.length > 0) {
     log.dim(`  ${lateFlags.length.toLocaleString()} ultrathink flags from before the hook existed`);
   }
+  if (split && found.flags > 0 && split.landing.flags !== found.flags) {
+    log.dim(`  of ${found.flags.toLocaleString()} ultrathink flags, ${split.landing.flags.toLocaleString()} are new — the rest are days already counted, or past where the hook took over`);
+  }
   if (flatCacheRows > 0) {
     log.dim(`  ${flatCacheRows.toLocaleString()} API calls recorded no cache-TTL split, so their cache-write cost is a floor`);
   }
-  log.dim(`  ${total.toLocaleString()} rows to upload. Timestamps and counts only — no prompt text.`);
+  if (split && split.landing.rows !== total) {
+    log.dim(`  ${total.toLocaleString()} rows to upload, ${split.landing.rows.toLocaleString()} of them new. Timestamps and counts only — no prompt text.`);
+  } else {
+    log.dim(`  ${total.toLocaleString()} rows to upload. Timestamps and counts only — no prompt text.`);
+  }
+  if (!coverage) {
+    log.dim("  (couldn't ask clawd.gg which days it already has — it skips those on arrival)");
+  }
   console.log();
 
   if (!(await confirm("Upload this to clawd.gg?", assumeYes))) {
