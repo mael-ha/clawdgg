@@ -19,6 +19,7 @@ import {
   modelFamilyMilestones,
   rarityTier,
   ratioOfSums,
+  sanitizeName,
   splitModelName,
   withShares,
   type DailyPoint,
@@ -635,5 +636,56 @@ describe('assembleFingerprint', () => {
     const data = assembleFingerprint(parts, { ...meta, hidden: ['curve', 'year', 'plan'] });
     expect(data.sections).toEqual([...BUILT_SECTIONS]);
     expect(data.hidden).toEqual(['curve', 'year', 'plan']);
+  });
+});
+
+/**
+ * Tool names, language names and model ids are OTEL ATTRIBUTES — strings the
+ * client chose — and they are drawn as SVG text on the profile's rings and on
+ * the share card. XML 1.0 cannot represent a C0 control character, so resvg
+ * does not draw a card containing one: it throws, and the card 503s for every
+ * unfurl of that profile's link.
+ */
+describe('sanitizeName', () => {
+  it('leaves an ordinary name alone', () => {
+    expect(sanitizeName('TypeScript')).toBe('TypeScript');
+    expect(sanitizeName('C++')).toBe('C++');
+    expect(sanitizeName('Opus 5.5')).toBe('Opus 5.5');
+    // Not ASCII-only: a tool or language name may be anything printable.
+    expect(sanitizeName('日本語')).toBe('日本語');
+    expect(sanitizeName('café')).toBe('café');
+  });
+
+  it('strips the characters an SVG cannot carry', () => {
+    expect(sanitizeName('Type\u0001Script')).toBe('TypeScript');
+    expect(sanitizeName('\u0000ruby\u001f')).toBe('ruby');
+    expect(sanitizeName('a\u007fb\u009fc')).toBe('abc');
+    // Legal XML, but not part of a name, and a newline in a ring label is a
+    // layout bug rather than a name.
+    expect(sanitizeName('line\nbreak')).toBe('linebreak');
+    expect(sanitizeName('  padded\t')).toBe('padded');
+  });
+
+  it('can empty a name that was nothing but control characters', () => {
+    // Empty is fine: the ring sorts by volume and labels what it has.
+    expect(sanitizeName('\u0001\u0002')).toBe('');
+  });
+});
+
+describe('names reach the payload sanitized', () => {
+  it('cleans language names on the ring', () => {
+    const rings = buildRings(
+      [{ hour: 9, weekday: 1, prompts: 10 }],
+      [{ name: 'Type\u0001Script', value: 80 }],
+      []
+    );
+    expect(rings.topLanguage?.name).toBe('TypeScript');
+    expect(JSON.stringify(rings)).not.toContain('\u0001');
+  });
+
+  it('cleans model names, family and version alike', () => {
+    expect(splitModelName('claude-opus-5-5\u0001')).toEqual({ family: 'Opus', version: '5.5' });
+    const families = groupModelsByFamily([{ model: 'claude-opus-5-5\u0001', value: 100 }]);
+    expect(JSON.stringify(families)).not.toContain('\u0001');
   });
 });

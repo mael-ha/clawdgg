@@ -698,9 +698,29 @@ export function attachRarity(
   });
 }
 
+/**
+ * A name from an OTEL attribute, fit to put in a payload that gets DRAWN.
+ *
+ * Tool names, language names and model ids are strings the client chose, and
+ * they end up as text nodes in an SVG — the profile's rings and, through
+ * src/lib/share-card.ts, the 1200×630 card. XML 1.0 has no way to represent a
+ * C0 control character, so resvg does not render a card containing one, it
+ * THROWS: a single `\u0001` in a tool name took the whole card down (503 for
+ * that profile, every unfurl of its link) and left the rest of the page
+ * showing a name with an invisible character in it. Stripped at the door, so
+ * nothing downstream has to know.
+ *
+ * Tab, newline and carriage return go too. They are legal XML but they are not
+ * part of anybody's language name, and a newline in a ring label is a layout
+ * bug rather than a name.
+ */
+export function sanitizeName(raw: string): string {
+  return raw.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').trim();
+}
+
 /** Model id → the family and version a human recognises ('Opus', '5.5'). */
 export function splitModelName(modelId: string): { family: string; version: string } {
-  const display = getModelDisplayName(modelId);
+  const display = sanitizeName(getModelDisplayName(modelId));
   const space = display.indexOf(' ');
   if (space === -1) return { family: display, version: '' };
   return { family: display.slice(0, space), version: display.slice(space + 1) };
@@ -723,7 +743,7 @@ export function groupModelsByFamily(
     const value = row.value || 0;
     if (value <= 0) continue;
     const { family } = splitModelName(row.model);
-    const name = getModelDisplayName(row.model);
+    const name = sanitizeName(getModelDisplayName(row.model));
     const entry = families.get(family) ?? { value: 0, versions: new Map() };
     entry.value += value;
     entry.versions.set(name, (entry.versions.get(name) ?? 0) + value);
@@ -819,7 +839,10 @@ async function fetchTopTools(userId: string): Promise<ToolCount[]> {
      LIMIT 4`,
     { userId }
   );
-  return rows.map((row) => ({ name: row.name, count: Number(row.count) || 0 }));
+  return rows.map((row) => ({
+    name: sanitizeName(row.name),
+    count: Number(row.count) || 0,
+  }));
 }
 
 /**
@@ -1252,7 +1275,9 @@ export function buildRings(
   });
 
   const weekdayTotal = weekdays.slice(0, 5).reduce((sum, n) => sum + n, 0);
-  const languageItems = withShares(languages.map((l) => ({ name: l.name, value: Number(l.value) || 0 })))
+  const languageItems = withShares(
+    languages.map((l) => ({ name: sanitizeName(l.name), value: Number(l.value) || 0 }))
+  )
     .map(({ name, value, share: s }) => ({ name, value, share: s }))
     .sort((a, b) => b.value - a.value);
   const modelFamilies = groupModelsByFamily(models);

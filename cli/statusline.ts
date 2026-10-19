@@ -68,13 +68,17 @@ export interface StatusLineMergeResult {
   existing?: string;
 }
 
-function statusLineCommandOf(settings: Record<string, any>): string | null {
-  const configured = settings?.statusLine;
-  if (typeof configured === "string") return configured;
-  if (configured && typeof configured === "object" && typeof configured.command === "string") {
-    return configured.command;
+/** The command out of a `statusLine` value, in either form Claude Code takes. */
+function commandOfValue(value: unknown): string | null {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object" && typeof (value as any).command === "string") {
+    return (value as any).command;
   }
   return null;
+}
+
+function statusLineCommandOf(settings: Record<string, any>): string | null {
+  return commandOfValue(settings?.statusLine);
 }
 
 /**
@@ -158,9 +162,10 @@ export type StatusLineRemovalAction = "removed" | "restored" | "not-ours" | "abs
  *
  * `original` is what `setup` recorded before wrapping, and it goes back exactly
  * as it was — a string stays a string, an object keeps its `padding` and its
- * key order. Without it (an older config, or a `disable` on another machine)
- * the wrapper still carries the command it wraps, so the command is recovered
- * from our own argv and the rest of the object is already untouched.
+ * key order — but ONLY when it is the command this wrapper wraps. Without it,
+ * or when it has gone stale, the wrapper still carries the command it wraps, so
+ * the command is recovered from our own argv and the rest of the object is
+ * already untouched.
  */
 export function removeStatusLineSetting(
   settings: Record<string, any>,
@@ -173,7 +178,16 @@ export function removeStatusLineSetting(
   if (!shape.ours) return "not-ours";
 
   if (shape.wrapped !== undefined) {
-    if (original !== undefined) {
+    // The recorded value is only the right answer when it is the command this
+    // wrapper actually wraps. `setup` records the FIRST original it ever saw
+    // and never updates it (a second setup sees our own wrapper, not their
+    // line, and must not overwrite the real original with it) — so: wrap X,
+    // the user replaces their status line with Z, `setup --wrap-statusline`
+    // wraps Z, and the recording still says X. Writing X back there would
+    // not restore anything, it would REPLACE the status line they are using
+    // with one they abandoned. The wrapper carries what it wraps, so that is
+    // what goes back, and the rest of the object is already untouched.
+    if (original !== undefined && commandOfValue(original) === shape.wrapped) {
       settings.statusLine = original;
     } else {
       const current = settings.statusLine;
@@ -429,6 +443,19 @@ export interface WrappedStatusLine {
  * — never our own text in its place. A status line that goes blank when a
  * script breaks is the user's own bug, visible and theirs; a status line that
  * silently turns into ours is us lying about what they configured.
+ *
+ * THE TIMEOUT BOUNDS THE PROCESS TREE, NOT THE SHELL. `child.kill()` signals
+ * `sh` alone, and `sh` is never the thing that is slow: it is the `sleep`,
+ * `git` or `curl` inside it, which outlives its parent holding the write end
+ * of our stdout pipe — so the reader never ends, the handle keeps Bun's loop
+ * alive, and this process sat there for the full eight seconds of a command it
+ * had "timed out" after three. Measured: 8.08s wall for `(sleep 8; echo late)
+ * & echo hi`, where the shell itself exits in 9ms. So the child gets a process
+ * group of its own (`detached`) and the deadline kills the GROUP.
+ *
+ * The group is also killed after a CLEAN exit that left the pipes open, which
+ * is that same backgrounded case — and only then, because a pgid whose last
+ * member has exited can be recycled, while one with a live member cannot.
  */
 export async function runWrappedStatusLine(
   command: string,
@@ -441,7 +468,24 @@ export async function runWrappedStatusLine(
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
+      // Its own process group, so one signal reaches everything it started.
+      detached: true,
     });
+
+    // SIGKILL and not SIGTERM: this is a hard deadline on a prompt render, and
+    // a shell script that traps TERM is not going to be waited for. Falls back
+    // to the child alone if the platform has no process groups.
+    const killGroup = () => {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        try {
+          child.kill();
+        } catch {
+          // Already gone, which is the outcome we wanted.
+        }
+      }
+    };
 
     // Drained chunk by chunk, starting before the write: a command that prints
     // more than a pipe buffer holds cannot deadlock against us, and — the
@@ -461,20 +505,25 @@ export async function runWrappedStatusLine(
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill();
+      killGroup();
     }, timeoutMs);
 
     const exitCode = await child.exited;
     clearTimeout(timer);
 
     // A grace window, not a wait: after a clean exit both streams end at once,
-    // but a killed `sh` can leave a grandchild holding the write end open, and
-    // that must not become our hang. Whatever has been read by then is what
-    // gets printed — a partial line beats a blank one.
-    await Promise.race([
-      Promise.all([out.done, err.done]),
-      new Promise((resolve) => setTimeout(resolve, DRAIN_GRACE_MS)),
+    // but a `sh` that is gone can leave a grandchild holding the write end
+    // open, and that must not become our hang. Whatever has been read by then
+    // is what gets printed — a partial line beats a blank one.
+    const drained = await Promise.race([
+      Promise.all([out.done, err.done]).then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), DRAIN_GRACE_MS)),
     ]);
+    // Still open means something in that group is alive and holding our pipe.
+    // It is not going to print anything we will wait for, and leaving it there
+    // leaves this process alive with it.
+    if (!drained) killGroup();
+
     return { stdout: out.bytes(), stderr: err.bytes(), exitCode, timedOut };
   } catch (error) {
     return {
@@ -508,12 +557,17 @@ export async function cmdStatusline(wrapped?: string): Promise<void> {
     await reportPlanUsage(input);
 
     const result = await runWrappedStatusLine(wrapped, raw);
-    if (result.stdout.length > 0) process.stdout.write(result.stdout);
-    if (result.stderr.length > 0) process.stderr.write(result.stderr);
-    // Their exit code is the exit code. process.exitCode rather than
-    // process.exit(), which can cut a write short.
-    if (result.exitCode !== 0) process.exitCode = result.exitCode;
-    return;
+    // Bun.write resolves when the bytes are GONE, which is the flush the
+    // process.exit below would otherwise cut short.
+    if (result.stdout.length > 0) await Bun.write(Bun.stdout, result.stdout);
+    if (result.stderr.length > 0) await Bun.write(Bun.stderr, result.stderr);
+    // Their exit code is the exit code — and we exit EXPLICITLY. Returning
+    // here waits for the event loop to empty, and a status line that
+    // backgrounded something (`mytool &`) leaves a grandchild holding the
+    // stdout pipe we were reading: the handle alone kept this process, and so
+    // the user's prompt, waiting for a command we had already given up on.
+    // runWrappedStatusLine kills what it can; this is the part it cannot.
+    process.exit(result.exitCode);
   }
 
   // Print first, always: the prompt gets its line whatever happens below.

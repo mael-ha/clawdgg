@@ -63,8 +63,16 @@ export const MONTH_NAMES = [
  * Languages people actually write here, in the colour they are recognised by.
  * Anything else falls through to FALLBACK_COLORS by position, which is stable
  * for a given ring because the ring is sorted by volume.
+ *
+ * A MAP, not an object, and that is load-bearing. The key is a language name
+ * out of an OTEL attribute — a string the client chose — so with an object
+ * literal, `constructor` and `__proto__` are not misses: the first returns a
+ * FUNCTION and the second the prototype, neither is nullish, so `??` does not
+ * reach the fallback and a function ends up in an SVG `fill`. A `.ts` file
+ * called `constructor` would have taken a profile down. A Map has no inherited
+ * keys, so a name nobody colour-coded is simply absent.
  */
-const LANGUAGE_COLORS: Record<string, string> = {
+const LANGUAGE_COLORS = new Map<string, string>(Object.entries({
   typescript: ICE,
   javascript: SUN,
   tsx: ICE,
@@ -104,13 +112,13 @@ const LANGUAGE_COLORS: Record<string, string> = {
   r: '#64b5f6',
   perl: '#9fa8da',
   text: FAINT,
-};
+}));
 
 const FALLBACK_COLORS = [ICE, PINK, TEXT, SUN, PRIMARY, VIOLET, ROSE, WEEKEND] as const;
 
 export function languageColor(name: string, index: number): string {
   return (
-    LANGUAGE_COLORS[name.trim().toLowerCase()] ??
+    LANGUAGE_COLORS.get(name.trim().toLowerCase()) ??
     FALLBACK_COLORS[index % FALLBACK_COLORS.length] ??
     DIM
   );
@@ -120,17 +128,20 @@ export function languageColor(name: string, index: number): string {
  * Model families in their house colour. The versions inside a family are the
  * same hue stepped darker (see shade), so the inner ring reads as "which Opus"
  * and the outer one as "how much Opus".
+ *
+ * A Map for the same reason as LANGUAGE_COLORS: the family is read off a model
+ * id the client sent.
  */
-const FAMILY_COLORS: Record<string, string> = {
-  opus: ACCENT,
-  fable: VIOLET,
-  sonnet: ICE,
-  haiku: PRIMARY,
-};
+const FAMILY_COLORS = new Map<string, string>([
+  ['opus', ACCENT],
+  ['fable', VIOLET],
+  ['sonnet', ICE],
+  ['haiku', PRIMARY],
+]);
 
 export function familyColor(family: string, index: number): string {
   return (
-    FAMILY_COLORS[family.trim().toLowerCase()] ??
+    FAMILY_COLORS.get(family.trim().toLowerCase()) ??
     FALLBACK_COLORS[index % FALLBACK_COLORS.length] ??
     DIM
   );
@@ -214,10 +225,15 @@ export function className(
   rhythm: RhythmClass | null,
   style: StyleClass | null
 ): ClassName | null {
-  if (!rhythm && !style) return null;
+  // hasOwn, not a truthiness check on the lookup: these come off a payload, and
+  // `rhythm: "constructor"` would otherwise index the prototype and read
+  // `.emoji` off a function instead of throwing or falling back.
+  const named = rhythm && Object.hasOwn(RHYTHM_LABELS, rhythm) ? RHYTHM_LABELS[rhythm] : null;
+  const styled = style && Object.hasOwn(STYLE_LABELS, style) ? STYLE_LABELS[style] : null;
+  if (!named && !styled) return null;
   return {
-    emoji: rhythm ? RHYTHM_LABELS[rhythm].emoji : '🧭',
-    rhythm: rhythm ? RHYTHM_LABELS[rhythm].label : '',
-    style: style ? STYLE_LABELS[style] : '',
+    emoji: named ? named.emoji : '🧭',
+    rhythm: named ? named.label : '',
+    style: styled ?? '',
   };
 }

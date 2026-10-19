@@ -204,3 +204,74 @@ describe("runWrappedStatusLine", () => {
     expect(result.exitCode).toBe(0);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The deadline bounds the PROCESS, not just the shell
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * These run the real CLI as a child, because what is being measured is when
+ * OUR PROCESS EXITS — and that is not something a function call can show.
+ * Claude Code waits for the statusLine command to exit before it draws the
+ * prompt, so a process that returns in 3s and then sits on an open pipe for
+ * five more is a five-second prompt, and the in-process timeout said nothing
+ * about it.
+ */
+describe("the wrapped status line as a whole process", () => {
+  const CLI = join(import.meta.dir, "index.ts");
+  const stdin = JSON.stringify({ model: { display_name: "Opus 5" }, session_id: "s1" });
+
+  async function runCli(wrapped: string) {
+    // HOME to a temp dir: this path reads ~/.config/clawdgg for a token, and a
+    // test must not find the developer's own.
+    const home = mkdtempSync(join(tmpdir(), "clawdgg-home-"));
+    dirs.push(home);
+    const started = Date.now();
+    const child = Bun.spawn(["bun", CLI, "statusline", "--wrap", wrapped], {
+      stdin: new TextEncoder().encode(stdin),
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, HOME: home, CLAWDGG_API_URL: "http://127.0.0.1:1" },
+    });
+    const [out, err] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    await child.exited;
+    return { ms: Date.now() - started, stdout: out, stderr: err };
+  }
+
+  // 3.5s is WRAPPED_TIMEOUT_MS (3s) plus the drain grace and two process
+  // starts. The number that matters is that it is nowhere near 8.
+  const BUDGET_MS = 3_500;
+
+  it("stops waiting on a command that hangs after printing", async () => {
+    const result = await runCli("echo a; sleep 8");
+
+    expect(result.stdout).toBe("a\n");
+    expect(result.ms).toBeLessThan(BUDGET_MS);
+    // It really did wait out the deadline rather than giving up early.
+    expect(result.ms).toBeGreaterThan(2_000);
+  }, 20_000);
+
+  /**
+   * The case the old code could not survive at all: `sh` exits in milliseconds
+   * and a BACKGROUNDED grandchild keeps the stdout pipe open for eight
+   * seconds. Nothing timed out, because nothing was running — the process just
+   * could not exit. Measured at 8.08s before the process-group kill.
+   */
+  it("exits as soon as the shell does, whatever it left running", async () => {
+    const result = await runCli("(sleep 8; echo late) & echo hi");
+
+    expect(result.stdout).toBe("hi\n");
+    // Nothing of the grandchild's output, which arrives long after the prompt.
+    expect(result.stdout).not.toContain("late");
+    expect(result.ms).toBeLessThan(BUDGET_MS);
+  }, 20_000);
+
+  it("passes a plain status line straight through", async () => {
+    const result = await runCli("printf 'clawd 42%%'");
+    expect(result.stdout).toBe("clawd 42%");
+    expect(result.ms).toBeLessThan(BUDGET_MS);
+  }, 20_000);
+});
