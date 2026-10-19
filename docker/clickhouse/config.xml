@@ -13,8 +13,12 @@
          set cannot change it silently. Verify with: SELECT timezone(). -->
     <timezone>UTC</timezone>
 
-    <!-- Memory settings optimized for 4GB VPS -->
-    <max_server_memory_usage_to_ram_ratio>0.5</max_server_memory_usage_to_ram_ratio>
+    <!-- Memory settings optimized for 4GB VPS.
+         0.75, not 0.5: a FINAL read on the row_id sorting key wants 120–290
+         MiB per query, and half of the host's 3.7 GiB was not enough for a few
+         of those at once — prod answered MEMORY_LIMIT_EXCEEDED 503s until it
+         was raised by hand on 2026-10-19. -->
+    <max_server_memory_usage_to_ram_ratio>0.75</max_server_memory_usage_to_ram_ratio>
 
     <!-- Logging -->
     <logger>
