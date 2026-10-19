@@ -1,0 +1,5 @@
+# `bun test` only. scripts/test-setup.ts says what it does and why it cannot be
+# a beforeAll hook: two modules in this app throw at IMPORT time when the
+# checkout has no data/ directory or no public/build, which is every CI run.
+[test]
+preload = ["./scripts/test-setup.ts"]
