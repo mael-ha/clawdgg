@@ -83,6 +83,7 @@ import {
   REVOKED_TOKEN_MESSAGE,
 } from "./otel-headers";
 import { clearTokenRevoked, isTokenRevoked, markTokenRevoked } from "./token-state";
+import { createProgress } from "./progress";
 import { version } from "./version";
 
 // ANSI color codes
@@ -1778,7 +1779,11 @@ async function fetchImportCutoff(token: string): Promise<Date> {
 
 async function postImportBatch(
   token: string,
-  batch: { events: unknown[]; runId: string }
+  batch: { events: unknown[]; runId: string },
+  // Where a rate-limit wait is reported. The default is a dim line; the import
+  // passes its progress bar's `note`, so the wait appears beside the bar
+  // instead of tearing it in half.
+  note: (text: string) => void = (text) => log.dim(text)
 ): Promise<ImportBatchResult> {
   for (let attempt = 1; attempt <= 5; attempt++) {
     const response = await apiFetch("/api/cli/import", {
@@ -1793,7 +1798,7 @@ async function postImportBatch(
     // than that, so being throttled is expected, not an error.
     if (response.status === 429) {
       const retryAfter = Math.min(Number(response.headers.get("Retry-After") ?? 10) || 10, 90);
-      log.dim(`  rate limited — waiting ${retryAfter}s`);
+      note(`  rate limited — waiting ${retryAfter}s`);
       await new Promise((r) => setTimeout(r, retryAfter * 1000));
       continue;
     }
@@ -1845,7 +1850,13 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
   // first live flag.
   const afterCutoff: ImportEventRow[] = [];
 
-  for (const file of transcripts) {
+  // ~3.9 GB of JSONL for the owner's tree, minutes of it, and until this bar
+  // existed the only thing on screen was the line above.
+  const reading = createProgress({ label: "Reading transcripts", total: transcripts.length });
+
+  for (const [index, file] of transcripts.entries()) {
+    reading.update(index + 1);
+
     let raw: string;
     try {
       raw = await readFile(file, "utf-8");
@@ -1863,6 +1874,8 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
       ...mapJsonlText(raw, { ...mapOptions, ...describe, to: undefined, from: cutoff }).events
     );
   }
+
+  reading.finish();
 
   // history.jsonl outlives the transcripts (which rotate at ~60 days), so it
   // fills days the transcripts no longer cover — and only those days, or every
@@ -1940,16 +1953,18 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
     skippedDuplicate: 0,
   };
   const skippedDays = new Set<string>();
-  let sentRows = 0;
 
   // One id for the whole run. The server snapshots which days it already holds
   // when the first batch arrives and reuses that snapshot for the rest — the
   // alternative is batch 1 making its own day look "already counted" to batch 2.
   const runId = crypto.randomUUID();
 
+  const batches = Math.ceil(events.length / IMPORT_BATCH_ROWS);
+  const uploading = createProgress({ label: "Uploading", total: batches, unit: "batches" });
+
   for (let i = 0; i < events.length; i += IMPORT_BATCH_ROWS) {
     const slice = events.slice(i, i + IMPORT_BATCH_ROWS);
-    const result = await postImportBatch(token, { events: slice, runId });
+    const result = await postImportBatch(token, { events: slice, runId }, uploading.note);
 
     totals.inserted += result.inserted;
     totals.rejected += result.rejected;
@@ -1958,10 +1973,9 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
     totals.skippedDuplicate += result.skippedDuplicate;
     for (const day of result.skippedDays ?? []) skippedDays.add(day);
 
-    sentRows += slice.length;
-    process.stdout.write(`\r  uploading… ${sentRows.toLocaleString()}/${total.toLocaleString()} rows`);
+    uploading.update(i / IMPORT_BATCH_ROWS + 1);
   }
-  process.stdout.write("\r\x1b[K");
+  uploading.finish();
 
   log.success(`Imported ${totals.inserted.toLocaleString()} rows.`);
   if (totals.skippedCoveredDay > 0) {
