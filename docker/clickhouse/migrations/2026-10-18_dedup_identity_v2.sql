@@ -346,7 +346,28 @@ FROM events_raw;
 --     account_uuid, organization_id, provenance, pricing_source, row_id
 -- FROM metrics_raw_v2 WHERE timestamp >= toDateTime64({watermark:String}, 3);
 --
--- (and the same for events_raw / events_raw_v2)
+-- INSERT INTO events_raw (timestamp, user_id, session_id, event_name, prompt_length,
+--     tool_name, tool_success, tool_duration_ms, model, cost_usd, input_tokens,
+--     output_tokens, cache_read_tokens, cache_write_tokens, error_message, error_type,
+--     status_code, duration_ms, decision, source, tool_use_id, tool_source, prompt_id,
+--     request_id, client_request_id, message_uuid, event_sequence, query_source, speed,
+--     effort, agent_name, skill_name, marketplace_name, command_name, command_source,
+--     terminal_type, app_version, account_uuid, organization_id, provenance,
+--     pricing_source, row_id)
+-- SELECT timestamp, user_id, session_id, event_name, prompt_length,
+--     tool_name, tool_success, tool_duration_ms, model, cost_usd, input_tokens,
+--     output_tokens, cache_read_tokens, cache_write_tokens, error_message, error_type,
+--     status_code, duration_ms, decision, source, tool_use_id, tool_source, prompt_id,
+--     request_id, client_request_id, message_uuid, event_sequence, query_source, speed,
+--     effort, agent_name, skill_name, marketplace_name, command_name, command_source,
+--     terminal_type, app_version, account_uuid, organization_id, provenance,
+--     pricing_source, row_id
+-- FROM events_raw_v2 WHERE timestamp >= toDateTime64({watermark:String}, 3);
+--
+-- Written out rather than left as "and the same for events_raw": this is the
+-- block you reach for under pressure, and the two tables do not have the same
+-- column list. Note that it does NOT carry tool_parameters — the old shape has
+-- that column and the v2 rows have nothing to put in it.
 --
 -- Then redeploy the previous app image. It does not write the new columns, and
 -- the old tables tolerate that: every one of them has a DEFAULT.
