@@ -18,7 +18,7 @@
 // Every function here takes its paths explicitly — nothing reads homedir() —
 // so the tests run against a fixture directory instead of the real ~/.claude.
 
-import { open, readFile, writeFile, chmod, rename, readdir, realpath, unlink } from "node:fs/promises";
+import { open, readFile, chmod, rename, readdir, realpath, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join } from "node:path";
@@ -94,6 +94,23 @@ const BACKUP_SUFFIX = ".clawdgg-backup-";
 export const BACKUPS_KEPT = 5;
 
 /**
+ * A counter, zero-padded, appended to every backup name.
+ *
+ * The ISO stamp is not unique: `setup` backs settings.json up several times in
+ * a row and two of those land in the same millisecond. The pid used to be the
+ * tiebreak, which is no tiebreak at all — it is CONSTANT inside one process, so
+ * the second write got the same name and REPLACED the first. That is how the
+ * backup of the user's original settings could end up holding a copy of the
+ * file we had already modified.
+ *
+ * Zero-padded because the pruning below keeps the newest N by sorting the names
+ * as strings: `...-10` must not come before `...-9`.
+ */
+let backupSequence = 0;
+
+const BACKUP_SEQUENCE_WIDTH = 6;
+
+/**
  * Copy settings.json aside. Called before EVERY write of ours, not just the
  * first: `setup`, `disable` and `logout` all rewrite the file, and the copy
  * that matters when something goes wrong is the one from just before.
@@ -109,12 +126,32 @@ export async function backupSettings(
 
   const dir = dirname(resolved);
   const base = basename(resolved);
-  // The ISO stamp sorts lexicographically, which is what makes pruning simple.
-  // The suffix keeps two writes in the same millisecond from colliding.
-  const stamp = `${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`;
-  const target = join(dir, `${base}${BACKUP_SUFFIX}${stamp}`);
+  const contents = await readFile(resolved, "utf-8");
 
-  await writeFile(target, await readFile(resolved, "utf-8"), { mode: 0o600 });
+  // The ISO stamp sorts lexicographically, which is what makes pruning simple;
+  // the counter after it separates two backups taken in the same millisecond
+  // without breaking that order. `wx` is the belt to that braces: a second
+  // PROCESS counts from zero of its own, so the one that loses the race takes
+  // the next name instead of writing over the file that is already there.
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  let target: string;
+  for (;;) {
+    const seq = String(backupSequence++).padStart(BACKUP_SEQUENCE_WIDTH, "0");
+    target = join(dir, `${base}${BACKUP_SUFFIX}${stamp}-${process.pid}-${seq}`);
+    let handle;
+    try {
+      handle = await open(target, "wx", 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "EEXIST") continue;
+      throw error;
+    }
+    try {
+      await handle.writeFile(contents, "utf-8");
+    } finally {
+      await handle.close();
+    }
+    break;
+  }
   await chmod(target, 0o600);
 
   // Prune oldest first, so a long-lived install doesn't accumulate one backup

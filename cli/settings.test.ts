@@ -1,9 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, setSystemTime } from 'bun:test';
 import { mkdir, mkdtemp, readFile, readdir, realpath, stat, symlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import {
   ALL_TOUCHED_KEYS,
   applyOtelSettings,
@@ -37,6 +37,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  setSystemTime();
   await rm(fixtureHome, { recursive: true, force: true });
 });
 
@@ -117,26 +118,80 @@ describe('symlinked settings.json', () => {
 });
 
 describe('backupSettings', () => {
+  const backupNames = async (): Promise<string[]> =>
+    (await readdir(fixtureHome)).filter((f) => f.includes('clawdgg-backup')).sort();
+
   it('backs up before EVERY write, keeping the newest N', async () => {
-    await writeFile(settingsPath, '{"env":{"KEEP":"1"}}');
+    // Every backup in this test lands in the SAME millisecond, which is what
+    // `setup` does on a machine faster than the laptop this was written on. The
+    // timestamp therefore cannot be what keeps the names apart.
+    setSystemTime(new Date('2026-10-19T12:00:00.000Z'));
+    await writeFile(settingsPath, '{"env":{"KEEP":"0"}}');
 
     const first = await backupSettings(settingsPath, 3);
     expect(first).toBeString();
-    expect(await readFile(first!, 'utf-8')).toBe('{"env":{"KEEP":"1"}}');
+    expect(await readFile(first!, 'utf-8')).toBe('{"env":{"KEEP":"0"}}');
     expect((await stat(first!)).mode & 0o777).toBe(0o600);
 
     // `disable` and `logout` rewrite this file too; backing up only once meant
     // the copy on disk was from the first `setup`, not from before the change
     // that actually broke something.
-    for (let i = 0; i < 5; i++) {
+    const paths = [first!];
+    for (let i = 1; i <= 5; i++) {
       await writeFile(settingsPath, `{"env":{"KEEP":"${i}"}}`);
-      expect(await backupSettings(settingsPath, 3)).toBeString();
+      const path = await backupSettings(settingsPath, 3);
+      expect(path).toBeString();
+      paths.push(path!);
     }
 
-    const backups = (await readdir(fixtureHome)).filter((f) => f.includes('clawdgg-backup')).sort();
+    // Six backups, six distinct names. A repeated name does not fail — it
+    // overwrites, and what it overwrites is the copy from before the change.
+    expect(new Set(paths).size).toBe(6);
+
+    const backups = await backupNames();
     expect(backups).toHaveLength(3);
-    // The newest survives, the oldest is pruned.
-    expect(await readFile(join(fixtureHome, backups[2]!), 'utf-8')).toBe('{"env":{"KEEP":"4"}}');
+    // The newest three survive, oldest first, each still the file as it was
+    // just before its own write.
+    expect(backups).toEqual(paths.slice(3).map((p) => basename(p)));
+    expect(
+      await Promise.all(backups.map((f) => readFile(join(fixtureHome, f), 'utf-8')))
+    ).toEqual(['{"env":{"KEEP":"3"}}', '{"env":{"KEEP":"4"}}', '{"env":{"KEEP":"5"}}']);
+  });
+
+  it('sorts oldest to newest past nine in a millisecond and across a second', async () => {
+    // The pruning picks the newest N by sorting the names as strings, so the
+    // counter has to be zero-padded (`-10` sorts before `-9`) and the stamp has
+    // to carry the tick over to the next second.
+    await writeFile(settingsPath, '{}');
+    setSystemTime(new Date('2026-10-19T12:00:00.999Z'));
+    const sameMillisecond: string[] = [];
+    for (let i = 0; i < 11; i++) sameMillisecond.push((await backupSettings(settingsPath, 50))!);
+
+    setSystemTime(new Date('2026-10-19T12:00:01.000Z'));
+    const nextSecond = (await backupSettings(settingsPath, 50))!;
+
+    expect(await backupNames()).toEqual(
+      [...sameMillisecond, nextSecond].map((p) => basename(p))
+    );
+  });
+
+  it('takes the next name rather than overwrite a backup already on disk', async () => {
+    setSystemTime(new Date('2026-10-19T12:00:00.000Z'));
+    await writeFile(settingsPath, '{"env":{"KEEP":"first"}}');
+    const first = (await backupSettings(settingsPath, 10))!;
+
+    // The name our next backup would take, occupied first — a second clawdgg
+    // in the same millisecond counts from a zero of its own.
+    const squatted = first.replace(/\d+$/, (n) => String(Number(n) + 1).padStart(n.length, '0'));
+    await writeFile(squatted, 'someone else');
+
+    await writeFile(settingsPath, '{"env":{"KEEP":"second"}}');
+    const second = (await backupSettings(settingsPath, 10))!;
+
+    expect(second).not.toBe(squatted);
+    expect(await readFile(squatted, 'utf-8')).toBe('someone else');
+    expect(await readFile(first, 'utf-8')).toBe('{"env":{"KEEP":"first"}}');
+    expect(await readFile(second, 'utf-8')).toBe('{"env":{"KEEP":"second"}}');
   });
 
   it('has nothing to back up when there is no settings.json', async () => {
