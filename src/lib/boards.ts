@@ -1059,8 +1059,15 @@ async function getRanking(
   scope: BoardScope,
   now: Date
 ): Promise<BoardRanking> {
+  // The UTC DAY is in the key as well as the board and the scope. Two reasons:
+  // the weekly scope's window is a function of `now`, so a request either side
+  // of Monday 00:00 UTC must not be served a ranking built for the week that
+  // ended (the 60-second TTL alone would serve it for a minute into the new
+  // week, with the old week's figures and the old `weekStart`); and a caller
+  // that passes an explicit `now` — a test — gets its own key rather than
+  // whatever the last call left behind.
   return rankingCache.remember(
-    `${board}|${scope}`,
+    `${board}|${scope}|${utcDay(now)}`,
     () => buildRanking(board, scope, now),
     (built) => built.complete
   );
@@ -1106,7 +1113,7 @@ export async function getBoardPage(options: BoardQuery): Promise<BoardPage> {
   const offset = clampBoardOffset(options.offset, ranking.ranked.length);
 
   const page = await boardCache.remember(
-    `${board}|${scope}|${limit}|${offset}`,
+    `${board}|${scope}|${utcDay(now)}|${limit}|${offset}`,
     () => decorateBoardPage(board, scope, ranking, limit, offset, now),
     (built) => built.complete
   );
