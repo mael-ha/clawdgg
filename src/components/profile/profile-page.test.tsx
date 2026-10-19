@@ -237,14 +237,14 @@ describe('ProfilePage · empty and partial states', () => {
     const loud = fixtureProfile();
     expect(loud.fingerprint.conversation!.historyDerivedCharsPct).toBeGreaterThan(5);
     const caveated = render(<ProfilePage {...loud} />);
-    expect(caveated).toContain('reads low');
+    expect(caveated).toContain('pastes undercounted');
     expect(caveated).toContain('characters typed*');
     expect(caveated).toContain('chars*');
 
     const clean = fixtureProfile();
     clean.fingerprint.conversation!.historyDerivedCharsPct = 0.4;
     const quiet = render(<ProfilePage {...clean} />);
-    expect(quiet).not.toContain('reads low');
+    expect(quiet).not.toContain('pastes undercounted');
     expect(quiet).toContain('characters typed ');
     // The caption keeps its p95 either way; the caveat is what comes and goes.
     expect(quiet).toContain('median · long tail to 778');
@@ -256,7 +256,7 @@ describe('ProfilePage · empty and partial states', () => {
     // asterisk pointing at a footnote that is no longer on the page.
     const html = page({ hide: ['conversation'] });
     expect(html).toContain('median · long tail to 778');
-    expect(html).not.toContain('reads low');
+    expect(html).not.toContain('pastes undercounted');
   });
 
   test('the footer offers one share control, carrying the page URL', () => {

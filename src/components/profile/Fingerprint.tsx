@@ -54,7 +54,7 @@ const historyNote = (sharePct: number): string | undefined =>
   sharePct >= HISTORY_CAVEAT_PCT
     ? `${Math.round(sharePct)}% of these characters were recovered from the ` +
       `local prompt history, which records a paste as "[Pasted text +40 lines]" ` +
-      `rather than its lines — so this reads low.`
+      `rather than its lines — so pastes are undercounted.`
     : undefined;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -234,7 +234,7 @@ export const Anatomy: FC<{
                 figures.p95PromptChars > figures.medianPromptChars
                   ? `long tail to ${group(figures.p95PromptChars)}`
                   : 'per prompt'
-              }${caveat ? ' · reads low' : ''}`
+              }${caveat ? ' · pastes undercounted' : ''}`
             }
             title={caveat}
           />
@@ -440,7 +440,9 @@ export const ConversationBlock: FC<{
       </div>
       <CardLabel class="text-fp-faint">
         output chars ≈ 4 per token
-        {caveat ? ` · *${Math.round(conversation.historyDerivedCharsPct)}% of typed chars recovered, reads low` : ''}
+        {caveat
+          ? ` · *${Math.round(conversation.historyDerivedCharsPct)}% of typed chars from local history · pastes undercounted`
+          : ''}
       </CardLabel>
     </div>
 
