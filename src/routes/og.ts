@@ -38,16 +38,30 @@ import { TtlCache } from '../lib/ttl-cache';
 const og = new Hono();
 
 /**
- * Ten minutes, longer than the page's minute.
+ * Ten minutes fresh, then a DAY of stale window.
  *
  * A popular link pasted into a busy channel can be fetched many times in a
  * second and each miss is the whole fingerprint fan-out, while nothing on the
  * card moves in ten minutes. Longer than the HTTP max-age below on purpose:
  * this one is OURS to evict when the owner changes a toggle (evictCardCache),
  * and the header's is not.
+ *
+ * The day behind it is about ONE crawler in particular. A cold card.png was
+ * 8.1 s measured on prod, and X's unfurler gives up long before that — so a
+ * link posted ten minutes after the last fetch unfurled with no image at all.
+ * Inside the window the crawler is answered from the last build immediately
+ * and the rebuild happens behind it. A day is long because an image that is a
+ * few hours old is the correct trade against an unfurl that never renders;
+ * what it is NOT is a licence for anyone else to hold it that long — see
+ * CARD_CACHE_CONTROL, which stays at a minute — and an owner hiding a section
+ * evicts this cache outright (TtlCache.delete drops the stale value too).
  */
 const CARD_TTL_MS = 10 * 60_000;
-const cardCache = new TtlCache<string>(CARD_TTL_MS);
+const CARD_STALE_MS = 24 * 60 * 60_000;
+const cardCache = new TtlCache<string>(CARD_TTL_MS, 500, {
+  staleMs: CARD_STALE_MS,
+  name: 'card',
+});
 
 /**
  * Rasterised cards, keyed by the SVG that produced them rather than by user.
@@ -56,9 +70,15 @@ const cardCache = new TtlCache<string>(CARD_TTL_MS);
  * is that payload's hash: a card that has not changed is not rasterised
  * again, and one that has cannot be served from a stale entry. A throw is
  * never cached — TtlCache only remembers what resolves — so a failed render
- * is retried rather than pinned for ten minutes.
+ * is retried rather than pinned.
+ *
+ * Which is also why this one gets a plain day-long TTL and NO stale window.
+ * A content-addressed key cannot go stale — there is nothing to revalidate
+ * against, and a stale-serve here would re-rasterise identical bytes — so the
+ * only question is how long to keep them. A day, with a tighter entry budget
+ * than the default because these are PNGs rather than strings.
  */
-const pngCache = new TtlCache<Uint8Array>(CARD_TTL_MS);
+const pngCache = new TtlCache<Uint8Array>(CARD_TTL_MS + CARD_STALE_MS, 200);
 
 /**
  * Forget the card this user's settings produced.

@@ -302,8 +302,20 @@ api.post('/otel/enable', requireAuth, async (c) => {
 // request retries instead of serving an empty fingerprint for a whole minute.
 // An all-zero fingerprint is indistinguishable from "this person has never
 // used Claude Code", which is the one thing it must not be able to say wrongly.
+//
+// Behind the minute there are thirty more of stale window. The minute bounds
+// how old the figures may be; it never said the rebuild was cheap, and a
+// 13-query fan-out through a 4-permit limiter is seconds for a heavy user. In
+// the window a caller gets the last payload at once with a rebuild behind it,
+// and a rebuild that fails leaves the stale payload alone instead of turning
+// into a 503. Past the window the caller waits, as before — and an eviction
+// (the toggle below) is a hard miss, stale value and in-flight build included.
 const FINGERPRINT_TTL_MS = 60_000;
-const fingerprintCache = new TtlCache<FingerprintData>(FINGERPRINT_TTL_MS);
+const FINGERPRINT_STALE_MS = 30 * 60_000;
+const fingerprintCache = new TtlCache<FingerprintData>(FINGERPRINT_TTL_MS, 500, {
+  staleMs: FINGERPRINT_STALE_MS,
+  name: 'fingerprint',
+});
 
 api.get('/u/:username/fingerprint', optionalAuth, async (c) => {
   const username = c.req.param('username');

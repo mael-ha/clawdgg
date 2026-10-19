@@ -104,8 +104,23 @@ interface ProfilePayload {
  * src/routes/api.ts: eviction alone loses the race against a build that was
  * already in flight when the toggle was saved, and that build would re-cache
  * the pre-toggle payload under the same key for the rest of the minute.
+ *
+ * Then THIRTY MINUTES of stale window behind that minute, because the minute
+ * was only ever about how old a 365-day rollup may be — it was never a claim
+ * that rebuilding is cheap. It is not: the heaviest profile is ~23 `… FINAL`
+ * reads over ~1.8M rows through a 4-permit limiter, 12.6 s cold. Inside the
+ * window a reader gets the last build at once and a rebuild runs behind them,
+ * so the minute still bounds how stale the page gets while nobody waits for
+ * the fan-out. Beyond it the caller waits, as before. An eviction is still a
+ * hard miss — TtlCache.delete drops the stale value and invalidates a build in
+ * flight — so a hidden section is never served from the window.
  */
-const pageCache = new TtlCache<ProfilePayload>(60_000);
+const PAGE_TTL_MS = 60_000;
+const PAGE_STALE_MS = 30 * 60_000;
+const pageCache = new TtlCache<ProfilePayload>(PAGE_TTL_MS, 500, {
+  staleMs: PAGE_STALE_MS,
+  name: 'profile',
+});
 
 /**
  * A minute of each curve, keyed by user, view AND hidden sections.
