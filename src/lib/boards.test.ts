@@ -32,7 +32,7 @@ import {
   type BoardFigures,
   type BoardUser,
 } from './boards';
-import { formatTokens } from './format';
+import { compact } from './format';
 import { defaultVisibility } from './profile-settings';
 import { MIN_PROMPTS_FOR_CLASS } from './fingerprint';
 
@@ -987,15 +987,17 @@ describe('the 🪙 board', () => {
   /**
    * Compact, because 37,214,882,901 is not a number anybody reads and nobody
    * compares their token count to the next person's digit by digit. Through
-   * src/lib/format.ts's formatTokens, which is the site's one answer for a
-   * token count — so the board cannot print a magnitude the rest of the site
-   * spells differently.
+   * src/lib/format.ts's `compact`, which is the same function the profile
+   * prints its magnitudes with — so the figure this board ranks on cannot be
+   * spelled one way here and another way on the page it links to.
    */
-  it('prints the figure as a magnitude', () => {
-    expect(formatBoardValue('tokens', 37_214_882_901)).toBe(formatTokens(37_214_882_901));
+  it('prints the figure as a magnitude, the way the profile does', () => {
+    expect(formatBoardValue('tokens', 37_214_882_901)).toBe(compact(37_214_882_901));
     expect(formatBoardValue('tokens', 37_214_882_901)).toBe('37.2B');
-    expect(formatBoardValue('tokens', 412_000_000)).toBe('412.0M');
-    expect(formatBoardValue('tokens', 9_800)).toBe('10K');
+    expect(formatBoardValue('tokens', 78_100_000_000)).toBe('78.1B');
+    expect(formatBoardValue('tokens', 412_000_000)).toBe('412M');
+    expect(formatBoardValue('tokens', 9_800)).toBe('9.8K');
+    expect(formatBoardValue('tokens', 999)).toBe('999');
     expect(formatBoardValue('tokens', 0)).toBe('0');
   });
 

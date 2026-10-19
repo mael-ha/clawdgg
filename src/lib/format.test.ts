@@ -1,32 +1,68 @@
 import { describe, expect, it } from 'bun:test';
 import {
+  compact,
   formatCost,
   formatDateLong,
   formatHours,
   formatNumber,
   formatRelativeTime,
-  formatTokens,
+  group,
+  tidy,
 } from './format';
+import { compact as profileCompact, group as profileGroup } from '../components/profile/format';
 
-describe('formatTokens', () => {
-  it('leaves sub-thousand counts alone', () => {
-    expect(formatTokens(0)).toBe('0');
-    expect(formatTokens(999)).toBe('999');
+/**
+ * `compact` moved here from src/components/profile/format.ts when the 🪙 board
+ * started printing a token count: two compact scales for one figure is how two
+ * pages end up disagreeing about the same number. It replaces `formatTokens`,
+ * which rounded K to the nearest thousand ("553K") and was the second answer.
+ */
+describe('compact', () => {
+  it('groups a count below a thousand instead of abbreviating it', () => {
+    expect(compact(0)).toBe('0');
+    expect(compact(999)).toBe('999');
   });
 
-  it('rounds K — no decimal', () => {
-    expect(formatTokens(1_000)).toBe('1K');
-    expect(formatTokens(1_499)).toBe('1K');
-    expect(formatTokens(1_500)).toBe('2K');
-    expect(formatTokens(552_900)).toBe('553K');
+  it('keeps one decimal and drops a pointless .0', () => {
+    expect(compact(9_800)).toBe('9.8K');
+    expect(compact(23_300)).toBe('23.3K');
+    expect(compact(2_000)).toBe('2K');
+    expect(compact(412_000_000)).toBe('412M');
   });
 
+  // Losing the decimal at a boundary turns 3.7M into 4M, a different claim.
   it('switches scale at each thousand boundary', () => {
-    expect(formatTokens(999_999)).toBe('1000K');
-    expect(formatTokens(1_000_000)).toBe('1.0M');
-    expect(formatTokens(65_900_000)).toBe('65.9M');
-    expect(formatTokens(1_000_000_000)).toBe('1.0B');
-    expect(formatTokens(38_800_000_000)).toBe('38.8B');
+    expect(compact(1_000)).toBe('1K');
+    expect(compact(999_999)).toBe('1000K');
+    expect(compact(1_000_000)).toBe('1M');
+    expect(compact(3_700_000)).toBe('3.7M');
+    expect(compact(1_000_000_000)).toBe('1B');
+    expect(compact(78_100_000_000)).toBe('78.1B');
+  });
+
+  it('never prints a negative magnitude', () => {
+    expect(compact(-5_000)).toBe('0');
+  });
+
+  /** The profile's module is the same function, not a copy of it. */
+  it('is the one the profile prints with', () => {
+    expect(profileCompact).toBe(compact);
+    expect(profileGroup).toBe(group);
+  });
+});
+
+describe('group / tidy', () => {
+  it('separates thousands without a locale', () => {
+    expect(group(0)).toBe('0');
+    expect(group(1_284)).toBe('1,284');
+    expect(group(37_214_882_901)).toBe('37,214,882,901');
+    expect(group(-1_284.6)).toBe('-1,285');
+  });
+
+  it('keeps a decimal only while it says something', () => {
+    expect(tidy(3.74)).toBe('3.7');
+    expect(tidy(4)).toBe('4');
+    expect(tidy(4.04)).toBe('4');
   });
 });
 

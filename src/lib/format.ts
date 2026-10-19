@@ -4,19 +4,53 @@
  * the server and another way after hydration.
  *
  * Two compact scales, deliberately:
- *   formatTokens  — big counters (tokens, lines). K is rounded: "553K", not
- *                   "552.9K". Reads as a magnitude, which is all it is.
+ *   compact       — big counters (tokens, lines, characters). Keeps one
+ *                   decimal and drops a pointless ".0": "78.1B", "412M",
+ *                   "9.8K". THE answer for "how big is this", on the boards
+ *                   and on the profile both — src/components/profile/format.ts
+ *                   re-exports this one rather than carrying a second.
  *   formatNumber  — human counts (users, prompts, tool calls). K keeps one
- *                   decimal, because "1.5K prompts" and "2K prompts" are
- *                   different claims.
+ *                   decimal always, because "1.5K prompts" and "2.0K prompts"
+ *                   are different claims.
  * Both carry B, so a 38-billion-token total reads "38.8B" and not "38800.0M".
+ *
+ * Nothing here consults a locale: `toLocaleString` would group digits
+ * differently for the server and for a visitor's browser, and a hydrated chart
+ * would then disagree with the page it is drawn on.
  */
 
-export function formatTokens(n: number): string {
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
-  return n.toString();
+/** Thousands separators, the same ones on both sides of the wire. */
+export function group(value: number): string {
+  const rounded = Math.round(value);
+  const negative = rounded < 0;
+  const digits = String(Math.abs(rounded));
+  let out = '';
+  for (let i = 0; i < digits.length; i++) {
+    if (i > 0 && (digits.length - i) % 3 === 0) out += ',';
+    out += digits[i];
+  }
+  return negative ? `-${out}` : out;
+}
+
+/** One decimal, without the pointless `.0`. */
+export function tidy(value: number): string {
+  const text = value.toFixed(1);
+  return text.endsWith('.0') ? text.slice(0, -2) : text;
+}
+
+/**
+ * A big count as a magnitude: 78.1B, 412M, 3.7M, 23.3K.
+ *
+ * The decimal is kept at every boundary and only the trailing ".0" goes, so
+ * 3.7M does not round to 4M — a different claim — while 412.0M does not print
+ * a decimal it has nothing to say with.
+ */
+export function compact(value: number): string {
+  const n = Math.max(0, value);
+  if (n >= 1_000_000_000) return `${tidy(n / 1_000_000_000)}B`;
+  if (n >= 1_000_000) return `${tidy(n / 1_000_000)}M`;
+  if (n >= 1_000) return `${tidy(n / 1_000)}K`;
+  return group(n);
 }
 
 export function formatNumber(n: number): string {

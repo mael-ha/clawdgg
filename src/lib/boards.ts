@@ -40,7 +40,7 @@ import {
   PROMPT_EVENT_SQL,
   query,
 } from '../db/clickhouse';
-import { formatTokens } from './format';
+import { compact } from './format';
 import {
   CHARS_PER_TOKEN,
   classifyRhythm,
@@ -321,13 +321,14 @@ export function boardValue(board: BoardKey, figures: BoardFigures, scope: BoardS
  *
  * 🪙 is the exception and has to be: "37,214,882,901" is not a number anybody
  * reads, and nobody is comparing their token count to the next person's digit
- * by digit. It goes through src/lib/format.ts's formatTokens, which is the
- * site's one answer to "how big is this" for a token count.
+ * by digit. It goes through src/lib/format.ts's `compact`, which is the SAME
+ * function the profile prints its magnitudes with — a figure this board ranks
+ * on must not be spelled one way here and another way on the page it links to.
  */
 export function formatBoardValue(board: BoardKey, value: number): string {
   switch (board) {
     case 'tokens':
-      return formatTokens(value);
+      return compact(value);
     case 'value':
       return `$${Math.round(value).toLocaleString('en-US')}`;
     case 'streak':

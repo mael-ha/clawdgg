@@ -1,51 +1,21 @@
 /**
  * How the fingerprint prints a number.
  *
- * src/lib/format.ts already answers "how big is this" for the leaderboard —
- * formatTokens rounds to a magnitude, formatCost takes cents. The profile asks
- * a different question in a few places and has to answer it the same way on
- * the server, in the chart island and on the share card, so those few cases
- * live here, next to the components that use them.
+ * `group`, `tidy` and `compact` live in src/lib/format.ts and are re-exported
+ * here, because the 🪙 board prints a token count too and two compact scales
+ * for one figure is how two pages end up disagreeing about the same number.
+ * What stays here is what only the profile asks — value at three magnitudes, a
+ * per-prompt figure, a ratio, the date and clock labels — answered the same way
+ * on the server, in the chart island and on the share card.
  *
  * Nothing here consults a locale: `toLocaleString` would group digits
  * differently for the server and for a visitor's browser, and the hydrated
  * chart would then disagree with the page it is drawn on.
  */
 
-/** Thousands separators, the same ones on both sides of the wire. */
-export function group(value: number): string {
-  const rounded = Math.round(value);
-  const negative = rounded < 0;
-  const digits = String(Math.abs(rounded));
-  let out = '';
-  for (let i = 0; i < digits.length; i++) {
-    if (i > 0 && (digits.length - i) % 3 === 0) out += ',';
-    out += digits[i];
-  }
-  return negative ? `-${out}` : out;
-}
+import { group, tidy } from '../../lib/format';
 
-/** One decimal, without the pointless `.0`. */
-function tidy(value: number): string {
-  const text = value.toFixed(1);
-  return text.endsWith('.0') ? text.slice(0, -2) : text;
-}
-
-/**
- * A big count as a magnitude: 3.7M, 558M, 23.3K.
- *
- * Distinct from src/lib/format's formatTokens, which rounds K to the nearest
- * thousand ("553K"). Characters and line counts are read as magnitudes either
- * way, but losing the decimal at the M boundary turns 3.7M into 4M, which is a
- * different claim.
- */
-export function compact(value: number): string {
-  const n = Math.max(0, value);
-  if (n >= 1_000_000_000) return `${tidy(n / 1_000_000_000)}B`;
-  if (n >= 1_000_000) return `${tidy(n / 1_000_000)}M`;
-  if (n >= 1_000) return `${tidy(n / 1_000)}K`;
-  return group(n);
-}
+export { compact, group } from '../../lib/format';
 
 /**
  * API-equivalent value, in DOLLARS (not cents — `claude_code.cost.usage` is
