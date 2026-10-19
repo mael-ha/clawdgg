@@ -21,9 +21,11 @@ import {
 /**
  * The homepage: the leaderboard, first.
  *
- * Four boards (💎 value, 🔥 streak, 🌈 ultrathinks, ⚡ leverage) over this UTC
- * week or all time, with the selection in the URL so a board is a link someone
- * can send and the page works with scripting off.
+ * Five boards (🪙 tokens, 💎 value, 🔥 streak, 🌈 ultrathinks, ⚡ leverage) over
+ * this UTC week or all time, with the selection in the URL so a board is a link
+ * someone can send and the page works with scripting off. A bare `/` is 🪙 over
+ * all time — parseBoard and parseScope own that, so the default lives in one
+ * place and the <title> below follows it.
  *
  * Every figure comes from src/lib/boards.ts, which is also what GET /api/boards
  * answers with — one computation, two renderings, so the page and the API can

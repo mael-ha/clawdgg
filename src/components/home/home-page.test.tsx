@@ -3,6 +3,7 @@ import { HomePage, type HomeView } from './HomePage';
 import { BoardRowList } from './BoardRows';
 import {
   BOARDS,
+  BOARD_KEYS,
   SCOPE_LABELS,
   formatBoardValue,
   parseBoard,
@@ -146,5 +147,38 @@ describe('pagination starts where the rows do', () => {
     expect(seen).toEqual(Array.from({ length: 2 * PAGE }, (_, i) => i + 1));
     expect(new Set(seen).size).toBe(seen.length);
     expect(fragment).toContain(`offset=${2 * PAGE}`);
+  });
+});
+
+describe('the tabs', () => {
+  it('prints the boards in tab order, 🪙 💎 🔥 🌈 ⚡', () => {
+    const html = render(<HomePage view={view()} />);
+    expect(BOARD_KEYS.map((key) => BOARDS[key].emoji)).toEqual(['🪙', '💎', '🔥', '🌈', '⚡']);
+
+    const positions = BOARD_KEYS.map((key) =>
+      html.indexOf(`${BOARDS[key].emoji} ${BOARDS[key].label}`)
+    );
+    for (const position of positions) expect(position).toBeGreaterThan(-1);
+    expect(positions).toEqual([...positions].sort((a, b) => a - b));
+  });
+
+  /**
+   * The board a visitor who clicked nothing is looking at. Asserted on the
+   * RENDERED page and not just on parseBoard, because the tab drawn as
+   * selected and the panel the figures came from have to be the same board.
+   */
+  it('opens on 🪙 tokens over all time', () => {
+    expect([DEFAULT_BOARD, DEFAULT_SCOPE]).toEqual(['tokens', 'all']);
+
+    const html = render(<HomePage view={view()} />);
+    const selected = /aria-selected="true"[\s\S]{0,240}?<\/button>/.exec(html)?.[0] ?? '';
+    expect(selected).toContain('🪙 tokens');
+    expect(html).toContain('aria-label="tokens, all time"');
+    // The all-time switch is the one pressed, and its note is the all-time one.
+    expect(html).toContain('value="all" aria-pressed="true"');
+    expect(html).toContain('every prompt on record');
+    // The table's figure column says which board and which window.
+    expect(tableHtml(html)).not.toContain('resets Mon');
+    expect(html).toContain('🪙 tokens');
   });
 });

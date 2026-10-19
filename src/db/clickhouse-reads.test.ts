@@ -694,17 +694,13 @@ suite('every ClickHouse read resolves against 24.3', () => {
 
   describe('src/lib/boards.ts', () => {
     it('getBoardPage, every board × scope', async () => {
-      const scopes: Record<string, readonly string[]> = {
-        value: ['week', 'all'],
-        ultrathinks: ['week', 'all'],
-        leverage: ['week', 'all'],
-        streak: ['current', 'best'],
-      };
+      // Read off BOARDS rather than listed here, so a new board is swept the
+      // moment it exists instead of the day somebody remembers this file.
       for (const board of boards.BOARD_KEYS) {
-        for (const scope of scopes[board]!) {
+        for (const scope of boards.BOARDS[board].scopes) {
           const page = await boards.getBoardPage({
             board,
-            scope: scope as any,
+            scope,
             limit: 25,
             offset: 0,
             viewerId: USER_A,

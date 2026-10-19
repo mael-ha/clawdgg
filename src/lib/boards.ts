@@ -1,12 +1,13 @@
 /**
- * The four weekly boards the homepage is built around.
+ * The five boards the homepage is built around.
  *
+ * 🪙 tokens      — every token Claude moved (claude_code.token.usage, all types)
  * 💎 value       — API-equivalent dollars (claude_code.cost.usage)
  * 🔥 streak      — current consecutive active days
  * 🌈 ultrathinks — synthetic `clawdgg.ultrathink` flags, never prompts
  * ⚡ leverage    — Claude output characters per character typed
  *
- * ONE FIGURE, ONE SOURCE. Value, ultrathinks and leverage are read from
+ * ONE FIGURE, ONE SOURCE. Tokens, value, ultrathinks and leverage are read from
  * ClickHouse (the only store that has days); the streak is read from
  * `users.current_streak`, which src/jobs/sync-clickhouse.ts computes from the
  * same ClickHouse days every five minutes. The streak is deliberately NOT
@@ -39,6 +40,7 @@ import {
   PROMPT_EVENT_SQL,
   query,
 } from '../db/clickhouse';
+import { formatTokens } from './format';
 import {
   CHARS_PER_TOKEN,
   classifyRhythm,
@@ -59,12 +61,12 @@ type AppDb = typeof db;
 // The boards
 // ═══════════════════════════════════════════════════════════════════════════
 
-export type BoardKey = 'value' | 'streak' | 'ultrathinks' | 'leverage';
+export type BoardKey = 'tokens' | 'value' | 'streak' | 'ultrathinks' | 'leverage';
 
 /**
  * The two ways to look at a board — which are NOT the same two on every board.
  *
- * Three of them are time windows (this UTC week, or everything). The streak is
+ * Four of them are time windows (this UTC week, or everything). The streak is
  * not a quantity that accumulates over a window: "this week's streak" is not a
  * number anyone has, so that board offers the pair that does exist — the run
  * you are on now, and the longest one you have ever had.
@@ -78,8 +80,18 @@ export interface BoardMeta {
   heading: string;
   /** One line under the podium figure, saying what it measures. */
   caption: string;
-  /** The scope switch for this board. The first one is the default. */
+  /** The scope switch for this board, in the order it is printed. */
   scopes: readonly [BoardScope, BoardScope];
+  /**
+   * The scope a board opens on, which is NOT always the leftmost switch.
+   *
+   * Named rather than inferred from `scopes[0]`, which is what it used to be:
+   * 🪙 opens on all time because a lifetime token count is the figure that
+   * makes the site's claim, while its switch still reads "this week | all
+   * time" like every other windowed board's. Tying the two together meant one
+   * of those had to be wrong.
+   */
+  defaultScope: BoardScope;
   /**
    * The profile section whose owner-hidden flag takes a user off this board.
    *
@@ -90,15 +102,36 @@ export interface BoardMeta {
   section: FingerprintSection;
 }
 
-export const BOARD_KEYS = ['value', 'streak', 'ultrathinks', 'leverage'] as const satisfies readonly BoardKey[];
+/** Tab order, and the first one is the board a bare `/` opens on. */
+export const BOARD_KEYS = [
+  'tokens',
+  'value',
+  'streak',
+  'ultrathinks',
+  'leverage',
+] as const satisfies readonly BoardKey[];
 
 export const BOARDS: Record<BoardKey, BoardMeta> = {
+  tokens: {
+    emoji: '🪙',
+    label: 'tokens',
+    heading: '🪙 tokens',
+    caption: 'tokens Claude processed',
+    scopes: ['week', 'all'],
+    defaultScope: 'all',
+    // Same section as 💎, because it is the same rows read a second way: a
+    // user who took their value section down has hidden the metrics_raw sums
+    // this figure comes out of, and listing their lifetime token count would
+    // hand back most of what they put away.
+    section: 'value',
+  },
   value: {
     emoji: '💎',
     label: 'value',
     heading: '💎 value',
     caption: 'API-equivalent of the work Claude did',
     scopes: ['week', 'all'],
+    defaultScope: 'week',
     section: 'value',
   },
   streak: {
@@ -107,6 +140,7 @@ export const BOARDS: Record<BoardKey, BoardMeta> = {
     heading: '🔥 streak',
     caption: 'consecutive days with a prompt',
     scopes: ['current', 'best'],
+    defaultScope: 'current',
     section: 'curve',
   },
   ultrathinks: {
@@ -115,6 +149,7 @@ export const BOARDS: Record<BoardKey, BoardMeta> = {
     heading: '🌈 ultrathinks',
     caption: 'prompts that asked Claude to think harder',
     scopes: ['week', 'all'],
+    defaultScope: 'week',
     section: 'ultrathink',
   },
   leverage: {
@@ -123,6 +158,7 @@ export const BOARDS: Record<BoardKey, BoardMeta> = {
     heading: '⚡ leverage',
     caption: 'characters Claude wrote per character typed',
     scopes: ['week', 'all'],
+    defaultScope: 'week',
     section: 'anatomy',
   },
 };
@@ -145,8 +181,9 @@ export function boardCaption(board: BoardKey, scope: BoardScope): string {
   return BOARDS[board].caption;
 }
 
+/** The board, or the first tab — which is the one a bare `/` has to open on. */
 export function parseBoard(raw: string | undefined): BoardKey {
-  return BOARD_KEYS.includes(raw as BoardKey) ? (raw as BoardKey) : 'value';
+  return BOARD_KEYS.includes(raw as BoardKey) ? (raw as BoardKey) : BOARD_KEYS[0];
 }
 
 /**
@@ -157,9 +194,9 @@ export function parseBoard(raw: string | undefined): BoardKey {
  * form. Falling back to the board's own default is what makes every
  * combination of the two URL parameters land on something real.
  */
-export function parseScope(raw: string | undefined, board: BoardKey = 'value'): BoardScope {
-  const scopes = BOARDS[board].scopes;
-  return scopes.includes(raw as BoardScope) ? (raw as BoardScope) : scopes[0];
+export function parseScope(raw: string | undefined, board: BoardKey = BOARD_KEYS[0]): BoardScope {
+  const { scopes, defaultScope } = BOARDS[board];
+  return scopes.includes(raw as BoardScope) ? (raw as BoardScope) : defaultScope;
 }
 
 /** True when the scope is a time window over ClickHouse rows, not a lifetime figure. */
@@ -221,6 +258,12 @@ function chTimestamp(instant: Date): string {
 /** Everything a board can rank on, per user, over one scope. */
 export interface BoardFigures {
   userId: string;
+  /**
+   * Every token Claude moved — input, output, cache reads and cache writes
+   * together, which is the same sum getUserProvenanceBreakdown reports.
+   * NOT `users.total_tokens`, which is input + output only.
+   */
+  tokens: number;
   /** API-equivalent dollars. */
   valueUsd: number;
   /** Synthetic ultrathink flags. NOT prompts — different event name entirely. */
@@ -254,12 +297,14 @@ export function leverageRatio(outputTokens: number, promptChars: number): number
  * The figure one board ranks on, for one user.
  *
  * The scope is a parameter because 🔥 reads a different COLUMN for each of its
- * two (current run vs longest ever), where the other three read the same
+ * two (current run vs longest ever), where the other four read the same
  * figure over a different window and so are handed figures already narrowed to
  * it by fetchFigures.
  */
 export function boardValue(board: BoardKey, figures: BoardFigures, scope: BoardScope): number {
   switch (board) {
+    case 'tokens':
+      return figures.tokens;
     case 'value':
       return figures.valueUsd;
     case 'streak':
@@ -271,9 +316,18 @@ export function boardValue(board: BoardKey, figures: BoardFigures, scope: BoardS
   }
 }
 
-/** How the figure is printed. Exact, not compacted: a rank is read against it. */
+/**
+ * How the figure is printed. Exact, not compacted — a rank is read against it.
+ *
+ * 🪙 is the exception and has to be: "37,214,882,901" is not a number anybody
+ * reads, and nobody is comparing their token count to the next person's digit
+ * by digit. It goes through src/lib/format.ts's formatTokens, which is the
+ * site's one answer to "how big is this" for a token count.
+ */
 export function formatBoardValue(board: BoardKey, value: number): string {
   switch (board) {
+    case 'tokens':
+      return formatTokens(value);
     case 'value':
       return `$${Math.round(value).toLocaleString('en-US')}`;
     case 'streak':
@@ -485,6 +539,7 @@ export function rankBoard(
 function emptyFigures(user: Pick<BoardUser, 'userId' | 'streak' | 'longestStreak'>): BoardFigures {
   return {
     userId: user.userId,
+    tokens: 0,
     valueUsd: 0,
     ultrathinks: 0,
     outputTokens: 0,
@@ -501,6 +556,7 @@ function emptyFigures(user: Pick<BoardUser, 'userId' | 'streak' | 'longestStreak
 
 interface FigureRow {
   user_id: string;
+  tokens: number;
   value_usd: number;
   ultrathinks: number;
   output_tokens: number;
@@ -535,8 +591,8 @@ function localTsExpr(
 }
 
 /**
- * Value, ultrathinks, output tokens and typed characters for every user, over
- * one scope, in one query.
+ * Tokens, value, ultrathinks, output tokens and typed characters for every
+ * user, over one scope, in one query.
  *
  * Legacy rows are included in the sums (they are honest about WHAT happened)
  * but they carry no prompt_length, which is why `prompt_chars` is summed over
@@ -583,9 +639,23 @@ async function fetchFigures(
        GROUP BY user_id`,
       { since: chTimestamp(weekStartUtc(now)), ...local.params }
     ),
-    query<Pick<FigureRow, 'user_id' | 'value_usd' | 'output_tokens'>>(
+    query<Pick<FigureRow, 'user_id' | 'tokens' | 'value_usd' | 'output_tokens'>>(
       `SELECT
          user_id,
+         -- 🪙 — EVERY token type, which is what makes it "tokens" and not
+         -- "tokens of one kind": no token_type filter, so input, output,
+         -- cacheRead and cacheCreation all land in it. The same sum
+         -- getUserProvenanceBreakdown and getUserRank's token sort read, and
+         -- the sum the four per-type figures in getUserTotals add up to.
+         --
+         -- NO provenance filter, deliberately, and for the same reason 💎
+         -- above has none: NO_LEGACY_SQL exists for queries that read the
+         -- SHAPE of a day, and a pre-OTEL row is honest about HOW MANY tokens
+         -- moved. Excluding it would take a user's first months off their own
+         -- lifetime total. The ⚡ sum below is the only one that drops them,
+         -- because it is one side of a RATIO whose other side a legacy row
+         -- cannot contribute to.
+         toUInt64(sumIf(value, metric_name = 'claude_code.token.usage')) AS tokens,
          toFloat64(sumIf(value, metric_name = 'claude_code.cost.usage')) AS value_usd,
          -- NO_LEGACY_SQL, to match the characters typed on the other side of
          -- the ⚡ ratio: prompt_chars above is summed over measured prompts
@@ -625,6 +695,7 @@ async function fetchFigures(
   }
   for (const row of metrics) {
     const figures = figuresFor(row.user_id);
+    figures.tokens = Number(row.tokens) || 0;
     figures.valueUsd = Number(row.value_usd) || 0;
     figures.outputTokens = Number(row.output_tokens) || 0;
   }
@@ -791,7 +862,7 @@ export function classFromEvidence(evidence: ClassEvidence | undefined): string |
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Rank snapshots for the four boards
+// Rank snapshots for the five boards
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
@@ -807,7 +878,7 @@ export function boardMetricName(board: BoardKey, scope: BoardScope): string {
 }
 
 /**
- * Write today's ranks for all four boards, both scopes, unless today is already
+ * Write today's ranks for all five boards, both scopes, unless today is already
  * on record.
  *
  * THE SYNC JOB MUST CALL THIS. One line, after it has refreshed users.total_*
@@ -1028,7 +1099,7 @@ export function clampBoardOffset(raw: number, total: number): number {
 /**
  * The ranking, which is the whole cost of a board, cached per BOARD AND SCOPE.
  *
- * Eight keys in total — four boards, two scopes each — and not one per page,
+ * Ten keys in total — five boards, two scopes each — and not one per page,
  * which is what the cache used to hold. Pagination is a SLICE of this, so a
  * request for page 400 of a board nobody has 400 pages of now costs a slice of
  * a list that is already in memory instead of the fan-out that built it.
@@ -1081,7 +1152,7 @@ async function buildRanking(
   const boardUsers = await loadBoardUsers();
 
   // A ClickHouse outage is not a reason to show nothing: the streak board is
-  // read from SQLite and stays correct, and the other three come out empty
+  // read from SQLite and stays correct, and the other four come out empty
   // rather than wrong. `complete` goes false either way, so the page says so
   // and nothing is cached.
   let figures = new Map<string, BoardFigures>();

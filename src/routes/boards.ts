@@ -1,5 +1,5 @@
 /**
- * GET /api/boards — the four weekly boards, as JSON.
+ * GET /api/boards — the five boards, as JSON.
  *
  * The homepage renders from the same `getBoardPage()` call, so this endpoint is
  * not a second implementation of the board: it is the same page payload without
@@ -65,6 +65,9 @@ app.get('/', optionalAuth, async (c) => {
         label: BOARDS[board].label,
         caption: boardCaption(board, scope),
         scopes: BOARDS[board].scopes,
+        // Named, because it is no longer `scopes[0]`: 🪙 prints its switch
+        // "this week | all time" and opens on the second one.
+        defaultScope: BOARDS[board].defaultScope,
       },
       total: page.total,
       // The CLAMPED offset, which is what the rows came from.
@@ -84,7 +87,7 @@ app.get('/pulse', async (c) => {
   return c.json(pulse, pulse.complete ? 200 : 503);
 });
 
-/** What boards exist, so a client does not have to hardcode the four keys. */
+/** What boards exist, so a client does not have to hardcode the five keys. */
 app.get('/list', (c) =>
   c.json({
     boards: BOARD_KEYS.map((key) => ({
@@ -93,6 +96,7 @@ app.get('/list', (c) =>
       label: BOARDS[key].label,
       caption: BOARDS[key].caption,
       scopes: BOARDS[key].scopes,
+      defaultScope: BOARDS[key].defaultScope,
     })),
   })
 );

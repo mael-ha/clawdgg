@@ -32,6 +32,7 @@ import {
   type BoardFigures,
   type BoardUser,
 } from './boards';
+import { formatTokens } from './format';
 import { defaultVisibility } from './profile-settings';
 import { MIN_PROMPTS_FOR_CLASS } from './fingerprint';
 
@@ -136,6 +137,7 @@ describe('leverageRatio', () => {
 function figures(overrides: Partial<BoardFigures> = {}): BoardFigures {
   return {
     userId: 'u',
+    tokens: 0,
     valueUsd: 0,
     ultrathinks: 0,
     outputTokens: 0,
@@ -550,20 +552,32 @@ describe('classFromEvidence', () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('parseBoard / parseScope', () => {
-  it('keeps a known board and falls back to value', () => {
+  it('keeps a known board and falls back to the first tab', () => {
     expect(parseBoard('leverage')).toBe('leverage');
     expect(parseBoard('streak')).toBe('streak');
-    expect(parseBoard('nonsense')).toBe('value');
-    expect(parseBoard(undefined)).toBe('value');
+    expect(parseBoard('nonsense')).toBe('tokens');
+    expect(parseBoard(undefined)).toBe('tokens');
+    // The fallback IS the first tab, so the two cannot drift apart: a bare `/`
+    // has to land on the board whose tab is drawn selected.
+    expect(parseBoard(undefined)).toBe(BOARD_KEYS[0]);
   });
 
-  // The week is the default: the page is about this week, and a typo must not
-  // quietly show an all-time board under a "resets Monday" countdown.
-  it('defaults the scope to this week', () => {
+  // 🪙 is the default board and it opens on ALL TIME, which is why the default
+  // scope is a field rather than `scopes[0]` — its switch still reads
+  // "this week | all time" like every other windowed board's.
+  it('defaults the scope to the default board’s own default', () => {
     expect(parseScope('all')).toBe('all');
     expect(parseScope('week')).toBe('week');
-    expect(parseScope('year')).toBe('week');
-    expect(parseScope(undefined)).toBe('week');
+    expect(parseScope('year')).toBe('all');
+    expect(parseScope(undefined)).toBe('all');
+  });
+
+  it('leaves every other board’s default where it was', () => {
+    expect(parseScope(undefined, 'value')).toBe('week');
+    expect(parseScope(undefined, 'ultrathinks')).toBe('week');
+    expect(parseScope(undefined, 'leverage')).toBe('week');
+    expect(parseScope(undefined, 'streak')).toBe('current');
+    expect(parseScope('year', 'value')).toBe('week');
   });
 });
 
@@ -572,8 +586,15 @@ describe('scopes per board', () => {
   // the run you are on and the longest one you ever had instead.
   it('offers current/best on the streak board and week/all on the others', () => {
     expect(BOARDS.streak.scopes).toEqual(['current', 'best']);
-    for (const board of ['value', 'ultrathinks', 'leverage'] as const) {
+    for (const board of ['tokens', 'value', 'ultrathinks', 'leverage'] as const) {
       expect(BOARDS[board].scopes).toEqual(['week', 'all']);
+    }
+  });
+
+  it('opens every board on a scope it actually offers', () => {
+    for (const board of BOARD_KEYS) {
+      expect(BOARDS[board].scopes).toContain(BOARDS[board].defaultScope);
+      expect(parseScope(undefined, board)).toBe(BOARDS[board].defaultScope);
     }
   });
 
@@ -583,6 +604,7 @@ describe('scopes per board', () => {
     // Switching boards carries the old scope in the form: it must land on the
     // new board's default rather than on a board that does not exist.
     expect(parseScope('best', 'value')).toBe('week');
+    expect(parseScope('best', 'tokens')).toBe('all');
     expect(parseScope('week', 'streak')).toBe('current');
     expect(parseScope(undefined, 'streak')).toBe('current');
   });
@@ -915,11 +937,15 @@ describe('the leverage ratio is read over one population', () => {
       readFile(join(REPO_ROOT, 'src/lib/fingerprint.ts'), 'utf-8'),
     ]);
 
-    const outputSum = /sumIf\(value, metric_name = 'claude_code\.token\.usage'[\s\S]{0,160}?\)\)/g;
+    const tokenSum = /sumIf\(value, metric_name = 'claude_code\.token\.usage'[\s\S]{0,160}?\)\)/g;
     for (const [name, source] of [['boards.ts', boards], ['fingerprint.ts', fingerprint]] as const) {
-      const sums = source.match(outputSum) ?? [];
+      const sums = source.match(tokenSum) ?? [];
       expect(sums.length).toBeGreaterThan(0);
-      for (const sum of sums) {
+      // 🪙 sums EVERY token type and so names none of them — it is a count of
+      // what happened, not a side of a ratio, and the describe below owns it.
+      const byType = sums.filter((sum) => sum.includes('token_type'));
+      expect(byType.length, name).toBeGreaterThan(0);
+      for (const sum of byType) {
         expect(sum).toContain("token_type = 'output'");
         expect(sum, `${name}: ${sum}`).toContain('${NO_LEGACY_SQL}');
       }
@@ -933,5 +959,118 @@ describe('the leverage ratio is read over one population', () => {
     // matching one rather than an extra filter.
     expect(boards).toContain('const measured = `${PROMPT_EVENT_SQL} AND prompt_length > 0`');
     expect(boards).toContain('sumIf(prompt_length, ${measured})');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🪙 tokens: the board, the figure and where the figure comes from
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('the 🪙 board', () => {
+  it('is the first tab, and the one a bare / opens on', () => {
+    expect(BOARD_KEYS[0]).toBe('tokens');
+    expect(BOARD_KEYS).toEqual(['tokens', 'value', 'streak', 'ultrathinks', 'leverage']);
+    expect(parseBoard(undefined)).toBe('tokens');
+    expect(parseScope(undefined, 'tokens')).toBe('all');
+  });
+
+  it('is labelled and captioned like the others', () => {
+    expect(BOARDS.tokens.emoji).toBe('🪙');
+    expect(BOARDS.tokens.label).toBe('tokens');
+    expect(BOARDS.tokens.heading).toBe('🪙 tokens');
+    // What the podium prints: `${caption} · ${SCOPE_LABELS[scope]}`.
+    expect(`${boardCaption('tokens', 'all')} · ${SCOPE_LABELS.all}`).toBe(
+      'tokens Claude processed · all time'
+    );
+  });
+
+  /**
+   * Compact, because 37,214,882,901 is not a number anybody reads and nobody
+   * compares their token count to the next person's digit by digit. Through
+   * src/lib/format.ts's formatTokens, which is the site's one answer for a
+   * token count — so the board cannot print a magnitude the rest of the site
+   * spells differently.
+   */
+  it('prints the figure as a magnitude', () => {
+    expect(formatBoardValue('tokens', 37_214_882_901)).toBe(formatTokens(37_214_882_901));
+    expect(formatBoardValue('tokens', 37_214_882_901)).toBe('37.2B');
+    expect(formatBoardValue('tokens', 412_000_000)).toBe('412.0M');
+    expect(formatBoardValue('tokens', 9_800)).toBe('10K');
+    expect(formatBoardValue('tokens', 0)).toBe('0');
+  });
+
+  /**
+   * EVERY token type. The figure is the sum the four per-type columns in
+   * getUserTotals add up to — input, output, cacheRead and cacheCreation —
+   * and not `users.total_tokens`, which is input + output only. About 95% of
+   * tokens are cache reads (see src/lib/fingerprint.ts), so the two are not
+   * close: one is roughly twenty times the other.
+   */
+  it('ranks on every token type added together', () => {
+    const input = 9_000_000_000;
+    const output = 400_000_000;
+    const cacheRead = 27_000_000_000;
+    const cacheCreation = 800_000_000;
+    const user = figures({
+      tokens: input + output + cacheRead + cacheCreation,
+      outputTokens: output,
+    });
+
+    expect(boardValue('tokens', user, 'all')).toBe(37_200_000_000);
+    expect(boardValue('tokens', user, 'week')).toBe(37_200_000_000);
+    // NOT the ⚡ figure's output-only sum, which is the one token count on
+    // this page that is deliberately narrower.
+    expect(boardValue('tokens', user, 'all')).not.toBe(user.outputTokens);
+  });
+
+  it('has no figure for a user ClickHouse had nothing for', () => {
+    expect(rankBoard('tokens', 'all', [boardUser('a')], new Map())).toEqual([]);
+  });
+
+  /**
+   * 🪙 and 💎 are the same rows read two ways, so they hide behind the same
+   * section: a user who took their value section down has put away the
+   * metrics_raw sums this figure comes out of, and a lifetime token count
+   * would hand most of it back.
+   */
+  it('hides behind the same section 💎 does', () => {
+    expect(BOARDS.tokens.section).toBe(BOARDS.value.section);
+
+    const visibility = defaultVisibility();
+    visibility.value = false;
+    const shy = [boardUser('shy', { visibility })];
+    const rich = figureMap([['shy', { tokens: 37_200_000_000, valueUsd: 10_918 }]]);
+    expect(rankBoard('tokens', 'all', shy, rich)).toEqual([]);
+    expect(rankBoard('tokens', 'week', shy, rich)).toEqual([]);
+    expect(rankBoard('value', 'all', shy, rich)).toEqual([]);
+  });
+
+  it('snapshots both of its scopes under their own metric names', () => {
+    expect(boardMetricName('tokens', 'week')).toBe('board:tokens:week');
+    expect(boardMetricName('tokens', 'all')).toBe('board:tokens:all');
+  });
+
+  /**
+   * ONE DEFINITION, read off the source. The 🪙 sum names no token_type and no
+   * provenance — which is the same sum getUserProvenanceBreakdown reports as
+   * `tokens`, and the same one getUserRank sorts its token leaderboard by. A
+   * provenance filter here would take a pre-OTEL user's first months off their
+   * own lifetime total; NO_LEGACY_SQL is for queries that read the SHAPE of a
+   * day, and a legacy row is honest about HOW MANY tokens moved.
+   */
+  it('is the same sum ClickHouse already answers "tokens" with', async () => {
+    const SUM = "sumIf(value, metric_name = 'claude_code.token.usage')";
+    const [boards, clickhouse] = await Promise.all([
+      readFile(join(REPO_ROOT, 'src/lib/boards.ts'), 'utf-8'),
+      readFile(join(REPO_ROOT, 'src/db/clickhouse.ts'), 'utf-8'),
+    ]);
+
+    expect(boards).toContain(`toUInt64(${SUM}) AS tokens`);
+    expect(clickhouse).toContain(`${SUM} as tokens`);
+    // And nothing narrows it afterwards: the 🪙 sum is one expression, with no
+    // token_type and no provenance clause bolted onto its line.
+    const line = boards.split('\n').find((text) => text.includes(`toUInt64(${SUM}) AS tokens`))!;
+    expect(line).not.toContain('token_type');
+    expect(line).not.toContain('NO_LEGACY_SQL');
   });
 });

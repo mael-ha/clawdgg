@@ -209,9 +209,14 @@ machines' tokens alone.
 
 ## Boards (homepage)
 
-Four weekly boards, ranked per UTC week (Monday 00:00 UTC) or all time. The
-homepage renders from the same function, so page and API cannot disagree. A user
-who hid the profile section behind a board is left off that board.
+Five boards, ranked per UTC week (Monday 00:00 UTC) or all time. The homepage
+renders from the same function, so page and API cannot disagree. A user who hid
+the profile section behind a board is left off that board.
+
+Each board carries its OWN pair of scopes and its own default, which is not
+always the first of the pair: 🪙 tokens offers week | all and opens on **all**,
+because a lifetime token count is the figure the board exists for. `meta.scopes`
+and `meta.defaultScope` report both, so a client never has to guess.
 
 `offset` and `limit` are CLAMPED rather than refused, and the response reports
 the values it was served with: an offset past the end of the board comes back
@@ -221,15 +226,19 @@ as `offset: total` with no rows. The ranking is cached per (board, scope) for
 ```
 GET /api/boards?board=value&scope=week&limit=25&offset=0
 
-  board   value | streak | ultrathinks | leverage        (default value; unknown → value)
-  scope   week | all                                     (default week; anything else → week)
+  board   tokens | value | streak | ultrathinks | leverage  (default tokens; unknown → tokens)
+  scope   week | all, or current | best on `streak`        (default: that board's `defaultScope`;
+                                                            a scope the board does not offer → it too)
   limit   1..100                                         (default 25; clamped, not refused)
   offset  >= 0                                           (default 0; clamped to `total`)
 
 200 (503 with the same body if any underlying query failed)
 {
   "board": "value", "scope": "week",
-  "meta": { "emoji": "💎", "label": "value", "caption": "API-equivalent of the work Claude did" },
+  "meta": {
+    "emoji": "💎", "label": "value", "caption": "API-equivalent of the work Claude did",
+    "scopes": ["week", "all"], "defaultScope": "week"
+  },
   "total": 214, "offset": 0, "limit": 25,
   "weekStart": "2026-10-12T00:00:00.000Z",
   "resetIn": "3d 4h",           // countdown string to the next Monday 00:00 UTC
@@ -250,7 +259,8 @@ GET /api/boards/pulse
   503 if incomplete.
 
 GET /api/boards/list
-→ { "boards": [ { "key": "value", "emoji": "💎", "label": "value", "caption": "…", "scopeless": false }, … ] }
+→ { "boards": [ { "key": "tokens", "emoji": "🪙", "label": "tokens", "caption": "tokens Claude processed",
+                  "scopes": ["week", "all"], "defaultScope": "all" }, … ] }
 ```
 
 ## Leaderboard
