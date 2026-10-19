@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { FINGERPRINT_SECTIONS, type FingerprintSection } from '../../lib/fingerprint';
 import { ProfilePage } from './ProfilePage';
-import { fixtureProfile, fixtureFingerprint } from './fixture';
+import { fixtureProfile, fixtureFingerprint, fixtureCurve } from './fixture';
 import { group, money } from './format';
 import { summarise } from '../../routes/profile';
 import { visibilityOf } from '../../lib/profile-settings';
@@ -42,7 +42,15 @@ function figuresOf(section: FingerprintSection): string[] {
 
   switch (section) {
     case 'value':
-      return [money(data.value!.thisWeek), money(data.value!.allTime), 'API-EQUIVALENT VALUE'];
+      return [
+        money(data.value!.thisWeek),
+        money(data.value!.allTime),
+        'API-EQUIVALENT VALUE',
+        // ⚡ activity plots 💎 by default, so its control, its footer total and
+        // its aria-label are all this section's figures too.
+        'aria-label="API-equivalent value"',
+        money(fixtureCurve().summary.total),
+      ];
     case 'anatomy':
       return [
         'ANATOMY OF YOUR AVERAGE PROMPT',
@@ -50,6 +58,8 @@ function figuresOf(section: FingerprintSection): string[] {
         'it ships',
         'API-equivalent, per prompt',
         'long tail to 778',
+        // The curve's `lines` metric is this section's figure over time.
+        'data-fp-metric="lines"',
         'Bash · Read · Edit · Grep',
       ];
     case 'conversation':
@@ -63,7 +73,11 @@ function figuresOf(section: FingerprintSection): string[] {
     case 'milestones':
       return ['🏁 milestones', '1K ultrathinks', '30-day streak', 'next ·'];
     case 'ultrathink':
-      return [`🌈 ${group(data.ultrathink!.count)} ultrathinks`, 'ultrathinks · 49.5%'];
+      return [
+        `🌈 ${group(data.ultrathink!.count)} ultrathinks`,
+        'ultrathinks · 49.5%',
+        'data-fp-metric="ultrathinks"',
+      ];
     case 'curve':
       return ['⚡ activity', 'granularity', 'fp-curve-paths'];
     case 'year':
@@ -272,6 +286,37 @@ describe('ProfilePage · a hidden section leaks nowhere', () => {
       expect(hidden).not.toContain('undefined');
     });
   }
+
+  test("hiding 'value' leaves ⚡ activity plotting prompts, not dollars", () => {
+    // The panel has its own toggle, and three of its five metrics are another
+    // section's figure drawn over time. With 💎 down the panel stays up on
+    // prompts — the one thing the curve's own toggle covers — rather than
+    // publishing the dollars the rest of the page refuses to print.
+    const hidden = page({ hide: ['value'] });
+    expect(hidden).toContain('⚡ activity');
+    expect(hidden).toContain('data-fp-metric="prompts"');
+    expect(hidden).not.toContain('data-fp-metric="value"');
+    expect(hidden).toContain('data-metric="prompts"');
+    // The chart's own aria-label — "<noun> per week, 1y — $X in total". The
+    // bare noun also names the model ring, which belongs to another section.
+    expect(hidden).not.toContain('API-equivalent value per ');
+  });
+
+  test('a visitor gets only the metric controls their sections allow', () => {
+    // Nothing is left to ask for but the two the curve itself owns.
+    const stripped = page({ hide: ['value', 'anatomy', 'ultrathink'] });
+    expect(stripped).toContain('data-fp-metric="prompts"');
+    expect(stripped).toContain('data-fp-metric="toolCalls"');
+    for (const gone of ['value', 'lines', 'ultrathinks']) {
+      expect(stripped).not.toContain(`data-fp-metric="${gone}"`);
+    }
+
+    // The owner's own page keeps all five, hidden sections and all.
+    const owner = page({ owner: true });
+    for (const metric of ['prompts', 'value', 'toolCalls', 'lines', 'ultrathinks']) {
+      expect(owner).toContain(`data-fp-metric="${metric}"`);
+    }
+  });
 
   test("hiding 'value' strips the daily values out of the year's attributes", () => {
     // A data attribute is as public as rendered text. 371 days of cost in

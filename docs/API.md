@@ -58,7 +58,7 @@ Extra per-user budgets: `POST /api/cli/import` 300 per 10 minutes,
 | GET | `/api/boards` | optional |
 | GET | `/api/boards/pulse` | public |
 | GET | `/api/boards/list` | public |
-| GET | `/api/leaderboard` | optional |
+| GET | `/api/leaderboard` | none. **410 Gone**, retired |
 | GET | `/api/u/:username/fingerprint` | optional |
 | GET | `/api/me` | auth |
 | GET | `/api/me/today` | auth |
@@ -82,6 +82,15 @@ Extra per-user budgets: `POST /api/cli/import` 300 per 10 minutes,
 
 Pages (HTML, not API): `/`, `/u/:username`, `/about`, and `GET /rows`, the
 fragment the homepage's load-more island appends (`?board=&scope=&offset=`).
+
+Under `/u/:username` and not in the table above, because they serve a page's
+data and a page's image rather than the API: `GET /u/:username/curve`
+(`?metric=prompts|value|toolCalls|lines|ultrathinks&period=30d|90d|1y|all&groupBy=day|week|month`,
+public, `404 {"error":"Not public"}` when the owner has hidden ⚡ activity **or
+the section the metric plots** — `value`→💎, `lines`→anatomy,
+`ultrathinks`→🌈 — and `503` when ClickHouse is unreachable, cached 60 s per
+(user, metric, period, groupBy, hidden)) and `GET /u/:username/card.svg` /
+`card.png` (the 1200×630 link-preview card, always the public payload).
 
 ---
 
@@ -235,43 +244,23 @@ GET /api/boards/list
 
 ```
 GET /api/leaderboard
-
-  period  today | week | month | all     (default all)
-  sort    prompts | tokens | lines | commits | cost    (default prompts)
-  page    >= 1                            (default 1)
-  limit   1..100                          (default 42)
-
-200
-{
-  "entries": [
-    {
-      "rank": 1,
-      "userId": "github_123456",
-      "githubUsername": "octocat",
-      "avatarUrl": "https://…",
-      "promptCount": 12847,
-      "tokenCount": 45231000,
-      "linesWritten": 9120,
-      "commitCount": 211,
-      "costUsdCents": 184200,
-      "badges": ["streak_7"],
-      "rankChange": 2             // all-time only; absent when not in the last snapshot
-    }
-  ],
-  "period": "all", "total": 2341, "page": 1, "pageSize": 42
+410 {
+  "error": "Endpoint retired",
+  "message": "GET /api/leaderboard is gone — it published figures profile owners had hidden. Use GET /api/boards …",
+  "use": "/api/boards"
 }
 ```
 
-- `sort=messages|sessions|tools` are **gone** → `400 {"error":"Invalid sort parameter. Valid: prompts, tokens, lines, commits, cost"}`.
-  `messageCount`, `toolCallCount`, `sessionCount` are no longer returned.
-- `period=all` reads `users.total_*` (the 5-minute cache); a user is listed once
-  they have any prompts or tokens. Ties break on user id.
-- `today | week | month` query ClickHouse directly, on rolling windows
-  (`today` = current UTC date, `week` = last 7 days, `month` = last 30 days),
-  and have no fallback: if ClickHouse is down this is an error, not a different
-  number. These windows differ from the Monday-UTC week used by `/api/boards`.
-- An unrecognised `period` is not validated and surfaces as `500`.
-- Returns JSON only. The old HTMX HTML partial (`HX-Request`) no longer exists.
+**Retired.** It ranked every user by cost, lines and prompts without reading
+`profile_settings`, so a user who had hidden 💎 value on their profile was still
+listed here, by name, with their dollars. `GET /api/boards` ranks the same
+figures, leaves a user off the board whose section they took down, and is what
+the homepage and its load-more fragment already read — see
+[Boards](#boards-homepage) above.
+
+Gone with it: `period`, `sort`, `page`, `limit`, `rankChange`, the
+`promptCount`/`tokenCount`/`linesWritten`/`commitCount`/`costUsdCents` entry
+shape, and the HTMX HTML partial that preceded them.
 
 ## Profile
 
@@ -313,7 +302,15 @@ PUT /api/me/profile-settings           auth
 ```
 
 No username in the path: you can only read or write your own. Sections default to
-visible. The change evicts the fingerprint cache immediately.
+visible.
+
+A change takes effect at once everywhere. The hidden list is part of the cache
+key of every cache built on it — the fingerprint payload, the profile page, each
+curve view and the share card — and the PUT also evicts this user's entries in
+all four, so the keys the previous list made are not left to sit out their TTL.
+`/u/:username/card.svg` and `card.png` are served `Cache-Control: public,
+max-age=60`: that is the one cache on the far side of this app, and it used to
+say `stale-while-revalidate=86400`.
 
 ### Timezone
 
@@ -508,15 +505,23 @@ timestamp + session + event, so a retry collapses.
 POST /api/stats
 410 {
   "error": "Endpoint retired",
-  "message": "clawd.gg no longer accepts uploaded daily summaries. Upgrade the CLI (`clawdgg upgrade`, then `clawdgg setup`) …",
-  "upgrade": "https://clawd.gg"
+  "message": "clawd.gg no longer accepts uploaded daily summaries. Reinstall the CLI (`curl -fsSL https://clawd.gg/install | sh`), then `clawdgg setup` …",
+  "install": "curl -fsSL https://clawd.gg/install | sh",
+  "upgrade": "https://clawd.gg/install"
 }
+
+GET /api/leaderboard
+410 { "error": "Endpoint retired", "use": "/api/boards" }
 ```
 
 The pre-OTEL daily-summary upload (`clawdgg sync`) is gone; nothing reads
 `daily_stats` any more. 410 rather than 404 so an old CLI stops retrying and
-the response says what to do. Also gone: the HTMX HTML partials on
-`/api/leaderboard`, and `sort=messages|sessions|tools`.
+the response says what to do.
+
+The leaderboard is gone because it did not read `profile_settings`: it answered
+with figures their owners had hidden. `/api/boards` is the replacement and
+always was the one the site uses. Also gone with it: the HTMX HTML partials and
+`sort=messages|sessions|tools`.
 
 ## Admin
 

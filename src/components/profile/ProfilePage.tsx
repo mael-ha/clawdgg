@@ -6,7 +6,7 @@ import { ClassHistory, Milestones } from './Milestones';
 import { OwnerLayer, Plan } from './Owner';
 import { Nothing } from './parts';
 import { group } from './format';
-import type { CurveView } from './curve';
+import type { CurveMetric, CurveView } from './curve';
 import type { ProfilePageProps } from './types';
 
 /**
@@ -30,6 +30,11 @@ import type { ProfilePageProps } from './types';
 export interface ProfileViewProps extends ProfilePageProps {
   /** Null when the owner has hidden ⚡ activity, or there is nothing to plot. */
   curve: CurveView | null;
+  /**
+   * The curve's metric controls, already filtered for this viewer — see
+   * visibleCurveMetrics. Absent means all of them, which is the owner's view.
+   */
+  curveMetrics?: readonly CurveMetric[];
 }
 
 export const ProfilePage: FC<ProfileViewProps> = ({
@@ -39,6 +44,7 @@ export const ProfilePage: FC<ProfileViewProps> = ({
   owner,
   publicPlan,
   curve,
+  curveMetrics,
   shareUrl,
 }) => {
   const visibility = owner?.visibility ?? null;
@@ -119,6 +125,7 @@ export const ProfilePage: FC<ProfileViewProps> = ({
               <Activity
                 view={curve}
                 visibility={visibility}
+                metrics={curveMetrics}
                 endpoint={`/u/${identity.username}/curve`}
               />
             )}

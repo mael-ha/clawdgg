@@ -16,9 +16,65 @@
 import { ACCENT, ICE, LINE, PRIMARY, SUN, VIOLET } from './palette';
 import { barsPath, linePath } from './geometry';
 import { compact, group, money } from './format';
+import type { Visibility } from './types';
+import type { FingerprintSection } from '../../lib/fingerprint';
 
 export const CURVE_METRICS = ['prompts', 'value', 'toolCalls', 'lines', 'ultrathinks'] as const;
 export type CurveMetric = (typeof CURVE_METRICS)[number];
+
+/**
+ * Which section OWNS each metric's figures.
+ *
+ * ⚡ activity is one panel with five metrics, and three of those are another
+ * section's headline drawn over time: `value` is 💎, `lines` is the anatomy's
+ * lines, `ultrathinks` is 🌈. So an owner who took 💎 down and left ⚡ up was
+ * still publishing their dollars — in the bars, in the footer's "1y $X · avg ·
+ * best", and in the chart's aria-label. The curve's own toggle covers
+ * `prompts` and `toolCalls` and nothing else.
+ *
+ * Both the route and the panel read this table: the endpoint 404s a metric
+ * whose section is hidden, and the controls for it are not rendered.
+ */
+export const CURVE_METRIC_SECTION: Record<CurveMetric, FingerprintSection> = {
+  prompts: 'curve',
+  value: 'value',
+  toolCalls: 'curve',
+  lines: 'anatomy',
+  ultrathinks: 'ultrathink',
+};
+
+/**
+ * May a VISITOR see this metric of this profile's curve?
+ *
+ * Two gates, and the second is the one that was missing: the panel's own toggle
+ * (`curve`), and the toggle on the section whose figure the metric plots. The
+ * endpoint answers 404 when this is false — an empty series would be a claim
+ * about the person, where a 404 is a claim about what the endpoint will say.
+ */
+export function curveIsVisible(visibility: Visibility, metric: CurveMetric): boolean {
+  return visibility.curve && visibility[CURVE_METRIC_SECTION[metric]];
+}
+
+/**
+ * The metrics this viewer may ask for, in the controls' own order.
+ *
+ * An OWNER is never filtered — they see their own hidden sections — so callers
+ * pass the visibility only for everybody else.
+ *
+ * The same predicate the endpoint answers on, so a button can never ask for a
+ * view that 404s.
+ */
+export function visibleCurveMetrics(visibility: Visibility): CurveMetric[] {
+  return CURVE_METRICS.filter((metric) => curveIsVisible(visibility, metric));
+}
+
+/** The metric a page opens on: the default, or `prompts` when it is hidden. */
+export function defaultCurveMetric(
+  preferred: CurveMetric,
+  visibility: Visibility
+): CurveMetric {
+  return visibility[CURVE_METRIC_SECTION[preferred]] ? preferred : 'prompts';
+}
 
 export const CURVE_PERIODS = ['30d', '90d', '1y', 'all'] as const;
 export type CurvePeriod = (typeof CURVE_PERIODS)[number];

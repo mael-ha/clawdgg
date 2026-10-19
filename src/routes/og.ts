@@ -40,10 +40,11 @@ const og = new Hono();
 /**
  * Ten minutes, longer than the page's minute.
  *
- * An unfurler fetches this once and then caches it for days of its own, so
- * freshness buys nothing here — while a popular link being pasted into a busy
- * channel can fetch it many times in a second, and each miss is the whole
- * fingerprint fan-out.
+ * A popular link pasted into a busy channel can be fetched many times in a
+ * second and each miss is the whole fingerprint fan-out, while nothing on the
+ * card moves in ten minutes. Longer than the HTTP max-age below on purpose:
+ * this one is OURS to evict when the owner changes a toggle (evictCardCache),
+ * and the header's is not.
  */
 const CARD_TTL_MS = 10 * 60_000;
 const cardCache = new TtlCache<string>(CARD_TTL_MS);
@@ -60,6 +61,17 @@ const cardCache = new TtlCache<string>(CARD_TTL_MS);
 const pngCache = new TtlCache<Uint8Array>(CARD_TTL_MS);
 
 /**
+ * Forget the card this user's settings produced.
+ *
+ * Called by PUT /api/me/profile-settings. `pngCache` needs no eviction: it is
+ * keyed by the hash of the SVG it rasterised, so a changed card is a changed
+ * key and a stale entry is unreachable rather than stale.
+ */
+export function evictCardCache(userId: string): void {
+  cardCache.deletePrefix(`${userId}|`);
+}
+
+/**
  * The card's SVG for a username, or null if there is no such user.
  *
  * Throws if the fingerprint cannot be built, which the routes turn into a
@@ -69,29 +81,56 @@ async function cardSvgFor(username: string): Promise<string | null> {
   const user = await fetchProfileUser(username);
   if (!user) return null;
 
-  return cardCache.remember(user.id, async () => {
-    const settings = await db
-      .select()
-      .from(profileSettings)
-      .where(eq(profileSettings.userId, user.id))
-      .get();
+  const settings = await db
+    .select()
+    .from(profileSettings)
+    .where(eq(profileSettings.userId, user.id))
+    .get();
+  const hidden = hiddenSections(settings);
 
+  // The hidden list is IN THE KEY, not just evicted on save — the reason is
+  // written out at the fingerprint cache in src/routes/api.ts: eviction alone
+  // loses the race against a build that was already in flight when the toggle
+  // was saved, and this cache holds the IMAGE that unfurlers go and fetch.
+  return cardCache.remember(`${user.id}|${hidden.join(',')}`, async () => {
     const data = await getFingerprint(user.id, {
       username: user.githubUsername,
       timezone: user.timezone,
       // Always the public view, whoever is asking — which also keeps the
       // zone name out of the payload this card is built from.
       isOwner: false,
-      hidden: hiddenSections(settings),
+      hidden,
     });
 
     return String(ShareCard({ card: shareCardFrom(data, { username: user.githubUsername }) }));
   });
 }
 
-// Short on the CDN, longer for the unfurlers that respect it, and
-// stale-while-revalidate so a pasted link never waits on a fan-out.
-const CARD_CACHE_CONTROL = 'public, max-age=600, stale-while-revalidate=86400';
+/**
+ * A minute, and NO `stale-while-revalidate`.
+ *
+ * This is the one cache on the card that nobody here can evict: it lives in
+ * whatever CDN, proxy or unfurler fetched the image. It used to say
+ * `stale-while-revalidate=86400`, which licensed every one of them to keep
+ * serving yesterday's card for a day — so an owner who hid 💎 watched the
+ * figure they had just taken down go on being unfurled into other people's
+ * channels, with nothing on this side able to stop it. A minute still absorbs
+ * the burst a pasted link causes (and the ten-minute in-process cache behind
+ * it absorbs the fan-out), while bounding that window to a minute.
+ */
+const CARD_CACHE_CONTROL = 'public, max-age=60';
+
+/**
+ * An SVG served from our own origin is a document, not just a picture: it can
+ * carry script and it is same-origin with the session cookie. Nothing in
+ * ShareCard emits either, so these are the belt to that braces — and the local
+ * equivalent of what Caddy adds in production (the Caddyfile sets nosniff
+ * site-wide; this route says it whoever is in front of it).
+ */
+const SVG_SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'Content-Security-Policy': "default-src 'none'",
+} as const;
 
 og.get('/:username/card.svg', async (c) => {
   const username = c.req.param('username');
@@ -103,6 +142,7 @@ og.get('/:username/card.svg', async (c) => {
     return c.body(svg, 200, {
       'Content-Type': 'image/svg+xml; charset=utf-8',
       'Cache-Control': CARD_CACHE_CONTROL,
+      ...SVG_SECURITY_HEADERS,
     });
   } catch (error) {
     console.error(`[card] ${username}:`, error);

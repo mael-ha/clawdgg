@@ -19,6 +19,7 @@ import { join } from 'node:path';
 import {
   CAPPED_ULTRATHINKS_SQL,
   PROMPT_EVENT_SQL,
+  cappedUltrathinksSql,
   ULTRATHINK_EVENT_NAME,
   ULTRATHINK_EVENT_SQL,
   eventRowId,
@@ -28,6 +29,7 @@ import { containsUltrathink } from '../lib/ultrathink';
 const SRC = join(import.meta.dir, '..');
 const clickhouse = readFileSync(join(SRC, 'db/clickhouse.ts'), 'utf8');
 const fingerprint = readFileSync(join(SRC, 'lib/fingerprint.ts'), 'utf8');
+const profileData = readFileSync(join(SRC, 'lib/profile-data.ts'), 'utf8');
 
 describe('the flag cannot be mistaken for a measurement', () => {
   it('is named outside the claude_code namespace', () => {
@@ -90,6 +92,39 @@ describe('the flag cannot be mistaken for a measurement', () => {
     expect(CAPPED_ULTRATHINKS_SQL).toStartWith('least(');
     expect(fingerprint).toContain('CAPPED_ULTRATHINKS_SQL');
     expect(fingerprint).not.toMatch(/countIf\(\$\{ULTRATHINK_EVENT_SQL\}\)/);
+  });
+
+  /**
+   * The PROFILE PANELS read the flag too — the year's squares and their
+   * tooltip, the ⚡ activity curve, ☀️ today — and all three counted it bare
+   * while the headline above them was capped. Two numbers for one word on one
+   * page, which is the thing the data-integrity rule forbids.
+   *
+   * The curve needs the nested form: a cap is per DAY, so a month bucket
+   * capped at a month of prompts is not a cap. src/lib/profile-data.ts groups
+   * by the bucket AND the user's local day inside, then sums the days.
+   */
+  it('the profile panels read the capped count, never the bare one', () => {
+    expect(profileData).not.toMatch(/countIf\(\$\{ULTRATHINK_EVENT_SQL\}( AND [^)]*)?\)/);
+    // The year's squares, grouped by local day already.
+    expect(profileData).toContain('${CAPPED_ULTRATHINKS_SQL}');
+    // ☀️ today (the day as a predicate) and the curve's recovered share.
+    expect(profileData).toContain('cappedUltrathinksSql(today)');
+    expect(profileData).toContain('cappedUltrathinksSql(ESTIMATED_SQL)');
+    // The curve's inner per-day group — without it the cap applies per bucket.
+    expect(profileData).toContain('GROUP BY date, toDate(${LOCAL_TS_SQL})');
+  });
+
+  it('caps a subset no higher than the group it came from', () => {
+    // least over two subsets is at most least over the sets, which is why
+    // cappedUltrathinksSql(ESTIMATED_SQL) can never exceed the day's total.
+    const subset = cappedUltrathinksSql("provenance = 'import'");
+    expect(subset).toStartWith('least(');
+    expect(subset).toContain(ULTRATHINK_EVENT_SQL);
+    expect(subset).toContain(PROMPT_EVENT_SQL);
+    // BOTH sides are narrowed, not just the flag's.
+    expect(subset.split("provenance = 'import'").length - 1).toBe(2);
+    expect(cappedUltrathinksSql()).toBe(CAPPED_ULTRATHINKS_SQL);
   });
 
   // api_request and tool_result are the other two counts a flag could pollute.

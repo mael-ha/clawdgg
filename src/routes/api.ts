@@ -1,9 +1,8 @@
 import { Hono } from 'hono';
 import { db } from '../db';
 import { users, planUsageSnapshots, profileSettings } from '../db/schema';
-import { eq, sql, desc, and, gte, inArray } from 'drizzle-orm';
+import { eq, sql, desc, and, gte } from 'drizzle-orm';
 import { requireAuth, requireBearerAuth, optionalAuth } from '../lib/auth-middleware';
-import type { LeaderboardEntry, LeaderboardResponse } from '../types';
 import { normalizeEpochSeconds, parseRateLimits, shouldInsertSnapshot } from '../lib/plan-usage';
 import { getModelDisplayName } from '../lib/pricing';
 import { DEFAULT_TIMEZONE, canonicalTimezone, normalizeTimezone } from '../lib/timezone';
@@ -15,7 +14,10 @@ import {
   setVisibility,
 } from '../lib/profile-settings';
 import { TtlCache } from '../lib/ttl-cache';
-import { rankChangesFor, type RankMetric } from '../lib/rank-snapshots';
+// Route modules, imported for one thing each: the caches a settings change has
+// to evict live next to the data they cache, not in a registry here.
+import { evictProfileCaches } from './profile';
+import { evictCardCache } from './og';
 
 const api = new Hono();
 
@@ -51,206 +53,35 @@ api.post('/stats', (c) =>
   )
 );
 
-// GET /api/leaderboard - Get leaderboard data
+// ═══════════════════════════════════════════════════════════════════════════
+// GET /api/leaderboard — RETIRED
 //
-// ONE source. `users.total_*` is ClickHouse's answer, cached every 5 minutes by
-// src/jobs/sync-clickhouse.ts, and period queries go straight to ClickHouse.
-// This endpoint used to UNION SQLite daily_stats sums for non-OTEL users with
-// ClickHouse figures for OTEL ones, which meant the same column on the same
-// page could be two different measurements. The pre-OTEL history now lives in
-// ClickHouse too, so there is nothing left to union.
-api.get('/leaderboard', optionalAuth, async (c) => {
-  try {
-    // Validated, not cast. `?period=yesterday` used to reach the date-filter
-    // lookup, come back `undefined`, and get interpolated into the SQL as the
-    // string "undefined" — a 500 from a query string, on a public endpoint.
-    const PERIODS = ['today', 'week', 'month', 'all'] as const;
-    const periodParam = c.req.query('period') || 'all';
-    if (!(PERIODS as readonly string[]).includes(periodParam)) {
-      return c.json(
-        { error: `Invalid period parameter. Valid: ${PERIODS.join(', ')}` },
-        400
-      );
-    }
-    const period = periodParam as (typeof PERIODS)[number];
-
-    // See LeaderboardResponse.window: `week` and `month` here are ROLLING
-    // windows, which /api/boards's "week" is not.
-    const WINDOW = {
-      all: 'all time',
-      today: 'today, UTC',
-      week: 'rolling 7 UTC days',
-      month: 'rolling 30 UTC days',
-    } as const;
-
-    const sort = (c.req.query('sort') || 'prompts') as string;
-    const page = Math.max(1, parseInt(c.req.query('page') || '1', 10));
-    const limit = Math.min(100, Math.max(1, parseInt(c.req.query('limit') || '42', 10)));
-    const offset = (page - 1) * limit;
-
-    // Only metrics ClickHouse actually answers. `messages`, `sessions` and
-    // `tools` used to be sortable off daily_stats columns; sorting by a number
-    // we can no longer compute would silently order by nothing, so they are a
-    // 400 rather than a lie.
-    const SORTABLE = {
-      prompts: { sqlite: 'total_prompts', ch: 'prompts' },
-      tokens: { sqlite: 'total_tokens', ch: 'tokens' },
-      lines: { sqlite: 'total_lines_added', ch: 'lines' },
-      commits: { sqlite: 'total_commits', ch: 'commits' },
-      cost: { sqlite: 'total_cost_cents', ch: 'cost' },
-    } as const;
-
-    const sortSpec = SORTABLE[sort as keyof typeof SORTABLE];
-    if (!sortSpec) {
-      return c.json(
-        { error: `Invalid sort parameter. Valid: ${Object.keys(SORTABLE).join(', ')}` },
-        400
-      );
-    }
-
-    const toEntry = (
-      row: { userId: string; githubUsername: string; avatarUrl: string | null; badges: string | null },
-      metrics: Omit<LeaderboardEntry, 'rank' | 'userId' | 'githubUsername' | 'avatarUrl' | 'badges'>,
-      index: number
-    ): LeaderboardEntry => {
-      let badges: string[] = [];
-      try {
-        badges = row.badges ? JSON.parse(row.badges) : [];
-      } catch {
-        badges = [];
-      }
-      return {
-        rank: offset + index + 1,
-        userId: row.userId,
-        githubUsername: row.githubUsername,
-        avatarUrl: row.avatarUrl,
-        ...metrics,
-        badges,
-      };
-    };
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // All-time: the synced totals, which is what the homepage renders too.
-    //
-    // Membership rule: a user is on the leaderboard when ClickHouse has usage
-    // for them. `users.total_*` IS that answer, so a non-zero total is exactly
-    // the condition — no `otel_enabled` flag, no `EXISTS (daily_stats)`.
-    // ═══════════════════════════════════════════════════════════════════════
-    if (period === 'all') {
-      const HAS_USAGE = sql`(COALESCE(u.total_prompts, 0) > 0 OR COALESCE(u.total_tokens, 0) > 0)`;
-
-      const results = (await db.all(sql`
-        SELECT
-          u.id as userId,
-          u.github_username as githubUsername,
-          u.avatar_url as avatarUrl,
-          u.badges,
-          COALESCE(u.total_prompts, 0) as promptCount,
-          COALESCE(u.total_tokens, 0) as tokenCount,
-          COALESCE(u.total_lines_added, 0) as linesWritten,
-          COALESCE(u.total_commits, 0) as commitCount,
-          COALESCE(u.total_cost_cents, 0) as costUsdCents
-        FROM users u
-        WHERE ${HAS_USAGE}
-        -- u.id is a TIEBREAKER, not decoration: without it two users on the
-        -- same total come back in an arbitrary order and the rank snapshot
-        -- shows both a phantom move every day (src/lib/rank-snapshots.ts).
-        ORDER BY ${sql.raw(sortSpec.sqlite)} DESC, u.id ASC
-        LIMIT ${limit}
-        OFFSET ${offset}
-      `)) as any[];
-
-      const countResult = (await db.all(sql`
-        SELECT COUNT(*) as count FROM users u WHERE ${HAS_USAGE}
-      `)) as any[];
-
-      const entries = results.map((row, index) =>
-        toEntry(row, {
-          promptCount: Number(row.promptCount) || 0,
-          tokenCount: Number(row.tokenCount) || 0,
-          linesWritten: Number(row.linesWritten) || 0,
-          commitCount: Number(row.commitCount) || 0,
-          costUsdCents: Number(row.costUsdCents) || 0,
-        }, index)
-      );
-
-      // Movement since the last snapshot. All-time only — a period board ranks
-      // on a different question, so its rows get no arrow rather than one
-      // computed from an unrelated field.
-      const changes = await rankChangesFor(
-        sort as RankMetric,
-        entries.map((e) => e.userId),
-        new Map(entries.map((e) => [e.userId, e.rank]))
-      );
-      for (const entry of entries) {
-        const change = changes.get(entry.userId);
-        if (change !== undefined) entry.rankChange = change;
-      }
-
-      const response: LeaderboardResponse = {
-        entries,
-        period,
-        window: WINDOW[period],
-        total: countResult[0]?.count || 0,
-        page,
-        pageSize: limit,
-      };
-      return c.json(response);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Period views: ClickHouse directly. There is no SQLite fallback on
-    // purpose — a leaderboard that silently drops to a different measurement
-    // when ClickHouse is unreachable is worse than one that says it is down.
-    // ═══════════════════════════════════════════════════════════════════════
-    const { clickhouse } = await import('../db/clickhouse');
-    const chResults = await clickhouse.getLeaderboard(period, sortSpec.ch, limit, offset);
-
-    const userIds = chResults.entries.map((e) => e.user_id);
-    const userInfos = userIds.length
-      ? await db
-          .select({
-            id: users.id,
-            githubUsername: users.githubUsername,
-            avatarUrl: users.avatarUrl,
-            badges: users.badges,
-          })
-          .from(users)
-          .where(inArray(users.id, userIds))
-      : [];
-    const userMap = new Map(userInfos.map((u) => [u.id, u]));
-
-    const entries = chResults.entries
-      .filter((e) => userMap.has(e.user_id))
-      .map((e, index) => {
-        const u = userMap.get(e.user_id)!;
-        return toEntry(
-          { userId: e.user_id, githubUsername: u.githubUsername, avatarUrl: u.avatarUrl, badges: u.badges },
-          {
-            promptCount: e.total_prompts,
-            tokenCount: e.total_tokens,
-            linesWritten: e.total_lines_added,
-            commitCount: e.total_commits,
-            costUsdCents: Math.round(e.total_cost_usd * 100),
-          },
-          index
-        );
-      });
-
-    const response: LeaderboardResponse = {
-      entries,
-      period,
-      window: WINDOW[period],
-      total: chResults.total,
-      page,
-      pageSize: limit,
-    };
-    return c.json(response);
-  } catch (error) {
-    console.error('Error fetching leaderboard:', error);
-    return c.json({ error: 'Failed to fetch leaderboard' }, 500);
-  }
-});
+// It answered with everybody's cost, lines and prompts, and it did it WITHOUT
+// reading profile_settings — so a user who hid 💎 value on their profile was
+// still listed here with their dollars, by name, to anyone who asked. Nothing
+// calls it: the homepage, its load-more fragment and every documented client
+// read /api/boards, which ranks on the same figures and leaves a user off the
+// board whose section they took down (src/lib/boards.ts).
+//
+// 410 Gone, like POST /api/stats above and for the same reasons: the endpoint
+// existed, it is deliberately withdrawn, the response says what to use instead,
+// and a 4xx stops an old client retrying where a 5xx would not. Fixing its
+// visibility instead would have meant a second ranking implementation with its
+// own answer to the same question — which is what /api/boards exists to be.
+// ═══════════════════════════════════════════════════════════════════════════
+api.get('/leaderboard', (c) =>
+  c.json(
+    {
+      error: 'Endpoint retired',
+      message:
+        'GET /api/leaderboard is gone — it published figures profile owners had ' +
+        'hidden. Use GET /api/boards (board=value|streak|ultrathinks|leverage, ' +
+        'scope, limit, offset), which honours those settings.',
+      use: '/api/boards',
+    },
+    410
+  )
+);
 
 // GET /api/me - Get current user's profile data (requires auth)
 // Dashboard V2: Now includes archetype, cost, and derived metrics
@@ -558,12 +389,18 @@ api.put('/me/profile-settings', requireAuth, async (c) => {
 
   const sections = await setVisibility(user.id, parsed.patch);
 
-  // The new hidden list is part of the cache key (see the GET above), so the
-  // next read is a miss by construction and no in-flight build can re-cache a
-  // stale payload under it. This evicts the keys the PREVIOUS list made, which
+  // Every cache keyed on the hidden list, evicted together.
+  //
+  // The list being part of each key (see the GET above) is what makes the next
+  // read a miss by construction and stops an in-flight build re-caching a
+  // stale payload under it. This clears the keys the PREVIOUS list made, which
   // would otherwise sit out their TTL unread — and only this user's, which is
-  // why it is a prefix and not a clear().
+  // why each one is a prefix and not a clear(). All three were missed before:
+  // the toggle took effect on the fingerprint endpoint immediately and on the
+  // page, the curve and the share card up to ten minutes later.
   fingerprintCache.deletePrefix(`${user.id}|`);
+  evictProfileCaches(user.githubUsername, user.id);
+  evictCardCache(user.id);
 
   return c.json({ success: true, sections });
 });

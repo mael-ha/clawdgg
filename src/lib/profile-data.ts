@@ -28,9 +28,11 @@ import { and, desc, eq, gte, isNull, sql } from 'drizzle-orm';
 import { db } from '../db';
 import { deviceTokens, planUsageSnapshots, users } from '../db/schema';
 import {
+  CAPPED_ULTRATHINKS_SQL,
   LOCAL_TS_SQL,
   PROMPT_EVENT_SQL,
   ULTRATHINK_EVENT_SQL,
+  cappedUltrathinksSql,
   query,
 } from '../db/clickhouse';
 import { bucketLabel, bucketSql, type ChartGroupBy } from './chart-buckets';
@@ -77,7 +79,12 @@ export async function fetchYearSeries(userId: string, tz: string): Promise<Contr
       `SELECT
          toString(toDate(${LOCAL_TS_SQL})) AS date,
          toUInt64(countIf(${PROMPT_EVENT_SQL})) AS prompts,
-         toUInt64(countIf(${ULTRATHINK_EVENT_SQL})) AS ultrathinks,
+         -- CAPPED, like the fingerprint's headline: this query is already
+         -- grouped by the user's own local day, which is the grouping the cap
+         -- is defined on. A bare count here put a 🌈 figure on the square and
+         -- in its tooltip that the number above the page disagreed with — and
+         -- could put more flags on a day than it held prompts.
+         toUInt64(${CAPPED_ULTRATHINKS_SQL}) AS ultrathinks,
          toUInt64(countIf(${PROMPT_EVENT_SQL} AND ${ESTIMATED_SQL})) AS estimated
        FROM events_raw FINAL
        WHERE user_id = {userId:String}
@@ -189,6 +196,9 @@ const CURVE_SOURCES: Record<
     match: `event_name = 'claude_code.tool_result' AND tool_name != ''`,
     expr: (p) => `toFloat64(countIf(${p}))`,
   },
+  // Only `table` is read for this one: the flag is capped per local day, which
+  // needs a nested grouping rather than one aggregate — see fetchCurve. The
+  // predicate stays here because it is still what the metric is counted over.
   ultrathinks: {
     table: 'events_raw',
     match: ULTRATHINK_EVENT_SQL,
@@ -208,6 +218,7 @@ const CURVE_SOURCES: Record<
 
 export async function fetchCurve(
   userId: string,
+  tz: string,
   metric: CurveMetric,
   period: CurvePeriod,
   groupBy: ChartGroupBy
@@ -219,16 +230,37 @@ export async function fetchCurve(
   const dateFilter = days === null ? '' : `AND toDate(timestamp) >= today() - ${days}`;
 
   const rows = await query<{ date: string; total: number; estimated: number }>(
-    `SELECT
-       ${bucketSql(groupBy)},
-       ${source.expr(source.match)} AS total,
-       ${source.expr(`${source.match} AND ${ESTIMATED_SQL}`)} AS estimated
-     FROM ${source.table} FINAL
-     WHERE user_id = {userId:String} ${dateFilter}
-     GROUP BY date
-     HAVING total > 0
-     ORDER BY date`,
-    { userId }
+    metric === 'ultrathinks'
+      ? // 🌈 is the one metric with a CAP, and a cap is per DAY — so the bucket
+        // cannot be the only grouping: a month of flags capped at a month of
+        // prompts is not a cap at all. The inner query groups by the bucket AND
+        // by the user's own local day (the grouping the cap is defined on, and
+        // the one the fingerprint's headline uses), the outer one sums those
+        // days into the bucket the reader asked for. Without it this chart drew
+        // the raw flag count while the number above it was capped.
+        `SELECT date, toFloat64(sum(day_total)) AS total, toFloat64(sum(day_estimated)) AS estimated
+         FROM (
+           SELECT
+             ${bucketSql(groupBy)},
+             ${CAPPED_ULTRATHINKS_SQL} AS day_total,
+             ${cappedUltrathinksSql(ESTIMATED_SQL)} AS day_estimated
+           FROM ${source.table} FINAL
+           WHERE user_id = {userId:String} ${dateFilter}
+           GROUP BY date, toDate(${LOCAL_TS_SQL})
+         )
+         GROUP BY date
+         HAVING total > 0
+         ORDER BY date`
+      : `SELECT
+           ${bucketSql(groupBy)},
+           ${source.expr(source.match)} AS total,
+           ${source.expr(`${source.match} AND ${ESTIMATED_SQL}`)} AS estimated
+         FROM ${source.table} FINAL
+         WHERE user_id = {userId:String} ${dateFilter}
+         GROUP BY date
+         HAVING total > 0
+         ORDER BY date`,
+    metric === 'ultrathinks' ? { userId, tz: normalizeTimezone(tz) } : { userId }
   );
 
   const points: CurvePointView[] = rows.map((row) => {
@@ -279,7 +311,10 @@ export async function fetchToday(userId: string, tz: string): Promise<TodayData>
     query<{ prompts: number; ultrathinks: number; last_event: string | null }>(
       `SELECT
          toUInt64(countIf(${PROMPT_EVENT_SQL} AND ${today})) AS prompts,
-         toUInt64(countIf(${ULTRATHINK_EVENT_SQL} AND ${today})) AS ultrathinks,
+         -- Capped over the rows of this one local day, which the today
+         -- predicate selects: the same cap the headline and the year's squares
+         -- apply, as a predicate rather than a GROUP BY because it is one day.
+         toUInt64(${cappedUltrathinksSql(today)}) AS ultrathinks,
          toString(max(timestamp)) AS last_event
        FROM events_raw FINAL
        WHERE user_id = {userId:String}

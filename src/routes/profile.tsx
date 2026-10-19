@@ -3,8 +3,12 @@ import { eq } from 'drizzle-orm';
 import { Layout } from '../components/Layout';
 import { db } from '../db';
 import { profileSettings } from '../db/schema';
-import { getFingerprint, type FingerprintData } from '../lib/fingerprint';
-import { visibilityOf } from '../lib/profile-settings';
+import {
+  getFingerprint,
+  type FingerprintData,
+  type FingerprintSection,
+} from '../lib/fingerprint';
+import { hiddenSections, visibilityOf } from '../lib/profile-settings';
 import { TtlCache } from '../lib/ttl-cache';
 import type { Island } from '../lib/assets';
 import type { SessionUser } from '../types';
@@ -22,11 +26,20 @@ import {
   type ProfileUser,
 } from '../lib/profile-data';
 import { DEFAULT_TIMEZONE } from '../lib/timezone';
+import type { ChartGroupBy } from '../lib/chart-buckets';
 import { ProfileNotFound, ProfilePage } from '../components/profile/ProfilePage';
 import { CARD_HEIGHT, CARD_WIDTH } from '../components/profile/ShareCard';
 import { className } from '../components/profile/palette';
 import { group, money } from '../components/profile/format';
-import type { CurveView } from '../components/profile/curve';
+import {
+  CURVE_METRICS,
+  curveIsVisible,
+  defaultCurveMetric,
+  visibleCurveMetrics,
+  type CurveMetric,
+  type CurvePeriod,
+  type CurveView,
+} from '../components/profile/curve';
 import type { PlanData, Visibility, YearData } from '../components/profile/types';
 import type { ContributionDay } from '../components/profile/geometry';
 
@@ -70,6 +83,8 @@ interface ProfilePayload {
   visibility: Visibility;
   year: YearData | null;
   curve: CurveView | null;
+  /** The metric controls this payload's viewer may see — CURVE_METRIC_SECTION. */
+  curveMetrics: CurveMetric[];
   plan: PlanData | null;
   /**
    * False when a query behind this payload failed. The cache refuses to keep a
@@ -80,27 +95,61 @@ interface ProfilePayload {
 }
 
 /**
- * A minute of the page, keyed by username AND by whether the viewer owns it.
+ * A minute of the page, keyed by username, by whether the viewer owns it, AND
+ * by the hidden sections it was built under.
  *
  * The owner's payload is a DIFFERENT payload — it contains the sections they
- * have hidden — so it cannot share a key with the public one. That was the
- * same decision the fingerprint endpoint made, for the same reason.
+ * have hidden — so it cannot share a key with the public one. The hidden list
+ * is in the key for the reason documented at the fingerprint cache in
+ * src/routes/api.ts: eviction alone loses the race against a build that was
+ * already in flight when the toggle was saved, and that build would re-cache
+ * the pre-toggle payload under the same key for the rest of the minute.
  */
 const pageCache = new TtlCache<ProfilePayload>(60_000);
+
+/**
+ * A minute of each curve, keyed by user, view AND hidden sections.
+ *
+ * The chart is one ClickHouse scan per click, on a PUBLIC endpoint with five
+ * metrics × four ranges × three granularities — sixty URLs per profile that
+ * each used to cost a full scan however often they were asked for. A throw is
+ * never cached (TtlCache only remembers what resolves), so an outage is
+ * retried rather than pinned for the minute.
+ */
+const curveCache = new TtlCache<CurveView>(60_000, 1_000);
 
 /** The default view of ⚡ activity: value, by week, over the last year. */
 const DEFAULT_CURVE = { metric: 'value', period: '1y', groupBy: 'week' } as const;
 
-async function buildPayload(user: ProfileUser, isOwner: boolean): Promise<ProfilePayload> {
-  const settings = await db
-    .select()
-    .from(profileSettings)
-    .where(eq(profileSettings.userId, user.id))
-    .get();
-  const visibility = visibilityOf(settings);
-  const hiddenFromOthers = (Object.keys(visibility) as (keyof Visibility)[]).filter(
-    (section) => !visibility[section]
-  );
+/** The owner's stored toggles, or undefined when they have never set any. */
+function settingsFor(userId: string) {
+  return db.select().from(profileSettings).where(eq(profileSettings.userId, userId)).get();
+}
+
+/**
+ * Forget everything this route has cached for one user.
+ *
+ * Called by PUT /api/me/profile-settings: the hidden list is part of both keys,
+ * so the next read is a miss by construction, and this clears the keys the
+ * PREVIOUS list made rather than leaving them to sit out their TTL unread.
+ */
+export function evictProfileCaches(username: string, userId: string): void {
+  pageCache.deletePrefix(`${username}|`);
+  curveCache.deletePrefix(`${userId}|`);
+}
+
+async function buildPayload(
+  user: ProfileUser,
+  isOwner: boolean,
+  visibility: Visibility,
+  hiddenFromOthers: readonly FingerprintSection[]
+): Promise<ProfilePayload> {
+  // ⚡ activity opens on 💎 value, which is another section's figure: for a
+  // visitor whose owner took that section down it opens on prompts instead.
+  const curveMetrics = isOwner ? [...CURVE_METRICS] : visibleCurveMetrics(visibility);
+  const curveMetric = isOwner
+    ? DEFAULT_CURVE.metric
+    : defaultCurveMetric(DEFAULT_CURVE.metric, visibility);
 
   // Failures are collected per BUILD, not in a module-level flag: two requests
   // for two profiles are in flight at the same time, and a shared flag would
@@ -125,18 +174,14 @@ async function buildPayload(user: ProfileUser, isOwner: boolean): Promise<Profil
       // `timezone` at all. See FingerprintData.timezone.
       isOwner,
       // The owner always sees everything, including what they have hidden.
-      hidden: isOwner ? [] : hiddenFromOthers,
+      hidden: isOwner ? [] : [...hiddenFromOthers],
     }),
     isOwner || visibility.year
       ? fetchYearSeries(user.id, user.timezone).catch(failed('year', null as ContributionDay[] | null))
       : Promise.resolve(null),
     isOwner || visibility.curve
-      ? fetchCurve(
-          user.id,
-          DEFAULT_CURVE.metric,
-          DEFAULT_CURVE.period,
-          DEFAULT_CURVE.groupBy
-        ).catch(failed('curve', null as CurveView | null))
+      ? rememberCurve(user, curveMetric, DEFAULT_CURVE.period, DEFAULT_CURVE.groupBy, hiddenFromOthers)
+          .catch(failed('curve', null as CurveView | null))
       : Promise.resolve(null),
     isOwner || visibility.plan
       ? fetchPlan(user.id).catch(failed('plan', null as PlanData | null))
@@ -156,9 +201,28 @@ async function buildPayload(user: ProfileUser, isOwner: boolean): Promise<Profil
             longestStreak: user.longestStreak,
           },
     curve,
+    curveMetrics,
     plan,
     complete: failures.length === 0,
   };
+}
+
+/**
+ * One cached curve. The hidden list is in the key for the same reason it is in
+ * the page's and the fingerprint's: a build in flight when the toggle was saved
+ * can only re-cache the key it was built for.
+ */
+function rememberCurve(
+  user: ProfileUser,
+  metric: CurveMetric,
+  period: CurvePeriod,
+  groupBy: ChartGroupBy,
+  hiddenFromOthers: readonly FingerprintSection[]
+): Promise<CurveView> {
+  return curveCache.remember(
+    `${user.id}|${metric}|${period}|${groupBy}|${hiddenFromOthers.join(',')}`,
+    () => fetchCurve(user.id, user.timezone, metric, period, groupBy)
+  );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -169,27 +233,35 @@ async function buildPayload(user: ProfileUser, isOwner: boolean): Promise<Profil
 // whose owner has hidden ⚡ activity rather than returning an empty series: an
 // empty series is a claim about the person, and a 404 is a claim about what
 // this endpoint will say.
+//
+// A METRIC is checked as well as the panel. Three of the five plot another
+// section's figure (CURVE_METRIC_SECTION), so `?metric=value` on a profile with
+// 💎 hidden used to answer with the dollars the page itself refuses to print —
+// the panel's own toggle was never the only question being asked.
 app.get('/:username/curve', async (c) => {
   const user = await fetchProfileUser(c.req.param('username'));
   if (!user) return c.json({ error: 'No such user' }, 404);
 
   const isOwner = c.get('user')?.githubUsername === user.githubUsername;
+  const metric = parseCurveMetric(c.req.query('metric'));
+  let hiddenFromOthers: FingerprintSection[] = [];
+
   if (!isOwner) {
-    const settings = await db
-      .select()
-      .from(profileSettings)
-      .where(eq(profileSettings.userId, user.id))
-      .get();
-    if (!visibilityOf(settings).curve) return c.json({ error: 'Not public' }, 404);
+    const settings = await settingsFor(user.id);
+    hiddenFromOthers = hiddenSections(settings);
+    if (!curveIsVisible(visibilityOf(settings), metric)) {
+      return c.json({ error: 'Not public' }, 404);
+    }
   }
 
   try {
     return c.json(
-      await fetchCurve(
-        user.id,
-        parseCurveMetric(c.req.query('metric')),
+      await rememberCurve(
+        user,
+        metric,
         parseCurvePeriod(c.req.query('period')),
-        parseCurveGroupBy(c.req.query('groupBy'))
+        parseCurveGroupBy(c.req.query('groupBy')),
+        hiddenFromOthers
       )
     );
   } catch (error) {
@@ -229,11 +301,17 @@ app.get('/:username', async (c) => {
   const asVisitor = c.req.query('as') === 'visitor';
   const isOwner = currentUser?.githubUsername === user.githubUsername && !asVisitor;
 
+  // Read OUTSIDE the cache, because the hidden list is part of the key: a
+  // payload built under one set of toggles must never be served under another.
+  const settings = await settingsFor(user.id);
+  const visibility = visibilityOf(settings);
+  const hiddenFromOthers = hiddenSections(settings);
+
   let payload: ProfilePayload;
   try {
     payload = await pageCache.remember(
-      `${user.githubUsername}|${isOwner ? 'own' : 'public'}`,
-      () => buildPayload(user, isOwner),
+      `${user.githubUsername}|${isOwner ? 'own' : 'public'}|${hiddenFromOthers.join(',')}`,
+      () => buildPayload(user, isOwner, visibility, hiddenFromOthers),
       (built) => built.complete
     );
   } catch (error) {
@@ -301,6 +379,7 @@ app.get('/:username', async (c) => {
         }}
         year={payload.year}
         curve={payload.curve}
+        curveMetrics={payload.curveMetrics}
         owner={
           isOwner
             ? { visibility: payload.visibility, plan: payload.plan, today, pipeline }

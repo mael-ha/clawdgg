@@ -21,7 +21,13 @@ import type {
 } from '../../lib/fingerprint';
 import type { ContributionDay } from './geometry';
 import { bucketLabel } from '../../lib/chart-buckets';
-import type { CurveView } from './curve';
+import {
+  defaultCurveMetric,
+  visibleCurveMetrics,
+  type CurveMetric,
+  type CurveView,
+} from './curve';
+import { defaultVisibility } from '../../lib/profile-settings';
 import type { OwnerData, PlanData, ProfilePageProps } from './types';
 
 /** A deterministic 0–1, so a screenshot diff is a real diff. */
@@ -288,7 +294,7 @@ export function fixtureYear(): ContributionDay[] {
   return days;
 }
 
-export function fixtureCurve(): CurveView {
+export function fixtureCurve(metric: CurveMetric = 'value'): CurveView {
   const random = seeded(23);
   const points = Array.from({ length: 52 }, (_, index) => {
     const monday = new Date(Date.parse(`${FIXTURE_TODAY}T00:00:00Z`) - (51 - index) * 7 * 86_400_000);
@@ -307,7 +313,7 @@ export function fixtureCurve(): CurveView {
   const best = points.reduce((top, point) => (point.value > top.value ? point : top), points[0]!);
 
   return {
-    metric: 'value',
+    metric,
     period: '1y',
     groupBy: 'week',
     points,
@@ -419,12 +425,15 @@ function applyHidden(data: FingerprintData, hide: readonly FingerprintSection[])
 
 export function fixtureProfile(options: FixtureOptions = {}): ProfilePageProps & {
   curve: CurveView | null;
+  curveMetrics?: readonly CurveMetric[];
 } {
   const base = options.empty ? emptyFingerprint() : fixtureFingerprint();
   const hide = options.takenDown
     ? [...base.sections]
     : options.hide ?? [];
   const fingerprint = applyHidden(base, hide);
+  const visibility = defaultVisibility();
+  for (const section of hide) visibility[section] = false;
   // A visitor's payload has no zone at all — see FingerprintData.timezone.
   if (!options.owner) delete fingerprint.timezone;
 
@@ -451,7 +460,14 @@ export function fixtureProfile(options: FixtureOptions = {}): ProfilePageProps &
           },
     owner: options.owner ? fixtureOwner() : null,
     publicPlan: options.owner || blank || hide.includes('plan') ? null : fixturePlan(),
-    curve: blank || hide.includes('curve') ? null : fixtureCurve(),
+    // The curve a VISITOR gets, decided the way the route decides it: three of
+    // its five metrics plot another section's figure, so hiding 💎 changes
+    // which metric the panel opens on and which controls exist at all.
+    curve:
+      blank || hide.includes('curve')
+        ? null
+        : fixtureCurve(options.owner ? 'value' : defaultCurveMetric('value', visibility)),
+    curveMetrics: options.owner ? undefined : visibleCurveMetrics(visibility),
     shareUrl: `https://clawd.gg/u/${fingerprint.username}`,
   };
 }

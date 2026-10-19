@@ -10,6 +10,7 @@ import {
   curveAria,
   curveFooter,
   curveInner,
+  type CurveMetric,
   type CurveView,
 } from './curve';
 import type { Visibility } from './types';
@@ -45,11 +46,22 @@ const Segmented: FC<{ children?: unknown; label: string }> = ({ children, label 
 export interface ActivityProps {
   view: CurveView;
   visibility: Visibility | null;
+  /**
+   * The metric controls to render — CURVE_METRIC_SECTION decides the list, and
+   * the route hands it down already filtered for this viewer.
+   *
+   * A button that is not here cannot be clicked, and the island only ever asks
+   * for what it can see (src/client/profile-curve.ts reads the rendered
+   * buttons), so this is the same gate as the endpoint's 404 rather than a
+   * decoration on top of it.
+   */
+  metrics?: readonly CurveMetric[];
   /** The route the island re-fetches from. */
   endpoint: string;
 }
 
-export const Activity: FC<ActivityProps> = ({ view, visibility, endpoint }) => {
+export const Activity: FC<ActivityProps> = ({ view, visibility, metrics, endpoint }) => {
+  const shown = metrics ?? CURVE_METRICS;
   const style = METRIC_STYLE[view.metric];
   const labels = axisLabels(view);
   const footer = curveFooter(view);
@@ -65,7 +77,7 @@ export const Activity: FC<ActivityProps> = ({ view, visibility, endpoint }) => {
         />
         <div class="flex flex-wrap gap-2.5">
           <Segmented label="metric">
-            {CURVE_METRICS.map((metric) => (
+            {shown.map((metric) => (
               <button
                 key={metric}
                 type="button"

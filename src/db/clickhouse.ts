@@ -710,6 +710,12 @@ export const CLAUDE_CODE_EVENT_SQL = `startsWith(event_name, 'claude_code.')`;
  * three read the same expression — see fetchPeerTotals for why the UTC variant
  * differs only for an abuser.
  *
+ * `cappedUltrathinksSql(predicate)` is the same cap over a SUBSET of the group:
+ * the day picked by a predicate rather than by the GROUP BY (☀️ today), and the
+ * recovered part of a bucket (⚡ activity's faint bars). A subset's cap can
+ * never exceed the group's, because a minimum over two subsets is at most the
+ * minimum over the sets they came from.
+ *
  * LOAD-BEARING ASSUMPTION: a flag carries the same instant as the prompt it
  * describes. Both sources guarantee it — the hook posts the prompt's own
  * timestamp, and the history import emits both rows from one record — and the
@@ -720,8 +726,12 @@ export const CLAUDE_CODE_EVENT_SQL = `startsWith(event_name, 'claude_code.')`;
  * submitted across local midnight whose two rows land on opposite sides of the
  * millisecond, which is at most one flag per user per lifetime.
  */
-export const CAPPED_ULTRATHINKS_SQL =
-  `least(countIf(${ULTRATHINK_EVENT_SQL}), countIf(${PROMPT_EVENT_SQL}))`;
+export function cappedUltrathinksSql(within?: string): string {
+  const scope = within ? ` AND (${within})` : '';
+  return `least(countIf(${ULTRATHINK_EVENT_SQL}${scope}), countIf(${PROMPT_EVENT_SQL}${scope}))`;
+}
+
+export const CAPPED_ULTRATHINKS_SQL = cappedUltrathinksSql();
 
 /**
  * `timestamp` in the user's own wall clock. Every hour-of-day, weekday and
