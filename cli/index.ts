@@ -84,6 +84,7 @@ import {
 } from "./otel-headers";
 import { clearTokenRevoked, isTokenRevoked, markTokenRevoked } from "./token-state";
 import { createProgress } from "./progress";
+import { countRows } from "./import-preview";
 import { version } from "./version";
 
 // ANSI color codes
@@ -1880,7 +1881,11 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
   // history.jsonl outlives the transcripts (which rotate at ~60 days), so it
   // fills days the transcripts no longer cover — and only those days, or every
   // prompt in the overlap would be counted twice.
-  let historyKept = 0;
+  // Counted by event_name, not by row count: gaps.events holds the flags
+  // history.jsonl produced as well as its prompts, and reporting its length as
+  // "of those prompts" is how the preview came to claim 2,665 of 1,629.
+  let historyPrompts = 0;
+  let historyFlags = 0;
   if (existsSync(CLAUDE_HISTORY_PATH)) {
     try {
       const history = mapHistoryText(await readFile(CLAUDE_HISTORY_PATH, "utf-8"), {
@@ -1890,7 +1895,9 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
         slashPolicy: "drop-builtin",
       });
       const gaps = fillPromptGapsFromHistory(events, history.events);
-      historyKept = gaps.events.length;
+      const fromHistory = countRows(gaps.events);
+      historyPrompts = fromHistory.prompts;
+      historyFlags = fromHistory.flags;
       events.push(...gaps.events);
       if (gaps.gapDays.length > 0) {
         log.dim(`history.jsonl fills ${gaps.gapDays.length} day(s) with no transcripts left`);
@@ -1918,10 +1925,8 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
   // server's double-count guard works a whole day at a time.
   events.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
 
-  const prompts = events.filter((e) => e.event_name === "claude_code.user_prompt").length;
-  const apiRequests = events.filter((e) => e.event_name === "claude_code.api_request").length;
+  const { prompts, apiRequests, rows: total } = countRows(events);
   const costUsd = previewCostUsd(events);
-  const total = events.length;
 
   if (total === 0) {
     log.info("Nothing to import — your local history is all after telemetry started.");
@@ -1930,7 +1935,12 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
 
   console.log();
   console.log(`  ${colors.bright}${prompts.toLocaleString()}${colors.reset} prompts  ${colors.dim}·${colors.reset}  ${colors.bright}${apiRequests.toLocaleString()}${colors.reset} API calls  ${colors.dim}·${colors.reset}  ${colors.bright}$${costUsd.toFixed(2)}${colors.reset} ${colors.dim}(estimated)${colors.reset}`);
-  if (historyKept > 0) log.dim(`  ${historyKept.toLocaleString()} of those prompts come from history.jsonl`);
+  if (historyPrompts > 0) {
+    log.dim(`  ${historyPrompts.toLocaleString()} of those prompts come from history.jsonl`);
+  }
+  if (historyFlags > 0) {
+    log.dim(`  ${historyFlags.toLocaleString()} ultrathink flags come from history.jsonl too`);
+  }
   if (lateFlags.length > 0) {
     log.dim(`  ${lateFlags.length.toLocaleString()} ultrathink flags from before the hook existed`);
   }
