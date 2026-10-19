@@ -138,8 +138,11 @@ function dayNumber(date: string): number {
  * In the USER'S timezone, because this is what decides the night-owl badge and
  * the archetype. Read in UTC, a Berlin user who stops at 23:00 looks like they
  * stop at 21:00, and one in Los Angeles looks nocturnal all day.
+ *
+ * Exported for src/db/clickhouse-reads.test.ts: the catch below turns a broken
+ * query into an empty answer, so the only way to see this SQL fail is to run it.
  */
-async function getUserHourlyCounts(
+export async function getUserHourlyCounts(
   userId: string,
   tz: string
 ): Promise<Record<string, number>> {
@@ -172,8 +175,10 @@ async function getUserHourlyCounts(
 /**
  * Get longest session message count for a user
  * OTel tracks this via session metrics
+ *
+ * Exported for the same reason as getUserHourlyCounts above.
  */
-async function getLongestSessionMessages(userId: string): Promise<number> {
+export async function getLongestSessionMessages(userId: string): Promise<number> {
   try {
     // Count prompts per session and get the max
     const result = await query<{ max_prompts: number }>(
