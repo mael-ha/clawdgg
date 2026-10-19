@@ -69,6 +69,34 @@ describe('GET /auth/logout', () => {
   });
 });
 
+describe('POST /auth/logout', () => {
+  function post(mode?: string) {
+    return auth.request(LOGOUT, {
+      method: 'POST',
+      headers: {
+        cookie: 'session=whatever',
+        ...(mode ? { 'Sec-Fetch-Mode': mode } : {}),
+      },
+      redirect: 'manual',
+    });
+  }
+
+  it('sends the header form back to a page, not to JSON', async () => {
+    // `Sec-Fetch-Mode: navigate` is a browser submitting <form method="post">.
+    // 303 is what turns that POST into a GET of '/'.
+    const response = await post('navigate');
+    expect(response.status).toBe(303);
+    expect(response.headers.get('location')).toBe('/');
+    expect(response.headers.get('set-cookie') ?? '').toMatch(/^session=;/);
+  });
+
+  it('still answers a fetch() caller in JSON', async () => {
+    const response = await post('same-origin');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ success: true });
+  });
+});
+
 describe('POST /api/plan-usage', () => {
   /**
    * BEARER ONLY. The figures come from the rate limits Claude Code hands the

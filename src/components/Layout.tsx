@@ -131,12 +131,16 @@ const NavBar: FC<{ user?: SessionUser | null }> = ({ user }) => (
                 )}
                 <span class="text-cyan-400 font-mono text-sm">@{user.githubUsername}</span>
               </div>
-              <a
-                href="/auth/logout"
-                class="text-gray-500 hover:text-red-400 font-mono text-xs transition-colors"
-              >
-                [logout]
-              </a>
+              {/* A POST, because a logout is a state change — see
+                  src/routes/auth.ts. Styled as the link it used to be. */}
+              <form method="post" action="/auth/logout" class="contents">
+                <button
+                  type="submit"
+                  class="cursor-pointer border-0 bg-transparent p-0 text-gray-500 hover:text-red-400 font-mono text-xs transition-colors"
+                >
+                  [logout]
+                </button>
+              </form>
             </div>
           ) : (
             <a

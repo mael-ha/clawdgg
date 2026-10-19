@@ -205,7 +205,7 @@ export const ProfilePage: FC<ProfileViewProps> = ({
               copy link
             </button>
             <a
-              href={`/u/${identity.username}/card.svg`}
+              href={`/u/${identity.username}/card.png`}
               class="flex min-h-[44px] grow items-center justify-center rounded-xl bg-cyan-400 px-4 font-mono text-[13px] font-extrabold text-fp-ground no-underline sm:grow-0"
             >
               share my card

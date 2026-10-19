@@ -184,11 +184,21 @@ auth.get('/callback', async (c) => {
   }
 });
 
-// POST /auth/logout — the canonical one. A logout is a state change, so it
-// gets the verb for a state change, and `SameSite=Lax` means a cross-site POST
-// carries no session cookie at all.
+/**
+ * POST /auth/logout — the canonical one, and what the markup uses.
+ *
+ * A logout is a state change, so it gets the verb for a state change, and
+ * `SameSite=Lax` means a cross-site POST carries no session cookie at all —
+ * the whole CSRF story, with none of the GET's caveats below.
+ *
+ * `Sec-Fetch-Mode: navigate` is a browser submitting the `<form>` in the
+ * header, and it must land on a page rather than on `{"success":true}`. 303
+ * is what turns that POST into a GET of '/'. A fetch() caller sends `cors`
+ * or `same-origin` and still gets the JSON.
+ */
 auth.post('/logout', async (c) => {
   destroySession(c);
+  if (c.req.header('Sec-Fetch-Mode') === 'navigate') return c.redirect('/', 303);
   return c.json({ success: true });
 });
 
@@ -213,8 +223,9 @@ auth.post('/logout', async (c) => {
  * A client that sends no `Sec-Fetch-Site` at all (curl, an old browser) is
  * allowed through: the header's absence is not evidence of anything, and
  * refusing it would break logging out in a browser that cannot be attacked this
- * way either. The POST above is the route with no caveats, and the markup
- * should use it — see the hand-off note in the D2 report.
+ * way either. The POST above is the route with no caveats and the one the
+ * markup posts to; this stays for a bookmark, a typed URL and anything that
+ * still links here.
  */
 auth.get('/logout', async (c) => {
   const site = c.req.header('Sec-Fetch-Site');

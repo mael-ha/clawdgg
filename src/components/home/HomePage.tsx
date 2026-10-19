@@ -65,9 +65,16 @@ const Header: FC<{ user: SessionUser | null }> = ({ user }) => (
               )}
               <span class="text-cyan-400">@{user.githubUsername}</span>
             </a>
-            <a href="/auth/logout" class="font-mono text-xs text-[#6f7686] hover:text-[#ff4d6d]">
-              [logout]
-            </a>
+            {/* A POST, because a logout is a state change — see
+                src/routes/auth.ts. Styled as the link it used to be. */}
+            <form method="post" action="/auth/logout" class="contents">
+              <button
+                type="submit"
+                class="cursor-pointer border-0 bg-transparent p-0 font-mono text-xs text-[#6f7686] hover:text-[#ff4d6d]"
+              >
+                [logout]
+              </button>
+            </form>
           </div>
         ) : (
           <a
