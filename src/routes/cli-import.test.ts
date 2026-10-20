@@ -7,13 +7,20 @@ import cli, {
   dropCoveredDays,
   dropDuplicates,
   EARLIEST_PLAUSIBLE_MS,
+  IMPORT_SLOTS_GLOBAL,
+  IMPORT_SLOTS_PER_USER,
+  importBusy,
+  importSlotFree,
+  importSlotsInUse,
   MAX_CACHE_TOKENS_PER_REQUEST,
   MAX_INPUT_TOKENS_PER_REQUEST,
   MAX_OUTPUT_TOKENS_PER_REQUEST,
   runImport,
   sanitizeImportRows,
   type ImportDeps,
+  withImportSlot,
 } from './cli';
+import { Hono } from 'hono';
 import { computeCostUsd, mapLine, type MapOptions } from '../lib/session-import';
 import {
   ULTRATHINK_EVENT_NAME,
@@ -887,6 +894,98 @@ describe('checkUltrathinkRate', () => {
     for (let i = 0; i < 61; i++) checkUltrathinkRate(a, now);
     expect(checkUltrathinkRate(a, now).ok).toBe(false);
     expect(checkUltrathinkRate(b, now).ok).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Import admission — one batch per user, two in all, refuse the rest at once
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('withImportSlot', () => {
+  /** A batch that runs until the test lets it finish. */
+  function held() {
+    let finish!: () => void;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    return { work: () => done.then(() => 'ran'), finish };
+  }
+
+  it('caps one user at one batch in flight', async () => {
+    expect(IMPORT_SLOTS_PER_USER).toBe(1);
+    const first = held();
+    const running = withImportSlot('github_a', first.work);
+
+    expect(importSlotFree('github_a')).toBe(false);
+    let ran = false;
+    expect(await withImportSlot('github_a', async () => { ran = true; })).toBeNull();
+    expect(ran).toBe(false);
+
+    first.finish();
+    expect(await running).toBe('ran');
+    expect(importSlotFree('github_a')).toBe(true);
+    expect(importSlotsInUse()).toEqual({ total: 0, users: 0 });
+  });
+
+  it('caps everyone together at two, whoever they are', async () => {
+    expect(IMPORT_SLOTS_GLOBAL).toBe(2);
+    const a = held();
+    const b = held();
+    const runningA = withImportSlot('github_a', a.work);
+    const runningB = withImportSlot('github_b', b.work);
+
+    expect(importSlotsInUse()).toEqual({ total: 2, users: 2 });
+    expect(importSlotFree('github_c')).toBe(false);
+    expect(await withImportSlot('github_c', async () => 'ran')).toBeNull();
+
+    a.finish();
+    await runningA;
+    // One slot back, and it goes to whoever asks next.
+    expect(await withImportSlot('github_c', async () => 'ran')).toBe('ran');
+
+    b.finish();
+    await runningB;
+    expect(importSlotsInUse()).toEqual({ total: 0, users: 0 });
+  });
+
+  it('gives the slot back when the batch throws', async () => {
+    await expect(
+      withImportSlot('github_a', async () => { throw new Error('ClickHouse fell over'); })
+    ).rejects.toThrow('ClickHouse fell over');
+
+    expect(importSlotsInUse()).toEqual({ total: 0, users: 0 });
+    expect(await withImportSlot('github_a', async () => 'ran')).toBe('ran');
+  });
+
+  it('gives the slot back when the batch answers with an error', async () => {
+    const app = new Hono();
+    app.get('/', async (c) => {
+      const answer = await withImportSlot('github_a', async () =>
+        c.json({ error: 'Import failed' }, 500)
+      );
+      return answer ?? importBusy(c);
+    });
+
+    expect((await app.request('http://localhost/')).status).toBe(500);
+    expect(importSlotsInUse()).toEqual({ total: 0, users: 0 });
+  });
+
+  it('refuses with a 429, a 2–8 s Retry-After and the usual body', async () => {
+    const app = new Hono();
+    app.get('/', (c) => importBusy(c));
+
+    const seen = new Set<number>();
+    for (let i = 0; i < 200; i++) {
+      const response = await app.request('http://localhost/');
+      expect(response.status).toBe(429);
+      const header = response.headers.get('Retry-After');
+      expect(header).toMatch(/^\d+$/);
+      const retryAfter = Number(header);
+      expect(retryAfter).toBeGreaterThanOrEqual(2);
+      expect(retryAfter).toBeLessThanOrEqual(8);
+      expect(await response.json()).toEqual({ error: 'Import busy', retryAfter });
+      seen.add(retryAfter);
+    }
+    // Jittered: the refused do not all come back in the same second.
+    expect(seen.size).toBeGreaterThan(1);
   });
 });
 

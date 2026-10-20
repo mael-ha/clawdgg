@@ -7,7 +7,7 @@
  * accepting the cookie would make "revoke all my devices" a CSRF one-liner.
  */
 
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { eq } from 'drizzle-orm';
 import { db } from '../db';
@@ -915,6 +915,69 @@ export function checkImportRate(
   return { ok: true, retryAfterSeconds: 0 };
 }
 
+/**
+ * Admission for the import's ClickHouse work: one batch per user, two in all.
+ *
+ * Every batch runs the coverage guard's scans and an insert, and pages read
+ * through a ClickHouse limiter of four on two vCPUs. A launch is tens to
+ * hundreds of `clawdgg setup` runs importing at once; unadmitted, they would
+ * hold every permit and the site would wait behind them. Beyond the caps the
+ * answer is an immediate 429, never a queue: a queue in memory is unbounded by
+ * construction, and the CLI already waits out a Retry-After and tries again.
+ * The wait is jittered so that the refused do not all come back together.
+ *
+ * The coverage preview takes the same slots, since it runs the same scans.
+ */
+export const IMPORT_SLOTS_PER_USER = 1;
+export const IMPORT_SLOTS_GLOBAL = 2;
+const IMPORT_RETRY_MIN_S = 2;
+const IMPORT_RETRY_MAX_S = 8;
+
+const importSlots = new Map<string, number>();
+let importSlotsTotal = 0;
+
+/** Would `withImportSlot` admit this user right now? It takes nothing. */
+export function importSlotFree(userId: string): boolean {
+  return (
+    importSlotsTotal < IMPORT_SLOTS_GLOBAL &&
+    (importSlots.get(userId) ?? 0) < IMPORT_SLOTS_PER_USER
+  );
+}
+
+/**
+ * Run `work` holding one of this user's slots and one of the global ones, or
+ * return `null` at once when either is full. Released however `work` ends.
+ */
+export async function withImportSlot<T>(
+  userId: string,
+  work: () => Promise<T>
+): Promise<T | null> {
+  if (!importSlotFree(userId)) return null;
+  importSlots.set(userId, (importSlots.get(userId) ?? 0) + 1);
+  importSlotsTotal++;
+  try {
+    return await work();
+  } finally {
+    importSlotsTotal--;
+    const held = (importSlots.get(userId) ?? 1) - 1;
+    if (held > 0) importSlots.set(userId, held);
+    else importSlots.delete(userId);
+  }
+}
+
+/** Slots held right now, for the tests. */
+export function importSlotsInUse(): { total: number; users: number } {
+  return { total: importSlotsTotal, users: importSlots.size };
+}
+
+/** The refusal: 429, a jittered whole-second Retry-After, the usual body. */
+export function importBusy(c: Context): Response {
+  const span = IMPORT_RETRY_MAX_S - IMPORT_RETRY_MIN_S + 1;
+  const retryAfter = IMPORT_RETRY_MIN_S + Math.floor(Math.random() * span);
+  c.header('Retry-After', String(retryAfter));
+  return c.json({ error: 'Import busy', retryAfter }, 429);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // GET /api/cli/import/coverage — what the import would skip, before it runs
 // ═══════════════════════════════════════════════════════════════════════════
@@ -926,34 +989,40 @@ cli.get('/import/coverage', requireBearerAuth, async (c) => {
   const user = c.get('user');
   if (!user) return c.json({ error: 'Unauthorized' }, 401);
 
+  // Before the budget, so a busy server does not spend it.
+  if (!importSlotFree(user.id)) return importBusy(c);
+
   const rate = checkImportRate(user.id);
   if (!rate.ok) {
     c.header('Retry-After', String(rate.retryAfterSeconds));
     return c.json({ error: 'Too many import requests', retryAfter: rate.retryAfterSeconds }, 429);
   }
 
-  const row = await db
-    .select({ otelSetupAt: users.otelSetupAt })
-    .from(users)
-    .where(eq(users.id, user.id))
-    .get();
+  const answer = await withImportSlot(user.id, async () => {
+    const row = await db
+      .select({ otelSetupAt: users.otelSetupAt })
+      .from(users)
+      .where(eq(users.id, user.id))
+      .get();
 
-  try {
-    // The live set, deliberately NOT coveredDaysForRun: seeding a run's
-    // snapshot from a preview the user may never confirm would freeze a
-    // coverage set for half an hour on the strength of a question.
-    const [cutoffMs, flagCutoffMs, coverage] = await Promise.all([
-      computeImportCutoff(user.id, row?.otelSetupAt ?? null),
-      computeFlagCutoff(user.id),
-      fetchRunCoverage(user.id),
-    ]);
-    return c.json(buildImportCoverage(coverage, cutoffMs, flagCutoffMs));
-  } catch (error) {
-    console.error('[cli/import/coverage] failed:', error);
-    // The CLI falls back to its old preview on anything but a 200, so this
-    // never blocks an import.
-    return c.json({ error: 'Coverage unavailable' }, 500);
-  }
+    try {
+      // The live set, deliberately NOT coveredDaysForRun: seeding a run's
+      // snapshot from a preview the user may never confirm would freeze a
+      // coverage set for half an hour on the strength of a question.
+      const [cutoffMs, flagCutoffMs, coverage] = await Promise.all([
+        computeImportCutoff(user.id, row?.otelSetupAt ?? null),
+        computeFlagCutoff(user.id),
+        fetchRunCoverage(user.id),
+      ]);
+      return c.json(buildImportCoverage(coverage, cutoffMs, flagCutoffMs));
+    } catch (error) {
+      console.error('[cli/import/coverage] failed:', error);
+      // The CLI falls back to its old preview on anything but a 200, so this
+      // never blocks an import.
+      return c.json({ error: 'Coverage unavailable' }, 500);
+    }
+  });
+  return answer ?? importBusy(c);
 });
 
 cli.post(
@@ -969,6 +1038,12 @@ cli.post(
   async (c) => {
     const user = c.get('user');
     if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+    // Checked before the body is read, so a refused upload is never held in
+    // memory, and before the budget, so a busy server does not spend it. The
+    // slot itself is taken after the read (below): a slow upload must not hold
+    // one while ClickHouse sits idle.
+    if (!importSlotFree(user.id)) return importBusy(c);
 
     const rate = checkImportRate(user.id);
     if (!rate.ok) {
@@ -994,40 +1069,43 @@ cli.post(
       return c.json({ error: 'Too many rows in one batch', maxRows: MAX_IMPORT_ROWS }, 413);
     }
 
-    const row = await db
-      .select({ otelSetupAt: users.otelSetupAt })
-      .from(users)
-      .where(eq(users.id, user.id))
-      .get();
+    const answer = await withImportSlot(user.id, async () => {
+      const row = await db
+        .select({ otelSetupAt: users.otelSetupAt })
+        .from(users)
+        .where(eq(users.id, user.id))
+        .get();
 
-    try {
-      const [cutoffMs, flagCutoffMs, coverage] = await Promise.all([
-        computeImportCutoff(user.id, row?.otelSetupAt ?? null),
-        computeFlagCutoff(user.id),
-        coveredDaysForRun(user.id, payload.runId),
-      ]);
+      try {
+        const [cutoffMs, flagCutoffMs, coverage] = await Promise.all([
+          computeImportCutoff(user.id, row?.otelSetupAt ?? null),
+          computeFlagCutoff(user.id),
+          coveredDaysForRun(user.id, payload.runId),
+        ]);
 
-      const result = await runImport(user.id, body, {
-        cutoffMs,
-        flagCutoffMs,
-        coveredDays: coverage.days,
-        ultrathinkDays: coverage.ultrathinkDays,
-        insertEvents,
-        insertMetrics,
-      });
+        const result = await runImport(user.id, body, {
+          cutoffMs,
+          flagCutoffMs,
+          coveredDays: coverage.days,
+          ultrathinkDays: coverage.ultrathinkDays,
+          insertEvents,
+          insertMetrics,
+        });
 
 
-      console.log(
-        `[cli/import] ${user.githubUsername}: inserted ${result.inserted}, ` +
-          `covered-day ${result.skippedCoveredDay}, dup ${result.skippedDuplicate}, ` +
-          `after-cutoff ${result.skippedAfterCutoff}, ` +
-          `after-flag-cutoff ${result.skippedAfterFlagCutoff}, rejected ${result.rejected}`
-      );
-      return c.json(result);
-    } catch (error) {
-      console.error('[cli/import] failed:', error);
-      return c.json({ error: 'Import failed' }, 500);
-    }
+        console.log(
+          `[cli/import] ${user.githubUsername}: inserted ${result.inserted}, ` +
+            `covered-day ${result.skippedCoveredDay}, dup ${result.skippedDuplicate}, ` +
+            `after-cutoff ${result.skippedAfterCutoff}, ` +
+            `after-flag-cutoff ${result.skippedAfterFlagCutoff}, rejected ${result.rejected}`
+        );
+        return c.json(result);
+      } catch (error) {
+        console.error('[cli/import] failed:', error);
+        return c.json({ error: 'Import failed' }, 500);
+      }
+    });
+    return answer ?? importBusy(c);
   }
 );
 
