@@ -1008,4 +1008,134 @@ suite('every ClickHouse read resolves against 24.3', () => {
       expect(await read()).toEqual(await withFinal(read));
     });
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // The board and the profile, one number each, in a DST zone and a
+  // half-hour zone
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * The board used to put each user on their local day by shifting every row
+   * by their CURRENT UTC offset, so a row on the far side of a DST change sat
+   * an hour off — and around midnight, on the wrong day. The fixture is built
+   * to make that visible whatever today's offset is: a pair of rows a minute
+   * either side of local midnight, in winter AND in summer, where the earlier
+   * day has more flags than prompts. On the real local days each pair caps to
+   * one ultrathink; shifted by the wrong hour both rows land on one day and
+   * cap to two. And a run of 23:30 prompts straight through the March change,
+   * which only counts as consecutive days in the real zone.
+   */
+  describe('board ↔ profile parity on local days', () => {
+    const NY = 'github_ci_parity_ny';
+    const KOL = 'github_ci_parity_kol';
+    const ZONES = { [NY]: 'America/New_York', [KOL]: 'Asia/Kolkata' } as const;
+
+    const utc = (iso: string) => iso.replace('T', ' ').replace('Z', '');
+    const ago = (ms: number) => utc(new Date(Date.now() - ms).toISOString());
+    let seq = 0;
+    const prompt = (userId: string, timestamp: string): import('./clickhouse').EventRow => ({
+      timestamp,
+      user_id: userId,
+      session_id: `parity-${userId}`,
+      event_name: 'claude_code.user_prompt',
+      prompt_length: 100,
+      provenance: 'live',
+      message_uuid: `parity-${userId}-${++seq}`,
+    });
+    const flag = (userId: string, timestamp: string): import('./clickhouse').EventRow => ({
+      timestamp,
+      user_id: userId,
+      session_id: `parity-${userId}`,
+      event_name: 'clawdgg.ultrathink',
+      provenance: 'hook',
+      message_uuid: `parity-${userId}-${++seq}`,
+    });
+
+    beforeAll(async () => {
+      const events: import('./clickhouse').EventRow[] = [];
+
+      // New York. Winter: Jan 15 23:30 EST is 04:30Z on the 16th.
+      events.push(prompt(NY, '2026-01-16 04:30:00'), flag(NY, '2026-01-16 04:30:00'), flag(NY, '2026-01-16 04:30:00.001'));
+      events.push(prompt(NY, '2026-01-16 05:30:00'));
+      // Summer: Jul 10 00:30 EDT is 04:30Z; Jul 9 23:30 EDT is 03:30Z.
+      events.push(prompt(NY, '2025-07-10 04:30:00'), flag(NY, '2025-07-10 04:30:00'), flag(NY, '2025-07-10 04:30:00.001'));
+      events.push(prompt(NY, '2025-07-10 03:30:00'));
+      // 23:30 local on Mar 5…11 2026, through the change on the 8th: 04:30Z
+      // the next day while on EST, 03:30Z from the 8th on EDT.
+      for (const day of [5, 6, 7]) events.push(prompt(NY, `2026-03-${String(day + 1).padStart(2, '0')} 04:30:00`));
+      for (const day of [8, 9, 10, 11]) events.push(prompt(NY, `2026-03-${String(day + 1).padStart(2, '0')} 03:30:00`));
+
+      // Kolkata, UTC+05:30. Feb 10 23:50 IST is 18:20Z; Feb 11 00:10 is 18:40Z.
+      events.push(prompt(KOL, '2026-02-10 18:20:00'), flag(KOL, '2026-02-10 18:20:00'), flag(KOL, '2026-02-10 18:20:00.001'));
+      events.push(prompt(KOL, '2026-02-10 18:40:00'));
+      // 00:15 IST on Feb 2, 3 and 4: 18:45Z the day before.
+      for (const day of ['01', '02', '03']) events.push(prompt(KOL, `2026-02-${day} 18:45:00`));
+
+      // Both are on a current run: a prompt now and one a day ago.
+      for (const userId of [NY, KOL]) {
+        events.push(prompt(userId, ago(60_000)), prompt(userId, ago(86_400_000)));
+      }
+
+      await clickhouse.insertEvents(events);
+
+      const { db } = await import('./index');
+      const { users } = await import('./schema');
+      for (const [userId, timezone] of Object.entries(ZONES)) {
+        await db
+          .insert(users)
+          .values({
+            id: userId,
+            githubId: userId,
+            githubUsername: userId.replace(/_/g, '-'),
+            timezone,
+            // Stale on purpose: the sync recomputes both from the days, and
+            // a longest streak of 40 is a run these rows do not contain.
+            currentStreak: 0,
+            longestStreak: 40,
+            totalPrompts: 10,
+          })
+          .onConflictDoNothing();
+      }
+
+      await sync.syncClickHouseToSqlite({ force: true });
+      boards.clearBoardCaches();
+    }, 120_000);
+
+    const boardValue = async (
+      board: import('../lib/boards').BoardKey,
+      scope: import('../lib/boards').BoardScope,
+      userId: string
+    ) => {
+      const page = await boards.getBoardPage({ board, scope, limit: 100, offset: 0, viewerId: null });
+      return page.rows.find(row => row.userId === userId)?.value;
+    };
+
+    for (const [userId, expected] of [
+      // Two capped pairs (1 each) — and nothing else carries a flag.
+      [NY, { ultrathinks: 2, current: 2, best: 7 }],
+      [KOL, { ultrathinks: 1, current: 2, best: 3 }],
+    ] as const) {
+      const timezone = ZONES[userId];
+
+      it(`🌈 is the profile's count, in ${timezone}`, async () => {
+        const data = await fingerprint.getFingerprint(userId, {
+          username: userId,
+          timezone,
+          isOwner: true,
+          hidden: [],
+        });
+        expect(data.ultrathink!.count).toBe(expected.ultrathinks);
+        expect(await boardValue('ultrathinks', 'all', userId)).toBe(data.ultrathink!.count);
+      });
+
+      it(`🔥 is the profile's streak, in ${timezone}`, async () => {
+        const user = (await profileData.fetchProfileUser(userId.replace(/_/g, '-')))!;
+        expect(user.currentStreak).toBe(expected.current);
+        // Recomputed from the days, so the stale 40 is gone.
+        expect(user.longestStreak).toBe(expected.best);
+        expect(await boardValue('streak', 'current', userId)).toBe(user.currentStreak);
+        expect(await boardValue('streak', 'best', userId)).toBe(user.longestStreak);
+      });
+    }
+  });
 });

@@ -190,6 +190,42 @@ function dayNumber(date: string): number {
   return Math.floor(Date.parse(`${date.slice(0, 10)}T00:00:00Z`) / 86_400_000);
 }
 
+/**
+ * Enough days back to reach the first row anyone has.
+ *
+ * getUserActiveLocalDays takes a window in days (`today() - n`), and the
+ * streaks want all of it. The epoch, less two days of margin for a server whose
+ * today() is a day off ours: a Date in ClickHouse cannot go below 1970-01-01,
+ * and subtracting past it wraps rather than clamping.
+ */
+function lifetimeDays(now: Date): number {
+  return Math.floor(now.getTime() / 86_400_000) - 2;
+}
+
+/**
+ * A user's 🔥 current and longest streak, recomputed from every active local
+ * day they have — what users.current_streak and longest_streak hold, which the
+ * board and the profile both read.
+ *
+ * From the data alone. The longest used to keep a max with the stored value,
+ * because the days were read over 365 of them and a run older than that would
+ * have been forgotten; over the whole history there is nothing to remember,
+ * and the max was keeping runs that no longer exist in the data — counted
+ * under an older, looser day definition, or in a zone the user has since
+ * left. So a longest streak can go DOWN here, to the run the days support.
+ * The profile's streak milestone walks the same days (fetchDailySeries in
+ * src/lib/fingerprint.ts: local days with a prompt), so the two agree.
+ */
+export async function userStreaks(
+  userId: string,
+  timezone: string,
+  now: Date = new Date()
+): Promise<{ activeDates: string[]; currentStreak: number; longestStreak: number }> {
+  const activeDates = await clickhouse.getUserActiveLocalDays(userId, timezone, lifetimeDays(now));
+  // Today in the USER's zone, because the days above are in it too.
+  return { activeDates, ...calculateStreaks(activeDates, localDate(now, timezone)) };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Hourly Counts for Badges
 // ═══════════════════════════════════════════════════════════════════════════
@@ -318,7 +354,6 @@ export async function syncClickHouseToSqlite(
       .select({
         id: users.id,
         createdAt: users.createdAt,
-        currentLongestStreak: users.longestStreak,
         currentFirstSessionDate: users.firstSessionDate,
         timezone: users.timezone,
       })
@@ -337,7 +372,6 @@ export async function syncClickHouseToSqlite(
     for (const user of syncTargets) {
       const {
         id: userId,
-        currentLongestStreak: existingLongestStreak = 0,
         currentFirstSessionDate,
         timezone,
       } = user;
@@ -384,28 +418,17 @@ export async function syncClickHouseToSqlite(
 
         // Active days come from ClickHouse alone — the imported pre-OTEL days
         // are in there, so a streak that spans the OTEL transition is just a
-        // streak now, with no two sources to reconcile.
-        //
-        // getUserActiveLocalDays, not every date getUserDailyMetrics returns:
-        // that set included days with no prompt at all (a background retry, a
-        // subagent finishing) and days whose only row was an ultrathink flag,
-        // and it was in UTC, so a 23:00 prompt in Paris landed on the previous
-        // day and broke the streak of anyone who works late. One definition,
-        // shared with the profile's streak milestones — see the helper.
-        const activeDates = await clickhouse.getUserActiveLocalDays(userId, timezone, 365);
-        // Today in the USER's zone, because the days above are in it too.
-        const streaks = calculateStreaks(activeDates, localDate(new Date(), timezone));
+        // streak now, with no two sources to reconcile. See userStreaks.
+        const { activeDates, ...streaks } = await userStreaks(userId, timezone);
 
         const hourCounts = await getUserHourlyCounts(userId, timezone);
         const longestSession = await getLongestSessionMessages(userId);
         const toolCalls = await clickhouse.getUserTotalToolCalls(userId);
 
-        // longestStreak keeps a max with the stored value: a user may have
-        // history older than the 365-day window this query reads.
-        const finalLongestStreak = Math.max(streaks.longestStreak, existingLongestStreak ?? 0);
+        const finalLongestStreak = streaks.longestStreak;
 
-        // First session date: prefer the stored one (it can predate the
-        // 365-day window), else the earliest day ClickHouse knows about.
+        // First session date: prefer the stored one, else the earliest day
+        // ClickHouse knows about.
         const finalFirstSessionDate =
           currentFirstSessionDate || (activeDates.length > 0 ? [...activeDates].sort()[0] : undefined);
 

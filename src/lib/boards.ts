@@ -22,9 +22,11 @@
  * comparing the same board saw different numbers. The countdown on the page
  * says which clock it is.
  *
- * EXCEPT the class and the clock, which ARE per-user shape questions and so go
- * through each user's timezone — matching what the profile shows, down to the
- * local-month window src/lib/fingerprint.ts classifies on.
+ * EXCEPT what is about a user's own DAYS AND HOURS — the 🌈 cap (one flag per
+ * prompt per local day), the class and the clock — which go through each
+ * user's real zone, in the profile's own SQL (see perZone), so the figure on
+ * the board and the figure on that user's page are the same number around a
+ * DST change too. The window those days are cut from is still the UTC week.
  *
  * NO FIGURE THE OWNER TOOK DOWN. A user who hid a profile section is left off
  * the board that ranks on it entirely, rather than listed with a blank: a rank
@@ -36,6 +38,7 @@ import { db } from '../db';
 import { profileSettings, rankSnapshots, users, type ProfileSettings } from '../db/schema';
 import {
   CAPPED_ULTRATHINKS_SQL,
+  LOCAL_TS_SQL,
   NO_LEGACY_SQL,
   PROMPT_EVENT_SQL,
   TOTAL_TOKENS_SQL,
@@ -582,29 +585,56 @@ interface FigureRow {
 }
 
 /**
- * `timestamp` in each listed user's own wall clock, as a ClickHouse expression.
+ * One SELECT per time zone among `boardUsers`, joined with UNION ALL.
  *
- * ClickHouse `toTimeZone` needs a CONSTANT zone, so it cannot batch users who
- * live in different ones. Shifting by each user's current offset gives the same
- * local wall clock in one pass. The caveat is DST: a row on the far side of a
- * transition lands an hour off, which moves nothing that matters here — a bar
- * on a 30px clock, or a prompt at local midnight into the neighbouring day.
+ * ClickHouse `toTimeZone` needs a CONSTANT zone, so one SELECT cannot put users
+ * who live in different zones on their own local days. This used to shift each
+ * row by the user's CURRENT offset instead (a multiIf over user ids), which is
+ * the same wall clock only on the near side of a DST transition: a 23:30 prompt
+ * in New York in March, read with October's offset, landed on the next day —
+ * so the board's 🌈 cap and the 🔥 days disagreed with the profile around every
+ * change of clock. Each branch here reads its users' rows through the
+ * profile's own LOCAL_TS_SQL, with the zone as a constant parameter, so the
+ * board's local day IS the profile's local day, by construction.
  *
- * The ids go in as parameters (`param_u0`, …), never as literals: ClickHouse
- * substitutes them before parsing, which is what makes this injection-proof.
+ * Cheap because the raw tables are sorted by user_id first: a branch's IN list
+ * prunes to its users' granules, so the branches together read what one pass
+ * did. A user is in exactly one branch, so a caller can sum across them.
+ *
+ * `others` adds a last branch for every user NOT listed, on UTC days — what the
+ * old expression's default arm did, so rows of a user the sync job has not
+ * listed yet still count toward an anonymous total.
+ *
+ * The ids and zones go in as parameters (`param_u0`, `param_z0`, …), never as
+ * literals: ClickHouse substitutes them before parsing.
  */
-function localTsExpr(
+function perZone(
   boardUsers: BoardUser[],
-  now: Date
-): { expr: string; params: Record<string, string> } {
-  if (boardUsers.length === 0) return { expr: 'timestamp', params: {} };
-
+  branch: (localTs: string, who: string) => string,
+  options: { others?: boolean } = {}
+): { sql: string; params: Record<string, string> } | null {
   const params: Record<string, string> = {};
-  const branches = boardUsers.map((user, index) => {
+  const zones = new Map<string, string[]>();
+  boardUsers.forEach((user, index) => {
     params[`u${index}`] = user.userId;
-    return `user_id = {u${index}:String}, ${offsetMinutes(user.timezone, now)}`;
+    const names = zones.get(user.timezone) ?? [];
+    names.push(`{u${index}:String}`);
+    zones.set(user.timezone, names);
   });
-  return { expr: `timestamp + toIntervalMinute(multiIf(${branches.join(', ')}, 0))`, params };
+
+  const branches = [...zones.entries()].map(([timezone, names], index) => {
+    params[`z${index}`] = timezone;
+    const localTs = LOCAL_TS_SQL.replace('{tz:String}', `{z${index}:String}`);
+    return branch(localTs, `user_id IN (${names.join(', ')})`);
+  });
+
+  if (options.others) {
+    const listed = boardUsers.map((_, index) => `{u${index}:String}`);
+    branches.push(branch('timestamp', listed.length > 0 ? `user_id NOT IN (${listed.join(', ')})` : '1 = 1'));
+  }
+
+  if (branches.length === 0) return null;
+  return { sql: branches.join('\n UNION ALL \n'), params };
 }
 
 /**
@@ -628,12 +658,24 @@ async function fetchFigures(
   const window = isWeekWindow(scope)
     ? `timestamp >= toDateTime64({since:String}, 3, 'UTC')`
     : '1 = 1';
-  const local = localTsExpr(boardUsers, now);
+  const since = chTimestamp(weekStartUtc(now));
+  // Per local day first, so the ultrathink cap can be applied where it means
+  // something, then summed per user. The prompt and character totals are
+  // unaffected by the grouping — a sum of days is the same sum.
+  const days = perZone(
+    boardUsers,
+    (localTs, who) => `SELECT
+           user_id,
+           ${CAPPED_ULTRATHINKS_SQL} AS day_ultrathinks,
+           sumIf(prompt_length, ${measured}) AS day_chars,
+           countIf(${PROMPT_EVENT_SQL}) AS day_prompts
+         FROM events_raw
+         WHERE ${who} AND ${window}
+         GROUP BY user_id, toDate(${localTs})`,
+    { others: true }
+  )!;
 
   const [events, metrics] = await Promise.all([
-    // Per local day first, so the ultrathink cap can be applied where it means
-    // something, then summed per user. The prompt and character totals are
-    // unaffected by the grouping — a sum of days is the same sum.
     query<Pick<FigureRow, 'user_id' | 'ultrathinks' | 'prompt_chars' | 'prompts'>>(
       `SELECT
          user_id,
@@ -641,20 +683,10 @@ async function fetchFigures(
          toUInt64(sum(day_chars)) AS prompt_chars,
          toUInt64(sum(day_prompts)) AS prompts
        FROM (
-         SELECT
-           user_id,
-           ${CAPPED_ULTRATHINKS_SQL} AS day_ultrathinks,
-           sumIf(prompt_length, ${measured}) AS day_chars,
-           countIf(${PROMPT_EVENT_SQL}) AS day_prompts
-         FROM (
-           SELECT user_id, event_name, command_source, prompt_length, ${local.expr} AS ts_local
-           FROM events_raw
-           WHERE ${window}
-         )
-         GROUP BY user_id, toDate(ts_local)
+         ${days.sql}
        )
        GROUP BY user_id`,
-      { since: chTimestamp(weekStartUtc(now)), ...local.params }
+      { since, ...days.params }
     ),
     query<Pick<FigureRow, 'user_id' | 'tokens' | 'value_usd' | 'output_tokens'>>(
       `SELECT
@@ -679,7 +711,7 @@ async function fetchFigures(
        FROM metrics_raw
        WHERE ${window}
        GROUP BY user_id`,
-      { since: chTimestamp(weekStartUtc(now)) }
+      { since }
     ),
   ]);
 
@@ -719,40 +751,6 @@ async function fetchFigures(
 // ClickHouse: the class and the clock, for the listed page only
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * An IN list of parameters, so a user id never reaches the SQL as a literal.
- * ClickHouse substitutes parameters before parsing, which is what makes this
- * safe — `query` sends them as `param_*` on the URL.
- */
-function idParams(userIds: string[]): { list: string; params: Record<string, string> } {
-  const params: Record<string, string> = {};
-  const names = userIds.map((id, index) => {
-    params[`u${index}`] = id;
-    return `{u${index}:String}`;
-  });
-  return { list: names.join(', '), params };
-}
-
-/**
- * Each user's offset from UTC in minutes, right now.
- *
- * The per-row alternative is ClickHouse `toTimeZone`, which needs a CONSTANT
- * zone and so cannot batch users in different zones. Shifting the timestamp by
- * the offset gives the same local wall clock, with one caveat: a row on the far
- * side of a DST transition lands an hour off. That is a bar's width on a 30px
- * clock, and the class it feeds is read from a whole month of rows.
- */
-function offsetMinutes(timeZone: string, instant: Date): number {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone,
-    timeZoneName: 'longOffset',
-  }).formatToParts(instant);
-  const name = parts.find((p) => p.type === 'timeZoneName')?.value ?? 'GMT';
-  const match = /GMT([+-])(\d{2}):?(\d{2})?/.exec(name);
-  if (!match) return 0;
-  return (match[1] === '-' ? -1 : 1) * (Number(match[2]) * 60 + Number(match[3] ?? 0));
-}
-
 export interface ClassEvidence {
   hours: number[];
   prompts: number;
@@ -778,48 +776,49 @@ async function fetchClassEvidence(
   const evidence = new Map<string, ClassEvidence>();
   if (pageUsers.length === 0) return evidence;
 
-  const { list, params } = idParams(pageUsers.map((u) => u.userId));
-  // Same parameter names on both sides — idParams and localTsExpr number users
-  // identically, which is what lets one params object serve the IN list and
-  // the offsets.
-  const localTs = localTsExpr(pageUsers, now).expr;
-
+  // Each user's rows in their own zone — the profile's LOCAL_TS_SQL, branch by
+  // branch (see perZone) — so the clock and the class here are read in the
+  // same hours as on that user's page, on either side of a DST change.
+  //
   // 70 days is "this local month, whatever day it is" with room to spare, and
   // it keeps the row count at users × 24 × 3 instead of users × 24 × forever.
-  const [eventRows, valueRows] = await Promise.all([
-    query<{ user_id: string; month: string; hour: number; prompts: number; tools: number }>(
-      `SELECT
+  const eventZones = perZone(
+    pageUsers,
+    (localTs, who) => `SELECT
          user_id,
-         formatDateTime(ts_local, '%Y-%m') AS month,
-         toUInt8(toHour(ts_local)) AS hour,
+         formatDateTime(${localTs}, '%Y-%m') AS month,
+         toUInt8(toHour(${localTs})) AS hour,
          toUInt64(countIf(${PROMPT_EVENT_SQL})) AS prompts,
          toUInt64(countIf(event_name = 'claude_code.tool_result')) AS tools
-       FROM (
-         SELECT user_id, event_name, command_source, ${localTs} AS ts_local
-         FROM events_raw
-         WHERE user_id IN (${list})
-           AND ${NO_LEGACY_SQL}
-           AND timestamp >= now() - INTERVAL 70 DAY
-       )
-       GROUP BY user_id, month, hour`,
-      params
-    ),
-    query<{ user_id: string; month: string; subagent: number; attributed: number }>(
-      `SELECT
+       FROM events_raw
+       WHERE ${who}
+         AND ${NO_LEGACY_SQL}
+         AND timestamp >= now() - INTERVAL 70 DAY
+       GROUP BY user_id, month, hour`
+  )!;
+  const valueZones = perZone(
+    pageUsers,
+    (localTs, who) => `SELECT
          user_id,
-         formatDateTime(ts_local, '%Y-%m') AS month,
+         formatDateTime(${localTs}, '%Y-%m') AS month,
          toFloat64(sumIf(value, query_source = 'subagent')) AS subagent,
          toFloat64(sumIf(value, query_source != '')) AS attributed
-       FROM (
-         SELECT user_id, value, query_source, ${localTs} AS ts_local
-         FROM metrics_raw
-         WHERE user_id IN (${list})
-           AND metric_name = 'claude_code.cost.usage'
-           AND ${NO_LEGACY_SQL}
-           AND timestamp >= now() - INTERVAL 70 DAY
-       )
-       GROUP BY user_id, month`,
-      params
+       FROM metrics_raw
+       WHERE ${who}
+         AND metric_name = 'claude_code.cost.usage'
+         AND ${NO_LEGACY_SQL}
+         AND timestamp >= now() - INTERVAL 70 DAY
+       GROUP BY user_id, month`
+  )!;
+
+  const [eventRows, valueRows] = await Promise.all([
+    query<{ user_id: string; month: string; hour: number; prompts: number; tools: number }>(
+      eventZones.sql,
+      eventZones.params
+    ),
+    query<{ user_id: string; month: string; subagent: number; attributed: number }>(
+      valueZones.sql,
+      valueZones.params
     ),
   ]);
 
@@ -1389,9 +1388,20 @@ async function buildGlobalPulse(now: Date): Promise<GlobalPulse> {
   const since = chTimestamp(weekStartUtc(now));
   const window = `timestamp >= toDateTime64({since:String}, 3, 'UTC')`;
   // The strip's 🌈 total has to be the sum of the figures on the 🌈 board, so
-  // it is read through the same per-local-day cap — which needs the same
-  // per-user offsets, which is why the pulse loads the user list at all.
-  const local = localTsExpr(await loadBoardUsers(), now);
+  // it is read through the same per-local-day cap in the same zones — which is
+  // why the pulse loads the user list at all.
+  const days = perZone(
+    await loadBoardUsers(),
+    (localTs, who) => `SELECT
+           user_id,
+           ${CAPPED_ULTRATHINKS_SQL} AS day_ultrathinks,
+           countIf(${PROMPT_EVENT_SQL}) AS day_prompts
+         FROM events_raw
+         WHERE ${who} AND ${window}
+         GROUP BY user_id, toDate(${localTs})
+         HAVING day_prompts > 0`,
+    { others: true }
+  )!;
 
   try {
     const [events, value] = await Promise.all([
@@ -1422,19 +1432,9 @@ async function buildGlobalPulse(now: Date): Promise<GlobalPulse> {
          toUInt64(uniqExact(user_id)) AS devs,
          toUInt64(sum(day_ultrathinks)) AS ultrathinks
        FROM (
-         SELECT
-           user_id,
-           ${CAPPED_ULTRATHINKS_SQL} AS day_ultrathinks,
-           countIf(${PROMPT_EVENT_SQL}) AS day_prompts
-         FROM (
-           SELECT user_id, event_name, command_source, ${local.expr} AS ts_local
-           FROM events_raw
-           WHERE ${window}
-         )
-         GROUP BY user_id, toDate(ts_local)
-         HAVING day_prompts > 0
+         ${days.sql}
        )`,
-      { since, ...local.params }
+      { since, ...days.params }
     );
 
     let busiestHourUtc: number | null = null;
