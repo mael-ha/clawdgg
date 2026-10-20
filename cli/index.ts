@@ -92,6 +92,7 @@ import {
   type PreviewSplit,
   type PreviewTotals,
 } from "./import-preview";
+import { ImportAbortedError, postImportWithRetry } from "./import-upload";
 import { version } from "./version";
 
 // ANSI color codes
@@ -249,7 +250,8 @@ async function apiFetch(
   path: string,
   init: RequestInit & { token?: string } = {}
 ): Promise<Response> {
-  const { token, headers, ...rest } = init;
+  const { token, headers, signal, ...rest } = init;
+  const timeout = AbortSignal.timeout(API_TIMEOUT_MS);
   return fetch(`${API_BASE_URL}${path}`, {
     ...rest,
     headers: {
@@ -257,7 +259,7 @@ async function apiFetch(
       ...(rest.body ? { "Content-Type": "application/json" } : {}),
       ...headers,
     },
-    signal: AbortSignal.timeout(API_TIMEOUT_MS),
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
   });
 }
 
@@ -1803,33 +1805,20 @@ async function fetchImportCoverage(
 async function postImportBatch(
   token: string,
   batch: { events: unknown[]; runId: string },
-  // Where a rate-limit wait is reported. The default is a dim line; the import
-  // passes its progress bar's `note`, so the wait appears beside the bar
-  // instead of tearing it in half.
-  note: (text: string) => void = (text) => log.dim(text)
+  // Where a wait for a slot is reported. The default is a dim line; the import
+  // passes its progress bar's `status`, so the wait rides on the bar instead of
+  // tearing it in half.
+  note: (text: string) => void = (text) => log.dim(text),
+  signal?: AbortSignal
 ): Promise<ImportBatchResult> {
-  for (let attempt = 1; attempt <= 5; attempt++) {
-    const response = await apiFetch("/api/cli/import", {
-      method: "POST",
-      token,
-      body: JSON.stringify(batch),
-    });
-
-    if (response.ok) return (await response.json()) as ImportBatchResult;
-
-    // /api/* allows 60 requests a minute and a full history is more batches
-    // than that, so being throttled is expected, not an error.
-    if (response.status === 429) {
-      const retryAfter = Math.min(Number(response.headers.get("Retry-After") ?? 10) || 10, 90);
-      note(`  rate limited — waiting ${retryAfter}s`);
-      await new Promise((r) => setTimeout(r, retryAfter * 1000));
-      continue;
-    }
-
-    throw new Error(`Import rejected (HTTP ${response.status}): ${await response.text()}`);
-  }
-
-  throw new Error("Gave up after repeated rate limiting — try again later.");
+  // The server admits two imports at a time and answers the rest with a 429,
+  // so on a busy day waiting is expected, not an error (see import-upload.ts).
+  const body = JSON.stringify(batch);
+  return postImportWithRetry<ImportBatchResult>({
+    post: (attemptSignal) => apiFetch("/api/cli/import", { method: "POST", token, body, signal: attemptSignal }),
+    note,
+    signal,
+  });
 }
 
 /**
@@ -2038,18 +2027,37 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
   const batches = Math.ceil(events.length / IMPORT_BATCH_ROWS);
   const uploading = createProgress({ label: "Uploading", total: batches, unit: "batches" });
 
-  for (let i = 0; i < events.length; i += IMPORT_BATCH_ROWS) {
-    const slice = events.slice(i, i + IMPORT_BATCH_ROWS);
-    const result = await postImportBatch(token, { events: slice, runId }, uploading.note);
+  // Ctrl-C mid-upload: stop the request or wait in flight, clear the bar, and
+  // say how to pick up again, instead of dying with the bar half drawn.
+  const interrupt = new AbortController();
+  const onInterrupt = () => interrupt.abort();
+  process.once("SIGINT", onInterrupt);
 
-    totals.inserted += result.inserted;
-    totals.rejected += result.rejected;
-    totals.skippedAfterCutoff += result.skippedAfterCutoff;
-    totals.skippedCoveredDay += result.skippedCoveredDay;
-    totals.skippedDuplicate += result.skippedDuplicate;
-    for (const day of result.skippedDays ?? []) skippedDays.add(day);
+  try {
+    for (let i = 0; i < events.length; i += IMPORT_BATCH_ROWS) {
+      const slice = events.slice(i, i + IMPORT_BATCH_ROWS);
+      const result = await postImportBatch(token, { events: slice, runId }, uploading.status, interrupt.signal);
 
-    uploading.update(i / IMPORT_BATCH_ROWS + 1);
+      totals.inserted += result.inserted;
+      totals.rejected += result.rejected;
+      totals.skippedAfterCutoff += result.skippedAfterCutoff;
+      totals.skippedCoveredDay += result.skippedCoveredDay;
+      totals.skippedDuplicate += result.skippedDuplicate;
+      for (const day of result.skippedDays ?? []) skippedDays.add(day);
+
+      uploading.update(i / IMPORT_BATCH_ROWS + 1);
+    }
+  } catch (error) {
+    uploading.finish();
+    if (error instanceof ImportAbortedError) {
+      console.log();
+      log.warn("Import interrupted.");
+      log.dim("    Re-run `clawdgg setup` (or `clawdgg import`) to resume — days already uploaded are skipped.");
+      process.exit(130);
+    }
+    throw error;
+  } finally {
+    process.removeListener("SIGINT", onInterrupt);
   }
   uploading.finish();
 

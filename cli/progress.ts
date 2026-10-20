@@ -13,9 +13,12 @@
 //   off a TTY  a plain line each time another ~10% is done. No \r, no \x1b:
 //              a CI log or a `| tee` file holds exactly what it shows.
 //
-// `note()` is how a message gets out mid-bar without breaking it — the import's
-// "rate limited — waiting 30s" goes through it, which on a TTY means the bar is
-// erased, the note is printed on its own line, and the bar is redrawn under it.
+// `note()` is how a message gets out mid-bar without breaking it, which on a
+// TTY means the bar is erased, the note is printed on its own line, and the bar
+// is redrawn under it.
+// `status()` is for a message that is only true for now — "waiting for a slot
+// (5s)" — and rides on the end of the bar until the next update replaces it,
+// so ten minutes of waits are one line, not a hundred.
 
 /** ~10 redraws a second. */
 const MIN_REDRAW_MS = 100;
@@ -48,6 +51,8 @@ export interface Progress {
   update(done: number): void;
   /** Print one line beside the bar, without disturbing it. */
   note(text: string): void;
+  /** Show `text` at the end of the bar until the next update. */
+  status(text: string): void;
   /** Stop reporting: clears the bar on a TTY, completes the log off one. */
   finish(): void;
 }
@@ -85,8 +90,11 @@ export function createProgress(options: ProgressOptions): Progress {
   const isTTY = options.isTTY ?? Boolean(process.stdout.isTTY);
   const color = options.color ?? !process.env.NO_COLOR;
 
+  // The current status(), drawn after the bar on a TTY.
+  let suffix = "";
+
   const line = (done: number) => {
-    const text = renderProgressLine({ label, done, total, unit });
+    const text = `${renderProgressLine({ label, done, total, unit })}${suffix}`;
     return color ? `\x1b[2m${text}\x1b[0m` : text;
   };
 
@@ -106,6 +114,8 @@ export function createProgress(options: ProgressOptions): Progress {
   return {
     update(done: number): void {
       lastDone = done;
+      const hadStatus = suffix !== "";
+      suffix = "";
 
       if (!isTTY) {
         const tenth = total > 0 ? Math.floor((done / total) * 10) : 10;
@@ -118,8 +128,17 @@ export function createProgress(options: ProgressOptions): Progress {
       // The first and the last update always draw, whatever the throttle says:
       // the first is the one that proves the loop started, and the last is the
       // state the user is left looking at.
-      if (drawn && done < total && now() - lastDrawnAt < MIN_REDRAW_MS) return;
+      if (!hadStatus && drawn && done < total && now() - lastDrawnAt < MIN_REDRAW_MS) return;
       draw(done);
+    },
+
+    status(text: string): void {
+      if (!isTTY) {
+        write(`${text.trim()}\n`);
+        return;
+      }
+      suffix = `  ${text.trim()}`;
+      draw(lastDone);
     },
 
     note(text: string): void {
@@ -128,9 +147,9 @@ export function createProgress(options: ProgressOptions): Progress {
         return;
       }
       write(`${CLEAR_LINE}${text}\n`);
-      // Redraw at once rather than wait for the next update: a rate-limit wait
-      // is tens of seconds of nothing, and a visible bar is what says the
-      // import is waiting rather than wedged.
+      // Redraw at once rather than wait for the next update: the next one may
+      // be tens of seconds away, and a visible bar is what says the import is
+      // waiting rather than wedged.
       draw(lastDone);
     },
 

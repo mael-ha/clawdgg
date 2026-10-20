@@ -185,3 +185,26 @@ describe("color", () => {
     }
   });
 });
+
+describe("status", () => {
+  it("rides on the end of the bar on a TTY until the next update", () => {
+    const { progress, writes, tick } = harness(true, 4, { unit: "batches" });
+    progress.update(1);
+    progress.status("  waiting for a slot (5s)");
+    expect(writes.at(-1)).toBe("\r\x1b[KReading transcripts  1 / 4 batches  ▕███░░░░░░░▏ 25%  waiting for a slot (5s)");
+    progress.status("  waiting for a slot (3s)");
+    expect(writes.filter((w) => w.includes("\n"))).toHaveLength(0);
+
+    // Inside the throttle window, and still redrawn: the stale wait must go.
+    tick(1);
+    progress.update(2);
+    expect(writes.at(-1)).toBe("\r\x1b[KReading transcripts  2 / 4 batches  ▕█████░░░░░▏ 50%");
+  });
+
+  it("is a plain line off a TTY", () => {
+    const { progress, writes } = harness(false, 4);
+    progress.update(1);
+    progress.status("  waiting for a slot (5s)");
+    expect(writes.at(-1)).toBe("waiting for a slot (5s)\n");
+  });
+});
