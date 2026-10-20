@@ -13,7 +13,13 @@ import {
   parseVisibilityPatch,
   setVisibility,
 } from '../lib/profile-settings';
-import { evictPublicFingerprint, publicFingerprint } from '../lib/public-fingerprint';
+import {
+  evictPublicFingerprint,
+  publicFingerprint,
+  publicFingerprintAge,
+} from '../lib/public-fingerprint';
+import { markDirty } from '../lib/dirty';
+import { recordSnapshotAge } from '../lib/request-timing';
 import { TtlCache } from '../lib/ttl-cache';
 // Route modules, imported for one thing each: the caches a settings change has
 // to evict live next to the data they cache, not in a registry here.
@@ -302,9 +308,9 @@ api.post('/otel/enable', requireAuth, async (c) => {
 // fingerprint (src/lib/public-fingerprint.ts), the same object the profile page
 // and the share card are built from: three surfaces asking ClickHouse the same
 // thirteen questions about the same person used to be three fan-outs, and is
-// now one. Everything that cache does — a minute fresh, thirty more of stale
-// window, single-flight, the hidden list in the key, never a cached failure —
-// is documented there.
+// now one. Everything that cache does — kept until the data changes,
+// single-flight, the hidden list in the key, never a cached failure — is
+// documented there.
 //
 // What stays here is the OWNER's payload, which is a different payload: it
 // carries the sections they have taken down and their zone name. It is kept
@@ -313,15 +319,15 @@ api.post('/otel/enable', requireAuth, async (c) => {
 //
 // It never holds a failure either: `getFingerprint` throws if ClickHouse is
 // unreachable and the throw never reaches the cache, so the next request
-// retries instead of serving an empty fingerprint for a whole minute. An
-// all-zero fingerprint is indistinguishable from "this person has never used
-// Claude Code", which is the one thing it must not be able to say wrongly.
-const OWNER_FINGERPRINT_TTL_MS = 60_000;
-const OWNER_FINGERPRINT_STALE_MS = 30 * 60_000;
-const ownerFingerprintCache = new TtlCache<FingerprintData>(OWNER_FINGERPRINT_TTL_MS, 500, {
-  staleMs: OWNER_FINGERPRINT_STALE_MS,
-  name: 'owner-fingerprint',
-});
+// retries instead of serving an empty fingerprint. An all-zero fingerprint is
+// indistinguishable from "this person has never used Claude Code", which is
+// the one thing it must not be able to say wrongly.
+//
+// Like the public one it is kept until replaced: refreshOwnerFingerprint
+// rebuilds it when the owner's rows change, if they have asked for it in the
+// last day. The day of max age is a safety net for a change nobody marked.
+const OWNER_FINGERPRINT_MAX_AGE_MS = 24 * 60 * 60_000;
+const ownerFingerprintCache = new TtlCache<FingerprintData>(OWNER_FINGERPRINT_MAX_AGE_MS, 500);
 
 /**
  * The owner's key: the user, and nothing else.
@@ -335,6 +341,30 @@ const ownerFingerprintCache = new TtlCache<FingerprintData>(OWNER_FINGERPRINT_TT
  */
 function ownerFingerprintKey(userId: string): string {
   return `${userId}|owner`;
+}
+
+function buildOwnerFingerprint(row: { id: string; githubUsername: string; timezone: string }) {
+  return getFingerprint(row.id, {
+    username: row.githubUsername,
+    timezone: row.timezone,
+    isOwner: true,
+    // The owner always sees everything, including what they have hidden.
+    hidden: [],
+  });
+}
+
+/**
+ * Rebuild the owner's own fingerprint payload, if they have asked for it in
+ * the last day. For src/jobs/refresh-pages.ts, after their rows changed.
+ */
+export async function refreshOwnerFingerprint(row: {
+  id: string;
+  githubUsername: string;
+  timezone: string;
+}): Promise<void> {
+  const key = ownerFingerprintKey(row.id);
+  if (!ownerFingerprintCache.readWithin(key, OWNER_FINGERPRINT_MAX_AGE_MS)) return;
+  await ownerFingerprintCache.refresh(key, () => buildOwnerFingerprint(row));
 }
 
 api.get('/u/:username/fingerprint', optionalAuth, async (c) => {
@@ -355,15 +385,14 @@ api.get('/u/:username/fingerprint', optionalAuth, async (c) => {
 
     const data = isOwner
       ? await ownerFingerprintCache.remember(ownerFingerprintKey(row.id), () =>
-          getFingerprint(row.id, {
-            username: row.githubUsername,
-            timezone: row.timezone,
-            isOwner: true,
-            // The owner always sees everything, including what they have hidden.
-            hidden: [],
-          })
+          buildOwnerFingerprint(row)
         )
       : await publicFingerprint(row, hiddenFromOthers);
+    recordSnapshotAge(
+      (isOwner
+        ? ownerFingerprintCache.ageMs(ownerFingerprintKey(row.id))
+        : publicFingerprintAge(row.id, hiddenFromOthers)) ?? 0
+    );
 
     // `hidden` says what is missing from THIS payload; `hiddenFromOthers` says
     // what a visitor would not get. For a visitor they are the same list, and
@@ -420,6 +449,10 @@ api.put('/me/profile-settings', requireAuth, async (c) => {
   ownerFingerprintCache.deletePrefix(`${user.id}|`);
   evictProfileCaches(user.githubUsername, user.id);
   evictCardCache(user.id);
+  // And rebuilt under the new list by the refresh job, so the next visitor is
+  // not the one who pays for it. The board drops or lists them on its own:
+  // visibility is read fresh for every ranking.
+  markDirty(user.id, 'visibility');
 
   return c.json({ success: true, sections });
 });
@@ -528,6 +561,9 @@ api.put('/me/timezone', requireAuth, async (c) => {
   ownerFingerprintCache.deletePrefix(`${user.id}|`);
   evictProfileCaches(user.githubUsername, user.id);
   evictCardCache(user.id);
+  // Rebuilt in the new clock by the refresh job — the board's local days and
+  // the streaks included, which move with the zone too.
+  markDirty(user.id, 'timezone');
 
   return c.json({ success: true, timezone });
 });

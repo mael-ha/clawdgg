@@ -32,6 +32,7 @@ import { getModelPricing, type PricingMatchQuality } from '../lib/pricing';
 import { DEFAULT_TIMEZONE, normalizeTimezone } from '../lib/timezone';
 import { ULTRATHINK_EVENT_NAME } from '../lib/ultrathink';
 import { recordClickhouse } from '../lib/request-timing';
+import { markDirty } from '../lib/dirty';
 
 const CLICKHOUSE_URL = process.env.CLICKHOUSE_URL || 'http://localhost:8123';
 const CLICKHOUSE_DATABASE = process.env.CLICKHOUSE_DATABASE || 'clawd';
@@ -335,6 +336,13 @@ export async function insert(table: string, rows: Record<string, any>[]): Promis
     const errorText = await response.text();
     console.error('[ClickHouse] Insert failed:', { table, rows: rows.length, error: errorText });
     throw new Error('Database insert failed');
+  }
+
+  // Every page built from these users' rows is now out of date — including
+  // after a 200 for a retried batch the server dropped, which costs one
+  // rebuild and is never wrong in the other direction. See src/lib/dirty.ts.
+  for (const userId of new Set(rows.map(row => row.user_id))) {
+    if (typeof userId === 'string') markDirty(userId, table);
   }
 }
 

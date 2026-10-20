@@ -58,6 +58,7 @@ import { localMonth, normalizeTimezone } from './timezone';
 import { rankChange, utcDay } from './rank-snapshots';
 import { visibilityOf, type Visibility } from './profile-settings';
 import { TtlCache } from './ttl-cache';
+import { recordSnapshotAge } from './request-timing';
 
 type AppDb = typeof db;
 
@@ -1152,14 +1153,14 @@ export function clampBoardOffset(raw: number, total: number): number {
  * current UTC week and all time (which the 🔥 board's two lifetime scopes read
  * too) — so every tab in a window is a hit once one of them has been opened.
  *
- * STALE-WHILE-REVALIDATE. Fresh for 60 s — the board's freshness target. After
- * that the last figures are still served while one rebuild runs behind them,
- * so a visitor only ever waits on a scan when there is nothing at all to show:
- * the first view after a restart, and the first view of a new week. Refreshed
- * by traffic rather than by a timer, deliberately: a timer would put two full
- * scans a minute back onto an idle server, which is the load this exists to
- * remove. The stale window bounds how old a page can be for the first visitor
- * after a long quiet spell; the one after them sees the rebuild.
+ * KEPT UNTIL REPLACED. A figure only moves when a row arrives, so nothing here
+ * expires on a timer: src/jobs/refresh-pages.ts calls refreshBoardFigures
+ * when users' rows have changed, at most once a minute however many of them
+ * did, and the board serves the previous figures until the new ones land. An
+ * idle server therefore runs no scan at all. A visitor waits on one only when
+ * there is nothing to show — the first view after a restart, and the first
+ * view of a new week, whose key is new. The day of max age is a safety net
+ * for a change nobody marked.
  *
  * What the figures cannot carry is anything SQLite owns: the user list, their
  * visibility and their 🔥 streaks are read fresh for every ranking (one SQLite
@@ -1168,13 +1169,9 @@ export function clampBoardOffset(raw: number, total: number): number {
  */
 type FigureWindow = 'week' | 'all';
 
-const FIGURES_TTL_MS = 60_000;
-const FIGURES_STALE_MS = 6 * 60 * 60_000;
+const FIGURES_MAX_AGE_MS = 24 * 60 * 60_000;
 
-const figuresCache = new TtlCache<Map<string, BoardFigures>>(FIGURES_TTL_MS, 4, {
-  staleMs: FIGURES_STALE_MS,
-  name: 'board-figures',
-});
+const figuresCache = new TtlCache<Map<string, BoardFigures>>(FIGURES_MAX_AGE_MS, 4);
 
 function figureWindow(scope: BoardScope): FigureWindow {
   return isWeekWindow(scope) ? 'week' : 'all';
@@ -1194,9 +1191,10 @@ async function getFigures(
   now: Date
 ): Promise<Map<string, BoardFigures>> {
   const window = figureWindow(scope);
-  return figuresCache.remember(figuresKey(window, now), () =>
-    fetchFigures(window, boardUsers, now)
-  );
+  const key = figuresKey(window, now);
+  const figures = await figuresCache.remember(key, () => fetchFigures(window, boardUsers, now));
+  recordSnapshotAge(figuresCache.ageMs(key) ?? 0);
+  return figures;
 }
 
 /**
@@ -1205,13 +1203,9 @@ async function getFigures(
  * It does not depend on the board or the scope — it is each user's current
  * local month — so a per-page fetch was two ClickHouse queries on every tab
  * switch for the same 25 people read a different way. Built for the whole list
- * at once instead, in the same two queries, under the same SWR policy as the
- * figures.
+ * at once instead, in the same two queries, and replaced with the figures.
  */
-const evidenceCache = new TtlCache<Map<string, ClassEvidence>>(FIGURES_TTL_MS, 2, {
-  staleMs: FIGURES_STALE_MS,
-  name: 'board-evidence',
-});
+const evidenceCache = new TtlCache<Map<string, ClassEvidence>>(FIGURES_MAX_AGE_MS, 2);
 
 function getClassEvidence(boardUsers: BoardUser[], now: Date): Promise<Map<string, ClassEvidence>> {
   return evidenceCache.remember('all', () => fetchClassEvidence(boardUsers, now));
@@ -1231,13 +1225,44 @@ interface BoardRanking {
  * The DECORATED page — the ranking's slice plus each row's clock, class and
  * arrow. Per (board, scope, limit, offset), because the slice is per page; a
  * miss is SQLite only (the arrows), everything from ClickHouse being cached
- * above.
+ * above. A minute, for what SQLite owns, and dropped whenever the figures
+ * under it are replaced.
  */
 const boardCache = new TtlCache<BoardPage>(60_000, 200);
-const pulseCache = new TtlCache<GlobalPulse>(FIGURES_TTL_MS, 8, {
-  staleMs: FIGURES_STALE_MS,
-  name: 'board-pulse',
-});
+const pulseCache = new TtlCache<GlobalPulse>(FIGURES_MAX_AGE_MS, 8);
+
+/** How long after its last read a board figure is still kept current. */
+const BOARD_READ_MS = 24 * 60 * 60_000;
+
+/**
+ * Rebuild every board figure that is cached — both windows, the class evidence
+ * and the pulse — and wait for it. For src/jobs/refresh-pages.ts, which calls
+ * it after users' rows changed and decides how often.
+ *
+ * Only what somebody has read in the last day: a window nobody has opened
+ * since the restart is built by its first visitor, as before, and one nobody
+ * has opened for a day is left to expire rather than rescanned every minute
+ * for no reader. Sequential, like everything the job does, so it is never
+ * more than one scan deep in the read limiter. A failure leaves the previous
+ * figures serving.
+ */
+export async function refreshBoardFigures(now: Date = new Date()): Promise<void> {
+  const boardUsers = await loadBoardUsers();
+
+  for (const window of ['all', 'week'] as const) {
+    const key = figuresKey(window, now);
+    if (!figuresCache.readWithin(key, BOARD_READ_MS)) continue;
+    await figuresCache.refresh(key, () => fetchFigures(window, boardUsers, now));
+  }
+  if (evidenceCache.readWithin('all', BOARD_READ_MS)) {
+    await evidenceCache.refresh('all', () => fetchClassEvidence(boardUsers, now));
+  }
+  const pulseKey = utcDay(weekStartUtc(now));
+  if (pulseCache.readWithin(pulseKey, BOARD_READ_MS)) {
+    await pulseCache.refresh(pulseKey, () => buildGlobalPulse(now), (pulse) => pulse.complete);
+  }
+  boardCache.clear();
+}
 
 /** Drop every board cache. For tests, which compare one build with another. */
 export function clearBoardCaches(): void {

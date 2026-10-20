@@ -8,6 +8,8 @@ import {
 import { hiddenSections, settingsFor, visibilityOf } from '../lib/profile-settings';
 import { publicFingerprint } from '../lib/public-fingerprint';
 import { TtlCache } from '../lib/ttl-cache';
+import { isDirty, refreshNow } from '../lib/dirty';
+import { recordSnapshotAge } from '../lib/request-timing';
 import type { Island } from '../lib/assets';
 import type { SessionUser } from '../types';
 import {
@@ -47,12 +49,14 @@ import type { ContributionDay } from '../components/profile/geometry';
  * Three routes, and the division between them is what a reader notices going
  * stale:
  *
- *   GET /u/:username         the page. Cached for a minute, because the
- *                            fingerprint, the year and the plan are rollups
- *                            and a minute of a 365-day aggregate is invisible.
- *                            The owner's today and pipeline panels are fetched
- *                            OUTSIDE that cache on every request — the whole
- *                            point of "today" is that it just moved.
+ *   GET /u/:username         the page. Cached until the user's data changes,
+ *                            then rebuilt behind the reader by
+ *                            src/jobs/refresh-pages.ts — the fingerprint, the
+ *                            year and the plan are rollups that only move when
+ *                            a row arrives. The owner's today and pipeline
+ *                            panels are fetched OUTSIDE that cache on every
+ *                            request — the whole point of "today" is that it
+ *                            just moved.
  *   GET /u/:username/curve   the activity chart's data, per interaction.
  *                            PUBLIC, and it honours the owner's toggle.
  *   GET /u/:username/card.png  mounted separately — see src/routes/og.ts.
@@ -87,38 +91,35 @@ interface ProfilePayload {
   /**
    * False when a query behind this payload failed. The cache refuses to keep a
    * payload built during an outage, so the next request retries instead of
-   * serving a half-empty page for the rest of the minute.
+   * serving a half-empty page until the next change.
    */
   complete: boolean;
 }
 
 /**
- * A minute of the page, keyed by username, by whether the viewer owns it, AND
- * by the hidden sections it was built under.
+ * The page, keyed by username, by whether the viewer owns it, AND by the
+ * hidden sections it was built under.
  *
  * The owner's payload is a DIFFERENT payload — it contains the sections they
  * have hidden — so it cannot share a key with the public one. The hidden list
  * is in the key for the reason documented at the fingerprint cache in
  * src/routes/api.ts: eviction alone loses the race against a build that was
  * already in flight when the toggle was saved, and that build would re-cache
- * the pre-toggle payload under the same key for the rest of the minute.
+ * the pre-toggle payload under the same key.
  *
- * Then THIRTY MINUTES of stale window behind that minute, because the minute
- * was only ever about how old a 365-day rollup may be — it was never a claim
- * that rebuilding is cheap. It is not: the heaviest profile is ~23 `… FINAL`
- * reads over ~1.8M rows through a 4-permit limiter, 12.6 s cold. Inside the
- * window a reader gets the last build at once and a rebuild runs behind them,
- * so the minute still bounds how stale the page gets while nobody waits for
- * the fan-out. Beyond it the caller waits, as before. An eviction is still a
- * hard miss — TtlCache.delete drops the stale value and invalidates a build in
- * flight — so a hidden section is never served from the window.
+ * KEPT UNTIL REPLACED. The heaviest profile is 17 ClickHouse reads over its
+ * owner's whole history, 2.3 s cold; it changes only when a row arrives, and
+ * then refreshProfilePages rebuilds it behind the reader (see
+ * src/jobs/refresh-pages.ts). The day is a safety net for a change nobody
+ * marked, the 1,000 entries are 500 users' public and own views. An eviction
+ * is still a hard miss — TtlCache.delete drops the value and invalidates a
+ * build in flight — so a hidden section is never served after the toggle.
  */
-const PAGE_TTL_MS = 60_000;
-const PAGE_STALE_MS = 30 * 60_000;
-const pageCache = new TtlCache<ProfilePayload>(PAGE_TTL_MS, 500, {
-  staleMs: PAGE_STALE_MS,
-  name: 'profile',
-});
+const PAGE_MAX_AGE_MS = 24 * 60 * 60_000;
+const pageCache = new TtlCache<ProfilePayload>(PAGE_MAX_AGE_MS, 1_000);
+
+/** How long an owner's own payload is kept current after they last looked at it. */
+const OWNER_VIEW_MS = 24 * 60 * 60_000;
 
 /**
  * A minute of each curve, keyed by user, view AND hidden sections.
@@ -127,7 +128,8 @@ const pageCache = new TtlCache<ProfilePayload>(PAGE_TTL_MS, 500, {
  * metrics × four ranges × three granularities — sixty URLs per profile that
  * each used to cost a full scan however often they were asked for. A throw is
  * never cached (TtlCache only remembers what resolves), so an outage is
- * retried rather than pinned for the minute.
+ * retried rather than pinned for the minute. A user's curves are dropped when
+ * their pages are refreshed, so the one inside a rebuilt payload is current.
  */
 const curveCache = new TtlCache<CurveView>(60_000, 1_000);
 
@@ -147,9 +149,9 @@ export function evictProfileCaches(username: string, userId: string): void {
 }
 
 /**
- * The page cache's key. One function, because the route and the warmer below
- * both have to name it and a warmed entry under a key nobody reads is a second
- * cache pretending to be this one.
+ * The page cache's key. One function, because the route and the refresh below
+ * both have to name it and a rebuilt entry under a key nobody reads is a
+ * second cache pretending to be this one.
  */
 function pageKey(
   username: string,
@@ -160,28 +162,38 @@ function pageKey(
 }
 
 /**
- * Rebuild one user's PUBLIC payload now, through the route's own build and key.
+ * Rebuild one user's page payloads now, through the route's own build and
+ * keys. For src/jobs/refresh-pages.ts, which calls it after the user's rows
+ * changed, with `user` read after its streaks were brought up to date.
  *
- * For src/lib/warm.ts. `refresh` and not `remember` on purpose: the warmer
- * walks users one at a time so it never holds more than its share of the read
- * limiter, and `remember` on a stale entry returns immediately with a rebuild
- * in the background — which would put every user's fan-out in flight at once.
+ * The PUBLIC view always — that is what keeps a profile warm for its next
+ * visitor. The OWNER's only if they have looked at it in the last day: it is
+ * a second fan-out, and nobody else ever reads it.
  *
- * The PUBLIC view only. The owner's payload carries the sections they have
- * hidden, and nothing but their own request should ever cause one to be built.
- *
- * The fingerprint inside it is the shared one, so when the warmer refreshes
- * that first this rebuild only costs the year, the curve and the plan.
+ * The fingerprint inside the public payload is the shared one, which the job
+ * refreshes first, so this rebuild only costs the year, the curve and the plan.
  */
-export async function warmProfilePayload(user: ProfileUser): Promise<void> {
+export async function refreshProfilePages(user: ProfileUser): Promise<void> {
   const settings = await settingsFor(user.id);
+  const visibility = visibilityOf(settings);
   const hiddenFromOthers = hiddenSections(settings);
+
+  curveCache.deletePrefix(`${user.id}|`);
 
   await pageCache.refresh(
     pageKey(user.githubUsername, false, hiddenFromOthers),
-    () => buildPayload(user, false, visibilityOf(settings), hiddenFromOthers),
+    () => buildPayload(user, false, visibility, hiddenFromOthers),
     (built) => built.complete
   );
+
+  const own = pageKey(user.githubUsername, true, hiddenFromOthers);
+  if (pageCache.readWithin(own, OWNER_VIEW_MS)) {
+    await pageCache.refresh(
+      own,
+      () => buildPayload(user, true, visibility, hiddenFromOthers),
+      (built) => built.complete
+    );
+  }
 }
 
 async function buildPayload(
@@ -332,7 +344,7 @@ app.get('/:username', async (c) => {
 
   // Outside the cache on purpose: a 404 is one indexed lookup, and a new
   // signup should not have to wait out a TTL to exist.
-  const user = await fetchProfileUser(username);
+  let user = await fetchProfileUser(username);
 
   if (!user) {
     return c.html(
@@ -353,6 +365,20 @@ app.get('/:username', async (c) => {
   const asVisitor = c.req.query('as') === 'visitor';
   const isOwner = currentUser?.githubUsername === user.githubUsername && !asVisitor;
 
+  // Read-your-writes: an owner whose rows have changed since their pages were
+  // built gets them rebuilt before this response, joined with the refresh job
+  // if it is already on them — nobody should watch their own numbers lag. The
+  // user is read again after, because the rebuild brings their streaks up to
+  // date in SQLite and a miss below builds from this row.
+  if (isOwner && isDirty(user.id)) {
+    try {
+      await refreshNow(user.id);
+      user = (await fetchProfileUser(username)) ?? user;
+    } catch (error) {
+      console.error(`[profile] ${username}: read-your-writes refresh failed:`, error);
+    }
+  }
+
   // Read OUTSIDE the cache, because the hidden list is part of the key: a
   // payload built under one set of toggles must never be served under another.
   const settings = await settingsFor(user.id);
@@ -360,12 +386,15 @@ app.get('/:username', async (c) => {
   const hiddenFromOthers = hiddenSections(settings);
 
   let payload: ProfilePayload;
+  const key = pageKey(user.githubUsername, isOwner, hiddenFromOthers);
   try {
+    const profileUser = user;
     payload = await pageCache.remember(
-      pageKey(user.githubUsername, isOwner, hiddenFromOthers),
-      () => buildPayload(user, isOwner, visibility, hiddenFromOthers),
+      key,
+      () => buildPayload(profileUser, isOwner, visibility, hiddenFromOthers),
       (built) => built.complete
     );
+    recordSnapshotAge(pageCache.ageMs(key) ?? 0);
   } catch (error) {
     console.error(`[profile] ${username}:`, error);
     return c.html(

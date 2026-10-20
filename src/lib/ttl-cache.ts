@@ -1,50 +1,51 @@
 /**
- * In-process TTL cache with single-flight and an optional stale window.
+ * In-process cache with a max age, an LRU bound and single-flight builds.
  *
- * Three jobs: keep a hot profile from re-running its query fan-out on every
- * request, keep N concurrent requests for the same cold key from running it N
- * times (the second caller awaits the first caller's promise), and — where a
- * `staleMs` is given — keep the ONE request that arrives after the TTL from
- * paying for the rebuild.
+ * Two jobs: keep a hot payload from re-running its query fan-out on every
+ * request, and keep N concurrent requests for the same cold key from running
+ * it N times (the second caller awaits the first caller's promise).
  *
- * STALE-WHILE-REVALIDATE. An entry has two deadlines. Until `expiresAt` it is
- * fresh and served as-is. Between `expiresAt` and `staleUntil` it is served
- * anyway, and the first caller to see it that way kicks off a rebuild behind
- * it — one per key, so a stale entry under load does not become N builds.
- * Past `staleUntil` it is gone and the caller waits, still single-flighted.
+ * THE MAX AGE IS EITHER A TTL OR A SAFETY NET, and the caller decides which.
+ * A curve or a board slice is cached for a minute and then rebuilt by
+ * whoever asks next. The profile surfaces are not: they are REPLACED when the
+ * data under them changes (src/jobs/refresh-pages.ts, through `refresh`), so
+ * their max age is a day — there only so a change that was somehow never
+ * marked cannot be served for ever.
  *
- * That is the whole fix for the cold profile: /u/mael-ha is ~23 `… FINAL`
- * reads over ~1.8M rows through a 4-permit limiter (src/db/clickhouse.ts), so
- * a miss costs 12 s. With a stale window the miss happens to a background
- * task, and the reader gets last build's page in 0.17 s.
+ * LEAST RECENTLY USED GOES FIRST once the cache is over its entry budget: a
+ * read moves an entry to the back of the Map, and eviction walks from the
+ * front. A refresh is not a read — a payload nobody looks at must not be kept
+ * alive by the job that keeps it current.
  *
- * A REBUILD THAT FAILS CHANGES NOTHING. The stale entry stays, the failure is
- * logged, and the next caller inside the window kicks another rebuild. Nothing
- * here ever caches a rejection — the whole point of the stale window is that a
- * ClickHouse outage degrades to "a few minutes old" rather than to a 503.
+ * `readWithin` says whether anyone has actually READ a key lately, which is
+ * how the refresh job decides that a payload is still worth rebuilding (the
+ * owner's own view, the share card). `ageMs` is how old the value being served
+ * is, for the Server-Timing header.
+ *
+ * NOTHING HERE EVER CACHES A REJECTION, and a rebuild that fails or comes back
+ * degraded (`shouldCache` false) leaves the previous entry where it was: a
+ * ClickHouse outage degrades to "a little old", not to a 503.
  *
  * EVICTION BEATS A REBUILD THAT IS ALREADY IN FLIGHT. `delete`/`deletePrefix`/
  * `clear` mark every matching in-flight build invalidated, and an invalidated
  * build does not write its value back. Without that, a build that started
  * before an owner hid a section finishes after the eviction and re-caches the
  * pre-toggle payload under the same key — serving the figure they just took
- * down for the rest of the window. The hidden list being part of the key is
- * the other half of that guard (see src/routes/api.ts); this half is what
- * makes an eviction a hard miss even for the key that is being rebuilt.
+ * down until the next change. The hidden list being part of the key is the
+ * other half of that guard (see src/routes/api.ts); this half is what makes an
+ * eviction a hard miss even for the key that is being rebuilt.
  *
  * In-process means per server instance and lost on restart. That is fine for
- * what it holds — a page payload that is a few minutes stale at worst — and
- * it is deliberately not a correctness mechanism: nothing writes through it.
+ * what it holds, and it is deliberately not a correctness mechanism: nothing
+ * writes through it.
  */
-
-import { untimed } from './request-timing';
 
 interface Entry<T> {
   value: T;
-  /** Served as-is until here. */
-  expiresAt: number;
-  /** Served stale, with a rebuild behind it, until here. Then it is gone. */
-  staleUntil: number;
+  /** When this value was built. Past `storedAt + maxAge` it is gone. */
+  storedAt: number;
+  /** When a caller last read it. 0 if nobody has since it was first built. */
+  readAt: number;
 }
 
 interface Flight<T> {
@@ -53,28 +54,14 @@ interface Flight<T> {
   invalidated: boolean;
 }
 
-export interface TtlCacheOptions {
-  /**
-   * How long past the TTL an entry may still be served while it is rebuilt.
-   * 0 (the default) is the plain TTL cache: past `ttlMs` the caller waits.
-   */
-  staleMs?: number;
-  /** Prefix for the one log line a failed background rebuild writes. */
-  name?: string;
-}
-
 export class TtlCache<T> {
-  readonly #ttlMs: number;
-  readonly #staleMs: number;
-  readonly #name: string;
+  readonly #maxAgeMs: number;
   readonly #maxEntries: number;
   readonly #entries = new Map<string, Entry<T>>();
   readonly #inFlight = new Map<string, Flight<T>>();
 
-  constructor(ttlMs: number, maxEntries = 500, options: TtlCacheOptions = {}) {
-    this.#ttlMs = ttlMs;
-    this.#staleMs = options.staleMs ?? 0;
-    this.#name = options.name ?? 'cache';
+  constructor(maxAgeMs: number, maxEntries = 500) {
+    this.#maxAgeMs = maxAgeMs;
     this.#maxEntries = maxEntries;
   }
 
@@ -82,86 +69,64 @@ export class TtlCache<T> {
     return this.#entries.size;
   }
 
-  /**
-   * The FRESH value, or undefined.
-   *
-   * A stale entry answers undefined here and is left in place: `get` is what
-   * callers use to ask "is this current", and dropping the entry would throw
-   * away the value `remember` is about to serve while it rebuilds.
-   */
+  /** The cached value, or undefined. A read: it counts as a use. */
   get(key: string): T | undefined {
-    const entry = this.#entries.get(key);
-    if (!entry) return undefined;
-    const now = Date.now();
-    if (entry.staleUntil <= now) {
-      this.#entries.delete(key);
-      return undefined;
-    }
-    if (entry.expiresAt <= now) return undefined;
-    return entry.value;
+    return this.#read(key, Date.now())?.value;
   }
 
   set(key: string, value: T): void {
-    // Re-insert so the Map's insertion order stays the eviction order.
-    this.#entries.delete(key);
-    const now = Date.now();
-    this.#entries.set(key, {
-      value,
-      expiresAt: now + this.#ttlMs,
-      staleUntil: now + this.#ttlMs + this.#staleMs,
-    });
+    // Replacing a value keeps its place in the LRU order — Map.set on a key
+    // that is already there does not move it — and the record of who last
+    // read it: a rebuild is not a use.
+    const previous = this.#entries.get(key);
+    this.#entries.set(key, { value, storedAt: Date.now(), readAt: previous?.readAt ?? 0 });
     this.#evict();
   }
 
+  /** How old the value under `key` is, or undefined if there is none. */
+  ageMs(key: string): number | undefined {
+    const entry = this.#live(key, Date.now());
+    return entry ? Date.now() - entry.storedAt : undefined;
+  }
+
+  /** True if `key` holds a value and somebody read it in the last `ms`. */
+  readWithin(key: string, ms: number): boolean {
+    const now = Date.now();
+    const entry = this.#live(key, now);
+    return entry !== undefined && entry.readAt > 0 && now - entry.readAt <= ms;
+  }
+
   /**
-   * Cached value, a stale value with a rebuild behind it, the in-flight build
-   * for this key, or a fresh build.
+   * Cached value, the in-flight build for this key, or a fresh build.
    *
    * `shouldCache` decides whether the built value is worth keeping. Without it
    * a build that degraded — a page assembled while ClickHouse was unreachable,
-   * say — gets pinned for the full TTL, so one failed query turns into a minute
-   * of everyone seeing an empty panel. Returning false still serves the value
-   * to this caller and still shares it with the callers already waiting behind
-   * the single-flight; it just isn't remembered, so the next request retries —
-   * and it leaves any stale entry alone, so a degraded rebuild keeps serving
-   * the last good build rather than replacing it.
+   * say — gets pinned, so one failed query turns into everyone seeing an empty
+   * panel. Returning false still serves the value to this caller and still
+   * shares it with the callers already waiting behind the single-flight; it
+   * just isn't remembered, so the next request retries.
    */
   async remember(
     key: string,
     build: () => Promise<T>,
     shouldCache?: (value: T) => boolean
   ): Promise<T> {
-    const entry = this.#entries.get(key);
     const now = Date.now();
+    const entry = this.#read(key, now);
+    if (entry) return entry.value;
 
-    if (entry && entry.expiresAt > now) return entry.value;
-
-    if (entry && entry.staleUntil > now) {
-      // One rebuild per key, and this caller does not wait for it.
-      // Untimed: nobody is waiting on it, so it is not this request's time.
-      if (!this.#inFlight.has(key)) {
-        untimed(() => this.#build(key, build, shouldCache)).catch((error) => {
-          console.error(`[${this.#name}] background rebuild of ${key} failed:`, error);
-        });
-      }
-      return entry.value;
-    }
-
-    if (entry) this.#entries.delete(key);
-
-    const pending = this.#inFlight.get(key);
-    if (pending) return pending.promise;
-
-    return this.#build(key, build, shouldCache);
+    const value = await (this.#inFlight.get(key)?.promise ?? this.#build(key, build, shouldCache));
+    const built = this.#entries.get(key);
+    if (built) built.readAt = Date.now();
+    return value;
   }
 
   /**
    * Rebuild now and wait for it, joining a build already in flight.
    *
-   * What the warmer calls (src/lib/warm.ts). `remember` is wrong for it: on a
-   * stale entry `remember` kicks a background rebuild and returns at once, so a
-   * warmer walking users one at a time would have every user's fan-out in the
-   * server simultaneously — the opposite of sequential.
+   * What the refresh job calls (src/jobs/refresh-pages.ts): the entry it
+   * replaces keeps serving until the new value lands, and is left alone if the
+   * build throws or comes back degraded.
    */
   refresh(
     key: string,
@@ -175,11 +140,11 @@ export class TtlCache<T> {
 
   /**
    * Forget one key, for when the thing it caches has just been changed by the
-   * person looking at it. Without it a 60-second cache makes a settings toggle
-   * look broken for a minute — which reads as "it didn't save".
+   * person looking at it — a settings toggle has to be visible at once, or it
+   * reads as "it didn't save".
    *
-   * Hard: the stale value goes too, and a build in flight for this key is
-   * invalidated rather than left to re-insert what was just evicted.
+   * Hard: a build in flight for this key is invalidated rather than left to
+   * re-insert what was just evicted.
    */
   delete(key: string): void {
     this.#entries.delete(key);
@@ -209,6 +174,27 @@ export class TtlCache<T> {
     for (const flight of this.#inFlight.values()) flight.invalidated = true;
   }
 
+  /** The live entry, without counting it as a use. Drops an expired one. */
+  #live(key: string, now: number): Entry<T> | undefined {
+    const entry = this.#entries.get(key);
+    if (!entry) return undefined;
+    if (entry.storedAt + this.#maxAgeMs <= now) {
+      this.#entries.delete(key);
+      return undefined;
+    }
+    return entry;
+  }
+
+  /** The live entry, counted as a use: moved to the back of the LRU order. */
+  #read(key: string, now: number): Entry<T> | undefined {
+    const entry = this.#live(key, now);
+    if (!entry) return undefined;
+    entry.readAt = now;
+    this.#entries.delete(key);
+    this.#entries.set(key, entry);
+    return entry;
+  }
+
   #build(
     key: string,
     build: () => Promise<T>,
@@ -236,9 +222,9 @@ export class TtlCache<T> {
     if (this.#entries.size <= this.#maxEntries) return;
     const now = Date.now();
     for (const [key, entry] of this.#entries) {
-      if (entry.staleUntil <= now) this.#entries.delete(key);
+      if (entry.storedAt + this.#maxAgeMs <= now) this.#entries.delete(key);
     }
-    // Still over budget: drop oldest-inserted first.
+    // Still over budget: least recently used first.
     for (const key of this.#entries.keys()) {
       if (this.#entries.size <= this.#maxEntries) break;
       this.#entries.delete(key);

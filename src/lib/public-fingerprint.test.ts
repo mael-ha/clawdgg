@@ -24,7 +24,7 @@ import {
  * measured here and the comparisons are made against it.
  */
 
-const USER = { id: 'github_warm', githubUsername: 'warm', timezone: 'Europe/Paris' };
+const USER = { id: 'github_shared', githubUsername: 'shared', timezone: 'Europe/Paris' };
 
 const tick = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -123,15 +123,15 @@ describe('one public fingerprint for all three surfaces', () => {
     );
     expect(publicFingerprintBuilds() - before).toBe(1);
 
-    // And the warmer's refresh plus the two surfaces that read it afterwards:
+    // And the refresh job's rebuild plus the two surfaces that read it after:
     // one more build in total, not three.
-    const warmed = publicFingerprintBuilds();
+    const refreshed = publicFingerprintBuilds();
     await capture(async () => {
       await refreshPublicFingerprint(USER, []);
       await publicFingerprint(USER, []);
       await publicFingerprint(USER, []);
     });
-    expect(publicFingerprintBuilds() - warmed).toBe(1);
+    expect(publicFingerprintBuilds() - refreshed).toBe(1);
   });
 
   it('keys by the hidden list, so two filtered payloads are two entries', async () => {

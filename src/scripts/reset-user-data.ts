@@ -89,6 +89,12 @@ async function resetUserData(username: string, apply: boolean): Promise<void> {
     await query(`ALTER TABLE ${table} MODIFY SETTING non_replicated_deduplication_window = 10000`);
   }
 
+  // The server's pages for this user are now built from rows that are gone,
+  // and nothing here can tell it: this is its own process, and the dirty marks
+  // (src/lib/dirty.ts) live in the server's memory. The server's sync job sees
+  // the user's rows vanish on its next pass — five minutes at most — and marks
+  // them there (see the watermark loop in src/jobs/sync-clickhouse.ts).
+
   await db
     .update(users)
     .set({
@@ -127,6 +133,8 @@ async function resetUserData(username: string, apply: boolean): Promise<void> {
   console.log('  2. use Claude Code  — rows arrive over OTLP as provenance=live');
   console.log('  3. `clawdgg import` — loads local history up to that cutoff');
   console.log('  4. the sync job (or POST /api/admin/sync) refreshes users.total_*');
+  console.log('');
+  console.log("The server's cached pages for this user rebuild on its next sync pass (≤5 min).");
 }
 
 const username = process.argv[2];

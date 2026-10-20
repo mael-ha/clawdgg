@@ -16,7 +16,7 @@ import { pageRateLimit, rateLimit } from './lib/rate-limit';
 import { optionalAuth } from './lib/auth-middleware';
 import { serverTiming } from './lib/request-timing';
 import { startSyncJob, stopSyncJob } from './jobs/sync-clickhouse';
-import { startWarmJob, stopWarmJob } from './lib/warm';
+import { startRefreshJob, stopRefreshJob } from './jobs/refresh-pages';
 import { healthCheck as clickhouseHealthCheck } from './db/clickhouse';
 
 // Create the main Hono app
@@ -131,9 +131,10 @@ console.log(`Server running at http://localhost:${port}`);
     if (clickhouseHealthy) {
       console.log('[startup] ClickHouse is available, starting sync job');
       startSyncJob();
-      // Only with ClickHouse up: every build the warmer runs is a ClickHouse
+      // Rebuilds a user's pages when their rows change, and does nothing
+      // otherwise. Only with ClickHouse up: every rebuild is a ClickHouse
       // fan-out, so without it the job is a cycle of logged failures.
-      startWarmJob();
+      startRefreshJob();
     } else {
       console.log('[startup] ClickHouse not available, sync job disabled');
       console.log('[startup] To enable: docker compose -f docker-compose.dev.yml up -d');
@@ -149,7 +150,7 @@ console.log(`Server running at http://localhost:${port}`);
 async function gracefulShutdown(signal: string) {
   console.log(`[shutdown] Received ${signal}, shutting down gracefully...`);
   stopSyncJob();
-  stopWarmJob();
+  stopRefreshJob();
   console.log('[shutdown] Shutdown complete');
   process.exit(0);
 }

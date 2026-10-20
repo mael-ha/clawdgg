@@ -57,7 +57,7 @@ describe('TtlCache', () => {
     expect(attempts).toBe(2);
   });
 
-  it('evicts oldest-first once over budget', async () => {
+  it('evicts the least recently used once over budget', async () => {
     const cache = new TtlCache<number>(1000, 3);
     for (const key of ['a', 'b', 'c', 'd']) cache.set(key, 1);
 
@@ -66,15 +66,15 @@ describe('TtlCache', () => {
     expect(cache.get('d')).toBe(1);
   });
 
-  it('counts a re-set key as freshly inserted', () => {
+  it('keeps a replaced value in its place: reading it is what moves it', () => {
     const cache = new TtlCache<number>(1000, 2);
     cache.set('a', 1);
     cache.set('b', 1);
     cache.set('a', 2);
     cache.set('c', 1);
 
-    expect(cache.get('a')).toBe(2);
-    expect(cache.get('b')).toBeUndefined();
+    expect(cache.get('a')).toBeUndefined();
+    expect(cache.get('b')).toBe(1);
   });
 });
 
@@ -120,128 +120,77 @@ describe('remember(shouldCache)', () => {
   });
 });
 
-describe('stale-while-revalidate', () => {
-  it('serves a fresh entry without rebuilding', async () => {
-    const cache = new TtlCache<number>(1000, 500, { staleMs: 1000 });
-    let builds = 0;
-    const build = async () => ++builds;
+describe('LRU', () => {
+  it('evicts the least recently READ entry, not the oldest inserted', () => {
+    const cache = new TtlCache<number>(60_000, 2);
+    cache.set('a', 1);
+    cache.set('b', 2);
+    expect(cache.get('a')).toBe(1); // a is now the most recent
+    cache.set('c', 3);
 
-    expect(await cache.remember('k', build)).toBe(1);
-    expect(await cache.remember('k', build)).toBe(1);
-    expect(builds).toBe(1);
+    expect(cache.get('b')).toBeUndefined();
+    expect(cache.get('a')).toBe(1);
+    expect(cache.get('c')).toBe(3);
   });
 
-  it('serves a stale entry at once and rebuilds it exactly once behind it', async () => {
-    const cache = new TtlCache<number>(20, 500, { staleMs: 10_000 });
-    let builds = 0;
-    const build = async () => {
-      builds++;
-      await tick(30);
-      return builds;
-    };
-
-    expect(await cache.remember('k', build)).toBe(1);
-    await tick(30);
-
-    // Five callers inside the stale window: all get build 1 immediately, and
-    // between them they trigger ONE rebuild, not five.
-    const served = await Promise.all([
-      cache.remember('k', build),
-      cache.remember('k', build),
-      cache.remember('k', build),
-      cache.remember('k', build),
-      cache.remember('k', build),
-    ]);
-    expect(served).toEqual([1, 1, 1, 1, 1]);
-    expect(builds).toBe(2);
-
-    await tick(40);
-    expect(cache.get('k')).toBe(2);
-    expect(builds).toBe(2);
+  it('does not count a refresh as a use', async () => {
+    const cache = new TtlCache<number>(60_000, 2);
+    cache.set('a', 1);
+    cache.set('b', 2);
+    expect(cache.get('b')).toBe(2);
+    // A rebuild of `a` replaces its value, and `a` is still the one nobody read.
+    await cache.refresh('a', async () => 10);
+    cache.set('c', 3);
+    expect(cache.size).toBe(2);
+    expect(cache.get('b')).toBe(2);
   });
 
-  it('collapses ten cold callers past the stale window into one build', async () => {
-    const cache = new TtlCache<number>(10, 500, { staleMs: 10 });
-    let builds = 0;
-    const build = async () => {
-      builds++;
-      await tick(25);
-      return builds;
-    };
+  it('holds at most its budget however many keys pass through it', async () => {
+    const cache = new TtlCache<number>(60_000, 500);
+    for (let i = 0; i < 2_000; i++) await cache.remember(`user-${i}`, async () => i);
+    expect(cache.size).toBe(500);
+    expect(cache.get('user-1999')).toBe(1999);
+    expect(cache.get('user-0')).toBeUndefined();
+  });
+});
 
-    expect(await cache.remember('k', build)).toBe(1);
-    await tick(35); // past ttl AND past the stale window
+describe('readWithin and ageMs', () => {
+  it('says whether a key was read lately, and a refresh is not a read', async () => {
+    const cache = new TtlCache<number>(60_000);
+    await cache.refresh('k', async () => 1);
+    expect(cache.readWithin('k', 1_000)).toBe(false);
 
-    const results = await Promise.all(
-      Array.from({ length: 10 }, () => cache.remember('k', build))
-    );
-    expect(results).toEqual(Array.from({ length: 10 }, () => 2));
-    expect(builds).toBe(2);
+    expect(await cache.remember('k', async () => 2)).toBe(1);
+    expect(cache.readWithin('k', 1_000)).toBe(true);
+    await tick(20);
+    expect(cache.readWithin('k', 10)).toBe(false);
+
+    // The value is replaced; the record of who read it is not.
+    await cache.refresh('k', async () => 3);
+    expect(cache.readWithin('k', 1_000)).toBe(true);
+    expect(cache.readWithin('missing', 1_000)).toBe(false);
   });
 
-  it('keeps serving the stale value when the background rebuild throws', async () => {
-    const cache = new TtlCache<string>(20, 500, { staleMs: 10_000 });
-    let builds = 0;
-    const build = async () => {
-      builds++;
-      if (builds > 1) throw new Error('clickhouse is having a day');
-      return 'good';
-    };
-
-    expect(await cache.remember('k', build)).toBe('good');
-    await tick(30);
-
-    // The failure is logged, never cached, and never reaches this caller.
-    expect(await cache.remember('k', build)).toBe('good');
-    await tick(10);
-    expect(builds).toBe(2);
-    expect(await cache.remember('k', build)).toBe('good');
+  it('counts the first build as a read by the caller who asked for it', async () => {
+    const cache = new TtlCache<number>(60_000);
+    await cache.remember('k', async () => 1);
+    expect(cache.readWithin('k', 1_000)).toBe(true);
   });
 
-  it('keeps serving the stale value when the rebuild comes back degraded', async () => {
-    const cache = new TtlCache<{ ok: boolean; n: number }>(20, 500, { staleMs: 10_000 });
-    let builds = 0;
-    const build = async () => ({ ok: builds++ === 0, n: builds });
-    const keep = (v: { ok: boolean }) => v.ok;
-
-    expect(await cache.remember('k', build, keep)).toEqual({ ok: true, n: 1 });
-    await tick(30);
-
-    expect(await cache.remember('k', build, keep)).toEqual({ ok: true, n: 1 });
-    await tick(10);
-    // The degraded build was not written over the last good one.
-    expect(await cache.remember('k', build, keep)).toEqual({ ok: true, n: 1 });
-  });
-
-  it('throws past the stale window, with nothing left to serve', async () => {
-    const cache = new TtlCache<string>(10, 500, { staleMs: 10 });
-    let builds = 0;
-    const build = async () => {
-      if (builds++ > 0) throw new Error('down');
-      return 'good';
-    };
-
-    expect(await cache.remember('k', build)).toBe('good');
-    await tick(35);
-    expect(cache.remember('k', build)).rejects.toThrow('down');
-  });
-
-  it('is a plain ttl cache when no stale window is given', async () => {
-    const cache = new TtlCache<number>(20);
-    let builds = 0;
-    const build = async () => ++builds;
-
-    expect(await cache.remember('k', build)).toBe(1);
-    await tick(30);
-    expect(await cache.remember('k', build)).toBe(2);
+  it('reports the age of the value being served, reset by a rebuild', async () => {
+    const cache = new TtlCache<number>(60_000);
+    expect(cache.ageMs('k')).toBeUndefined();
+    cache.set('k', 1);
+    await tick(25);
+    expect(cache.ageMs('k')!).toBeGreaterThanOrEqual(20);
+    await cache.refresh('k', async () => 2);
+    expect(cache.ageMs('k')!).toBeLessThan(20);
   });
 });
 
 describe('refresh', () => {
-  // The warmer's entry point: it must WAIT for the rebuild, or walking users
-  // one at a time would still put every user's fan-out in flight at once.
-  it('rebuilds a stale entry and waits for it', async () => {
-    const cache = new TtlCache<number>(20, 500, { staleMs: 10_000 });
+  it('rebuilds a cached entry and waits for it', async () => {
+    const cache = new TtlCache<number>(10_000);
     let builds = 0;
     const build = async () => {
       builds++;
@@ -250,19 +199,36 @@ describe('refresh', () => {
     };
 
     await cache.remember('k', build);
-    await tick(30);
-
     expect(await cache.refresh('k', build)).toBe(2);
     expect(cache.get('k')).toBe(2);
   });
 
-  it('rebuilds a fresh entry too, rather than returning it', async () => {
-    const cache = new TtlCache<number>(10_000, 500, { staleMs: 10_000 });
-    let builds = 0;
-    const build = async () => ++builds;
+  it('keeps serving the previous value while the rebuild runs', async () => {
+    const cache = new TtlCache<number>(10_000);
+    let release: ((value: number) => void) | undefined;
+    cache.set('k', 1);
 
-    await cache.remember('k', build);
-    expect(await cache.refresh('k', build)).toBe(2);
+    const rebuilding = cache.refresh('k', () => new Promise<number>((r) => (release = r)));
+    expect(await cache.remember('k', async () => 99)).toBe(1);
+    release!(2);
+    expect(await rebuilding).toBe(2);
+    expect(cache.get('k')).toBe(2);
+  });
+
+  it('leaves the previous value when the rebuild throws', async () => {
+    const cache = new TtlCache<string>(10_000);
+    cache.set('k', 'good');
+    expect(cache.refresh('k', async () => { throw new Error('down'); })).rejects.toThrow('down');
+    await tick(5);
+    expect(cache.get('k')).toBe('good');
+  });
+
+  it('leaves the previous value when the rebuild comes back degraded', async () => {
+    const cache = new TtlCache<{ ok: boolean }>(10_000);
+    const good = { ok: true };
+    cache.set('k', good);
+    await cache.refresh('k', async () => ({ ok: false }), (v) => v.ok);
+    expect(cache.get('k')).toBe(good);
   });
 
   it('joins a build already in flight instead of starting a second', async () => {
@@ -289,15 +255,14 @@ describe('eviction vs a build already in flight', () => {
    * of the window, after the UI said it was saved.
    */
   it('does not let a rebuild that started before the eviction re-insert its value', async () => {
-    const cache = new TtlCache<string>(20, 500, { staleMs: 10_000 });
+    const cache = new TtlCache<string>(10_000);
     let release: ((value: string) => void) | undefined;
     const slowBuild = () => new Promise<string>((resolve) => (release = resolve));
 
     cache.set('mael|public|', 'shows 💎 value');
-    await tick(30); // now stale: the next read serves it and rebuilds behind it
-
+    // The refresh job starts a rebuild; the old value keeps serving meanwhile.
+    const rebuilding = cache.refresh('mael|public|', slowBuild);
     expect(await cache.remember('mael|public|', slowBuild)).toBe('shows 💎 value');
-    expect(release).toBeDefined();
 
     // The owner hides 💎 while that rebuild is in the air.
     cache.deletePrefix('mael|');
@@ -305,9 +270,9 @@ describe('eviction vs a build already in flight', () => {
 
     // The pre-eviction build lands.
     release!('shows 💎 value');
-    await tick(10);
+    await rebuilding;
 
-    // It is gone, not stale: the next read is a hard miss and builds afresh.
+    // It is gone: the next read is a hard miss and builds afresh.
     expect(cache.get('mael|public|')).toBeUndefined();
     expect(cache.size).toBe(0);
     expect(await cache.remember('mael|public|', async () => 'no 💎')).toBe('no 💎');

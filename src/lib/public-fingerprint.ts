@@ -5,9 +5,8 @@
  * person: src/routes/profile.tsx's page payload, src/routes/api.ts's
  * `/api/u/:username/fingerprint`, and src/routes/og.ts's share card. Each had
  * its own cache, each cache was keyed differently, and each therefore built
- * its own copy — so a cold profile cost 39 `... FINAL` reads through a
- * 4-permit limiter rather than 13, and the warmer paid that three times per
- * user per cycle.
+ * its own copy — so a cold profile cost 39 reads through a 4-permit limiter
+ * rather than 13.
  *
  * They are the SAME payload. All three call getFingerprint with
  * `isOwner: false` and the owner's hidden list; none of them can tell its copy
@@ -46,20 +45,18 @@ export interface PublicFingerprintUser {
 }
 
 /**
- * A minute fresh, thirty more of stale window.
+ * Kept until replaced, for up to a day, for up to 500 payloads.
  *
- * The minute is the figure's own staleness budget and is what the three caches
- * this replaces already used. The window behind it is the other question — how
- * long it is better to answer with a slightly old payload than to make a
- * reader, or X's crawler, wait out the fan-out. See src/lib/ttl-cache.ts.
+ * Replaced by src/jobs/refresh-pages.ts when the user's rows change (see
+ * src/lib/dirty.ts), so it never expires on a timer: an unchanged profile is
+ * served from here however long ago it was built, and a changed one is rebuilt
+ * behind the reader rather than in front of them. The day is a safety net for
+ * a change that was never marked, and the LRU bound is what keeps memory
+ * bounded as the user count grows.
  */
-const TTL_MS = 60_000;
-const STALE_MS = 30 * 60_000;
+export const PUBLIC_FINGERPRINT_MAX_AGE_MS = 24 * 60 * 60_000;
 
-const cache = new TtlCache<FingerprintData>(TTL_MS, 500, {
-  staleMs: STALE_MS,
-  name: 'public-fingerprint',
-});
+const cache = new TtlCache<FingerprintData>(PUBLIC_FINGERPRINT_MAX_AGE_MS, 500);
 
 /** User, then the list the payload was filtered by. Nothing else. */
 function key(userId: string, hidden: readonly FingerprintSection[]): string {
@@ -94,11 +91,10 @@ function build(
 }
 
 /**
- * The public fingerprint: cached, stale-while-revalidating, single-flighted.
+ * The public fingerprint: cached, single-flighted.
  *
  * What all three surfaces call. A throw is never cached, so a ClickHouse
- * outage is retried by the next caller rather than pinned — and inside the
- * stale window it does not even reach the caller.
+ * outage is retried by the next caller rather than pinned.
  */
 export function publicFingerprint(
   user: PublicFingerprintUser,
@@ -110,15 +106,23 @@ export function publicFingerprint(
 /**
  * Rebuild now and wait for it, joining a build already in flight.
  *
- * The warmer's entry point (src/lib/warm.ts), and the reason its cycle costs
- * ONE fan-out per user: it refreshes this first, and the page payload and the
- * card it warms next both find it fresh.
+ * The refresh job's entry point (src/jobs/refresh-pages.ts), and the reason a
+ * refresh costs ONE fan-out per user: it rebuilds this first, and the page
+ * payload and the card it rebuilds next both find it current.
  */
 export function refreshPublicFingerprint(
   user: PublicFingerprintUser,
   hidden: readonly FingerprintSection[]
 ): Promise<FingerprintData> {
   return cache.refresh(key(user.id, hidden), () => build(user, hidden));
+}
+
+/** How old the cached payload is, for the Server-Timing header. */
+export function publicFingerprintAge(
+  userId: string,
+  hidden: readonly FingerprintSection[]
+): number | undefined {
+  return cache.ageMs(key(userId, hidden));
 }
 
 /**

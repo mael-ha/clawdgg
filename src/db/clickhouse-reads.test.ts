@@ -1138,4 +1138,118 @@ suite('every ClickHouse read resolves against 24.3', () => {
       });
     }
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // src/jobs/refresh-pages.ts, end to end: a row lands, the page follows
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe('the refresh job, end to end', () => {
+    type Viewer = { id: string; githubUsername: string } | null;
+    let viewer: Viewer = null;
+    let app: import('hono').Hono;
+    let dirty: typeof import('../lib/dirty');
+    let refresh: typeof import('../jobs/refresh-pages');
+    let promptSeq = 0;
+
+    beforeAll(async () => {
+      const { Hono } = await import('hono');
+      const { serverTiming } = await import('../lib/request-timing');
+      const profileRoute = (await import('../routes/profile')).default;
+      dirty = await import('../lib/dirty');
+      refresh = await import('../jobs/refresh-pages');
+
+      app = new Hono();
+      app.use('*', serverTiming);
+      app.use('*', async (c, next) => {
+        c.set('user' as never, viewer as never);
+        await next();
+      });
+      app.route('/u', profileRoute);
+      dirty.resetDirty();
+    });
+
+    /** The page, the prompt count its summary prints, and what it cost. */
+    async function view(path: string) {
+      const original = globalThis.fetch;
+      let calls = 0;
+      globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+        if (url.startsWith(TEST_URL!)) calls++;
+        return original(input, init);
+      }) as typeof fetch;
+      try {
+        const response = await app.request(path);
+        const html = await response.text();
+        const prompts = Number(/([\d,]+) prompts/.exec(html)?.[1]?.replace(/,/g, ''));
+        return { status: response.status, prompts, calls, timing: response.headers.get('Server-Timing') ?? '' };
+      } finally {
+        globalThis.fetch = original;
+      }
+    }
+
+    /** One prompt through the real insert path — which is what marks the user. */
+    async function newPrompt() {
+      await clickhouse.insertEvents([
+        {
+          timestamp: at(0, 0, ++promptSeq),
+          user_id: USER_A,
+          session_id: `refresh-${promptSeq}`,
+          event_name: 'claude_code.user_prompt',
+          prompt_length: 64,
+          provenance: 'live',
+          message_uuid: `refresh-${promptSeq}`,
+        },
+      ]);
+    }
+
+    it('serves the cached page until the rebuild, then the new figure for nothing', async () => {
+      viewer = null;
+      const first = await view('/u/ci-reads-a');
+      expect(first.status).toBe(200);
+      expect(first.prompts).toBeGreaterThan(0);
+
+      await newPrompt();
+      expect(dirty.isDirty(USER_A)).toBe(true);
+
+      // Not rebuilt yet: the visitor gets the cached page, at no cost.
+      const before = await view('/u/ci-reads-a');
+      expect(before.prompts).toBe(first.prompts);
+      expect(before.calls).toBe(0);
+      expect(before.timing).toMatch(/snap;desc="age=\d+s"/);
+
+      const report = await refresh.refreshCycle(() => {}, Date.now() + dirty.QUIET_MS + 1);
+      expect(report).toMatchObject({ refreshed: 1, failed: 0 });
+      expect(dirty.isDirty(USER_A)).toBe(false);
+
+      const after = await view('/u/ci-reads-a');
+      expect(after.prompts).toBe(first.prompts + 1);
+      expect(after.calls).toBe(0);
+      expect(after.timing).toContain('ch;dur=0.0;desc="0 queries"');
+      expect(after.timing).toContain('snap;desc="age=0s"');
+    }, 60_000);
+
+    it("rebuilds the owner's own page before answering them", async () => {
+      refresh.startRefreshJob();
+      try {
+        viewer = { id: USER_A, githubUsername: 'ci-reads-a' };
+        const first = await view('/u/ci-reads-a');
+        expect(first.status).toBe(200);
+
+        await newPrompt();
+        expect(dirty.isDirty(USER_A)).toBe(true);
+
+        // No cycle has run: the owner's request did the rebuild itself.
+        const after = await view('/u/ci-reads-a');
+        expect(after.prompts).toBe(first.prompts + 1);
+        expect(dirty.isDirty(USER_A)).toBe(false);
+
+        // And a visitor is served the same rebuild.
+        viewer = null;
+        expect((await view('/u/ci-reads-a')).prompts).toBe(first.prompts + 1);
+      } finally {
+        refresh.stopRefreshJob();
+        viewer = null;
+      }
+    }, 60_000);
+  });
 });

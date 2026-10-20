@@ -24,7 +24,7 @@
  * wherever `live` counts.
  */
 
-import { and, desc, eq, gte, isNull, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, isNull, sql, type SQL } from 'drizzle-orm';
 import { db } from '../db';
 import { deviceTokens, planUsageSnapshots, users } from '../db/schema';
 import {
@@ -545,6 +545,15 @@ export interface ProfileUser {
 }
 
 export async function fetchProfileUser(username: string): Promise<ProfileUser | null> {
+  return selectProfileUser(eq(users.githubUsername, username));
+}
+
+/** The same row by user id — what src/jobs/refresh-pages.ts has in hand. */
+export async function fetchProfileUserById(userId: string): Promise<ProfileUser | null> {
+  return selectProfileUser(eq(users.id, userId));
+}
+
+async function selectProfileUser(where: SQL): Promise<ProfileUser | null> {
   const row = await db
     .select({
       id: users.id,
@@ -556,7 +565,7 @@ export async function fetchProfileUser(username: string): Promise<ProfileUser | 
       longestStreak: users.longestStreak,
     })
     .from(users)
-    .where(eq(users.githubUsername, username))
+    .where(where)
     .get();
 
   if (!row) return null;

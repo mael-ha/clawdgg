@@ -6,6 +6,7 @@ import {
   serverTiming,
   serverTimingHeader,
   newRequestTiming,
+  recordSnapshotAge,
   timeStatement,
   untimed,
   withRequestTiming,
@@ -28,6 +29,22 @@ describe('Server-Timing', () => {
     expect(serverTimingHeader(timing, 870)).toBe(
       'ch;dur=812.0;desc="4 queries", sqlite;dur=3.0;desc="7 queries", render;dur=41.0, total;dur=870.0'
     );
+  });
+
+  it('says how old the served payload is, in whole seconds, when a route recorded it', () => {
+    const timing = newRequestTiming();
+    withRequestTiming(timing, () => {
+      recordSnapshotAge(3_200);
+      // Two payloads behind one response: the older one is how stale it is.
+      recordSnapshotAge(37_900);
+      recordSnapshotAge(1_000);
+    });
+    expect(serverTimingHeader(timing, 10)).toBe(
+      'ch;dur=0.0;desc="0 queries", sqlite;dur=0.0;desc="0 queries", render;dur=0.0, snap;desc="age=37s", total;dur=10.0'
+    );
+    // Outside a request it is a no-op, like every other record.
+    recordSnapshotAge(5_000);
+    expect(serverTimingHeader(newRequestTiming(), 1)).not.toContain('snap');
   });
 
   it('keeps two interleaved requests apart', async () => {

@@ -26,39 +26,39 @@
 import { Hono } from 'hono';
 import { hiddenFor } from '../lib/profile-settings';
 import { publicFingerprint } from '../lib/public-fingerprint';
-import { fetchProfileUser } from '../lib/profile-data';
+import { fetchProfileUser, type ProfileUser } from '../lib/profile-data';
 import { shareCardFrom } from '../lib/share-card';
 import { cardPng } from '../lib/card-png';
 import { ShareCard } from '../components/profile/ShareCard';
 import { TtlCache } from '../lib/ttl-cache';
+import { recordSnapshotAge } from '../lib/request-timing';
 
 const og = new Hono();
 
 /**
- * Ten minutes fresh, then a DAY of stale window.
+ * Kept until replaced, for up to a day.
  *
  * A popular link pasted into a busy channel can be fetched many times in a
- * second and each miss is the whole fingerprint fan-out, while nothing on the
- * card moves in ten minutes. Longer than the HTTP max-age below on purpose:
- * this one is OURS to evict when the owner changes a toggle (evictCardCache),
- * and the header's is not.
- *
- * The day behind it is about ONE crawler in particular. A cold card.png was
- * 8.1 s measured on prod, and X's unfurler gives up long before that — so a
- * link posted ten minutes after the last fetch unfurled with no image at all.
- * Inside the window the crawler is answered from the last build immediately
- * and the rebuild happens behind it. A day is long because an image that is a
- * few hours old is the correct trade against an unfurl that never renders;
- * what it is NOT is a licence for anyone else to hold it that long — see
- * CARD_CACHE_CONTROL, which stays at a minute — and an owner hiding a section
- * evicts this cache outright (TtlCache.delete drops the stale value too).
+ * second, and X's unfurler gives up long before a cold card.png is drawn (8.1 s
+ * measured on prod) — what it caches then is the failure. So a card that has
+ * been asked for is kept, and rebuilt by src/jobs/refresh-pages.ts when the
+ * owner's data changes, rather than expiring and making the next crawler wait.
+ * The day is a safety net for a change nobody marked; an owner hiding a section
+ * evicts this cache outright (evictCardCache), and the HTTP max-age below stays
+ * at a minute for everyone else's copies.
  */
-const CARD_TTL_MS = 10 * 60_000;
-const CARD_STALE_MS = 24 * 60 * 60_000;
-const cardCache = new TtlCache<string>(CARD_TTL_MS, 500, {
-  staleMs: CARD_STALE_MS,
-  name: 'card',
-});
+const CARD_MAX_AGE_MS = 24 * 60 * 60_000;
+const cardCache = new TtlCache<string>(CARD_MAX_AGE_MS, 500);
+
+/** How long after its last request a card is still rebuilt when its data changes. */
+const CARD_REQUESTED_MS = 24 * 60 * 60_000;
+
+/**
+ * When each user's card.png was last asked for. The SVG cache knows when the
+ * card was read, but not in which encoding, and rasterising a PNG nobody
+ * fetches is the most expensive thing a refresh could do for nothing.
+ */
+const pngRequestedAt = new Map<string, number>();
 
 /**
  * Rasterised cards, keyed by the SVG that produced them rather than by user.
@@ -69,13 +69,12 @@ const cardCache = new TtlCache<string>(CARD_TTL_MS, 500, {
  * never cached — TtlCache only remembers what resolves — so a failed render
  * is retried rather than pinned.
  *
- * Which is also why this one gets a plain day-long TTL and NO stale window.
  * A content-addressed key cannot go stale — there is nothing to revalidate
- * against, and a stale-serve here would re-rasterise identical bytes — so the
- * only question is how long to keep them. A day, with a tighter entry budget
- * than the default because these are PNGs rather than strings.
+ * against — so the only question is how long to keep them. A day, with a
+ * tighter entry budget than the default because these are PNGs rather than
+ * strings.
  */
-const pngCache = new TtlCache<Uint8Array>(CARD_TTL_MS + CARD_STALE_MS, 200);
+const pngCache = new TtlCache<Uint8Array>(CARD_MAX_AGE_MS, 200);
 
 /**
  * Forget the card this user's settings produced.
@@ -89,15 +88,15 @@ export function evictCardCache(userId: string): void {
 }
 
 /**
- * The card's SVG for a username, or null if there is no such user.
+ * The card's SVG for a user, through the cache.
  *
  * Throws if the fingerprint cannot be built, which the routes turn into a
  * 503 — see the note on the placeholder below.
  */
-async function cardSvgFor(username: string, rebuild = false): Promise<string | null> {
-  const user = await fetchProfileUser(username);
-  if (!user) return null;
-
+async function cardSvgFor(
+  user: ProfileUser,
+  rebuild = false
+): Promise<{ svg: string; key: string }> {
   const hidden = await hiddenFor(user.id);
 
   const build = async () => {
@@ -116,7 +115,8 @@ async function cardSvgFor(username: string, rebuild = false): Promise<string | n
   // loses the race against a build that was already in flight when the toggle
   // was saved, and this cache holds the IMAGE that unfurlers go and fetch.
   const key = `${user.id}|${hidden.join(',')}`;
-  return rebuild ? cardCache.refresh(key, build) : cardCache.remember(key, build);
+  const svg = rebuild ? await cardCache.refresh(key, build) : await cardCache.remember(key, build);
+  return { svg, key };
 }
 
 /** The PNG cache's key: the hash of the drawing, not the user. */
@@ -125,20 +125,25 @@ function pngKey(svg: string): string {
 }
 
 /**
- * Rebuild one user's card now, through the routes' own builds and keys.
+ * Rebuild one user's card now, through the routes' own builds and keys — if it
+ * has been asked for in the last day. For src/jobs/refresh-pages.ts, after the
+ * user's rows changed: a card has to be current BEFORE the next crawler
+ * fetches it, because the crawler will not wait for it to be drawn.
  *
- * For src/lib/warm.ts, and the reason the warmer exists at all: a cold card
- * takes seconds and X's unfurler will not wait for it, so the card has to be
- * warm BEFORE the link is posted rather than one fetch after.
- *
- * The SVG is forced; the PNG is not. `pngCache` is keyed by the hash of the
- * markup it rasterised, so an unchanged card is already there and re-doing it
- * would burn resvg on identical bytes.
+ * The PNG only if card.png itself was asked for. `pngCache` is keyed by the
+ * hash of the markup it rasterised, so an unchanged card costs nothing there.
  */
-export async function warmCard(username: string): Promise<void> {
-  const svg = await cardSvgFor(username, true);
-  if (svg === null) return;
-  await pngCache.remember(pngKey(svg), async () => cardPng(svg));
+export async function refreshCard(user: ProfileUser): Promise<void> {
+  const hidden = await hiddenFor(user.id);
+  const key = `${user.id}|${hidden.join(',')}`;
+  const now = Date.now();
+  const pngAt = pngRequestedAt.get(user.id);
+  const wantsPng = pngAt !== undefined && now - pngAt <= CARD_REQUESTED_MS;
+  if (pngAt !== undefined && !wantsPng) pngRequestedAt.delete(user.id);
+  if (!wantsPng && !cardCache.readWithin(key, CARD_REQUESTED_MS)) return;
+
+  const { svg } = await cardSvgFor(user, true);
+  if (wantsPng) await pngCache.remember(pngKey(svg), async () => cardPng(svg));
 }
 
 /**
@@ -150,8 +155,8 @@ export async function warmCard(username: string): Promise<void> {
  * serving yesterday's card for a day — so an owner who hid 💎 watched the
  * figure they had just taken down go on being unfurled into other people's
  * channels, with nothing on this side able to stop it. A minute still absorbs
- * the burst a pasted link causes (and the ten-minute in-process cache behind
- * it absorbs the fan-out), while bounding that window to a minute.
+ * the burst a pasted link causes (and the in-process cache behind it absorbs
+ * the fan-out), while bounding that window to a minute.
  */
 const CARD_CACHE_CONTROL = 'public, max-age=60';
 
@@ -171,8 +176,11 @@ og.get('/:username/card.svg', async (c) => {
   const username = c.req.param('username');
 
   try {
-    const svg = await cardSvgFor(username);
-    if (svg === null) return c.text('No such user', 404);
+    const user = await fetchProfileUser(username);
+    if (!user) return c.text('No such user', 404);
+
+    const { svg, key } = await cardSvgFor(user);
+    recordSnapshotAge(cardCache.ageMs(key) ?? 0);
 
     return c.body(svg, 200, {
       'Content-Type': 'image/svg+xml; charset=utf-8',
@@ -191,9 +199,12 @@ og.get('/:username/card.png', async (c) => {
   const username = c.req.param('username');
 
   try {
-    const svg = await cardSvgFor(username);
-    if (svg === null) return c.text('No such user', 404);
+    const user = await fetchProfileUser(username);
+    if (!user) return c.text('No such user', 404);
 
+    pngRequestedAt.set(user.id, Date.now());
+    const { svg, key } = await cardSvgFor(user);
+    recordSnapshotAge(cardCache.ageMs(key) ?? 0);
     const png = await pngCache.remember(pngKey(svg), async () => cardPng(svg));
 
     return new Response(png, {

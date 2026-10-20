@@ -2,13 +2,16 @@
  * Where one request's time went, as a `Server-Timing` header.
  *
  *   Server-Timing: ch;dur=812;desc="4 queries", sqlite;dur=3;desc="7 queries",
- *                  render;dur=41, total;dur=870
+ *                  render;dur=41, snap;desc="age=37s", total;dur=870
  *
  * Measured, per request, in the process that served it: the ClickHouse reads
  * (src/db/clickhouse.ts query(), from the call to the parsed answer, so a read
  * that waited for a permit counts its wait), the SQLite statements (every
  * statement drizzle runs, via the prepare hook in src/db/index.ts), the JSX
- * render (c.html) and the wall clock. `ch` and `sqlite` are SUMS over reads
+ * render (c.html) and the wall clock. `snap` is how old the cached payload the
+ * response was built from is — the caches are replaced when the data changes
+ * rather than on a timer, so this is the figure that says how stale a page
+ * is; a route that serves no such payload leaves it out. `ch` and `sqlite` are SUMS over reads
  * that may have run concurrently, so on a page that fans out they can exceed
  * `total` — that is the fan-out showing, not a bug.
  *
@@ -17,9 +20,8 @@
  *
  * ONE STORE PER REQUEST, through AsyncLocalStorage, so two interleaved
  * requests cannot add to each other's figures. Work a request merely STARTS
- * and does not wait for — a stale cache entry's background rebuild (see
- * src/lib/ttl-cache.ts) — runs outside it via `untimed`, or a visitor served
- * in 5 ms would be shown the 3 s scan their visit happened to kick off.
+ * and does not wait for runs outside it via `untimed`, or a visitor served in
+ * 5 ms would be shown the 3 s scan their visit happened to kick off.
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -31,6 +33,8 @@ export interface RequestTiming {
   sqliteMs: number;
   sqliteQueries: number;
   renderMs: number;
+  /** Age of the cached payload served, if the route recorded one. */
+  snapAgeMs?: number;
 }
 
 const storage = new AsyncLocalStorage<RequestTiming>();
@@ -72,6 +76,15 @@ export function recordRender(ms: number): void {
   if (timing) timing.renderMs += ms;
 }
 
+/**
+ * The age of the cached payload this response is built from. The oldest wins
+ * if a route records more than one, since that is how stale the response is.
+ */
+export function recordSnapshotAge(ageMs: number): void {
+  const timing = storage.getStore();
+  if (timing) timing.snapAgeMs = Math.max(timing.snapAgeMs ?? 0, ageMs);
+}
+
 function ms(value: number): string {
   return value.toFixed(1);
 }
@@ -81,6 +94,9 @@ export function serverTimingHeader(timing: RequestTiming, totalMs: number): stri
     `ch;dur=${ms(timing.chMs)};desc="${timing.chQueries} queries"`,
     `sqlite;dur=${ms(timing.sqliteMs)};desc="${timing.sqliteQueries} queries"`,
     `render;dur=${ms(timing.renderMs)}`,
+    ...(timing.snapAgeMs === undefined
+      ? []
+      : [`snap;desc="age=${Math.floor(timing.snapAgeMs / 1000)}s"`]),
     `total;dur=${ms(totalMs)}`,
   ].join(', ');
 }

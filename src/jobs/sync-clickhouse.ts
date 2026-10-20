@@ -27,6 +27,7 @@ import { localDate, normalizeTimezone } from '../lib/timezone';
 import { pruneRankSnapshots, snapshotRanks } from '../lib/rank-snapshots';
 import { snapshotBoardRanks } from '../lib/boards';
 import { computeBadges } from '../lib/badges';
+import { lastMarkedAt, markDirty } from '../lib/dirty';
 import { eq } from 'drizzle-orm';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -46,7 +47,7 @@ let isSyncing = false;
 /**
  * WHY A WATERMARK. Recomputing every user's totals every five minutes re-read
  * each whole history (1.2–1.9M rows for the heaviest) whether or not anything
- * had arrived — with nobody visiting, this job and the profile warmer were
+ * had arrived — with nobody visiting, this job and the old profile warmer were
  * ~600 s of ClickHouse time an hour, and visitors queued behind them. Most
  * users send nothing in most five-minute windows, so most of that work
  * recomputed the number already stored.
@@ -100,6 +101,45 @@ export function syncKey(watermark: string, timezone: string, today: string, rank
 /** Exported for the tests, which run passes back to back. */
 export function resetSyncWatermarks(): void {
   lastSyncedKey.clear();
+  previousPassStartedAt = 0;
+}
+
+/**
+ * When the previous watermarked pass began — the line between "a write this
+ * process saw" and "a write it did not". See pageMarkReason.
+ */
+let previousPassStartedAt = 0;
+
+/** The watermark half of a syncKey: everything before the zone. */
+function watermarkOf(key: string): string {
+  return key.slice(0, key.indexOf('|tz='));
+}
+
+/**
+ * Why this user's pages need rebuilding, judging by how their key moved — or
+ * null if they do not.
+ *
+ * The pages are rebuilt when a write is marked (src/lib/dirty.ts), and every
+ * write in THIS process marks itself. Two changes cannot:
+ *   - the clock: a new local day, a new zone. "Today", the streak and every
+ *     rolling window on the page move with no new row.
+ *   - rows written by ANOTHER process — a backfill, a reset, a migration —
+ *     which this pass sees as a watermark that moved with no mark behind it.
+ * A first pass after a restart has no previous key and marks nothing this way:
+ * the caches it would refresh are as new as the process.
+ */
+export function pageMarkReason(
+  previous: string | undefined,
+  key: string,
+  lastMarked: number | undefined,
+  passStartedBefore: number
+): string | null {
+  if (previous === undefined || previous === key) return null;
+  if (previous.slice(previous.indexOf('|tz=')) !== key.slice(key.indexOf('|tz='))) return 'clock';
+  if (watermarkOf(previous) !== watermarkOf(key) && (lastMarked ?? 0) < passStartedBefore) {
+    return 'rows';
+  }
+  return null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -356,8 +396,16 @@ export async function syncClickHouseToSqlite(
         createdAt: users.createdAt,
         currentFirstSessionDate: users.firstSessionDate,
         timezone: users.timezone,
+        storedStreak: users.currentStreak,
+        storedLongestStreak: users.longestStreak,
+        storedPrompts: users.totalPrompts,
+        storedTokens: users.totalTokens,
       })
       .from(users);
+    // Read before the loop, so a write that lands while it runs is counted as
+    // after this pass began — and explains the watermark it moves next time.
+    const passStartedBefore = previousPassStartedAt;
+    if (watermarks) previousPassStartedAt = startTime;
 
     console.log(`[sync] Syncing ${syncTargets.length} users from ClickHouse`);
 
@@ -370,11 +418,7 @@ export async function syncClickHouseToSqlite(
 
     // Process users in batches to avoid overwhelming ClickHouse
     for (const user of syncTargets) {
-      const {
-        id: userId,
-        currentFirstSessionDate,
-        timezone,
-      } = user;
+      const { id: userId, currentFirstSessionDate, timezone } = user;
 
       // Get user rank from pre-calculated lookup
       const userRank = rankLookup.get(userId) ?? allUsers.length;
@@ -384,12 +428,20 @@ export async function syncClickHouseToSqlite(
         const watermark = watermarks.get(userId);
         // No row in either table: getUserTotals would answer nothing and the
         // loop below would `continue` — the same outcome, without the read.
-        if (watermark === undefined) continue;
+        // A user who HAD rows last pass has just been deleted from under their
+        // pages (src/scripts/reset-user-data.ts runs in its own process).
+        if (watermark === undefined) {
+          if (lastSyncedKey.delete(userId)) markDirty(userId, 'sync:rows');
+          continue;
+        }
         key = syncKey(watermark, timezone, localDate(new Date(), timezone), userRank);
-        if (lastSyncedKey.get(userId) === key) {
+        const previous = lastSyncedKey.get(userId);
+        if (previous === key) {
           unchanged++;
           continue;
         }
+        const reason = pageMarkReason(previous, key, lastMarkedAt(userId), passStartedBefore);
+        if (reason) markDirty(userId, `sync:${reason}`);
       }
 
       try {
@@ -448,6 +500,21 @@ export async function syncClickHouseToSqlite(
         hourCounts,
         userRank: userRank > 0 ? userRank : undefined,
       });
+
+      // A figure the pages and the board read from this row is about to move —
+      // the streaks, the joined date, whether they are listed at all — so they
+      // are rebuilt from it. The refresh job writes the streaks itself first,
+      // so for a write this process saw, these already agree.
+      const listed = (row: { prompts: number; tokens: number }) => row.prompts > 0 || row.tokens > 0;
+      if (
+        streaks.currentStreak !== (user.storedStreak ?? 0) ||
+        finalLongestStreak !== (user.storedLongestStreak ?? 0) ||
+        (finalFirstSessionDate ?? null) !== (currentFirstSessionDate ?? null) ||
+        listed({ prompts: totalPrompts, tokens: totalTokens }) !==
+          listed({ prompts: user.storedPrompts ?? 0, tokens: user.storedTokens ?? 0 })
+      ) {
+        markDirty(userId, 'sync:figures');
+      }
 
       // users.total_* is a cache of the ClickHouse figures above, nothing more.
       await db
