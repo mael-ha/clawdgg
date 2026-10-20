@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   EVENT_IDENTITY_COLUMNS,
@@ -9,6 +9,7 @@ import {
   TOTAL_TOKENS_SQL,
   eventRowId,
   identitySqlExpr,
+  insertDedupToken,
   metricRowId,
   sanitizeForJson,
   type EventRow,
@@ -483,5 +484,42 @@ describe('schema and migrations stay in sync', () => {
     expect(migration).toContain('EXCHANGE TABLES metrics_raw AND metrics_raw_v2;');
     expect(migration).toContain('EXCHANGE TABLES events_raw  AND events_raw_v2;');
     expect(migration).not.toContain('RENAME TABLE');
+  });
+});
+
+/**
+ * Identity is enforced at write time (row_id + insert_deduplication_token, see
+ * insert()), so an app read never pays for FINAL. One FINAL in a hot read put
+ * back the in-memory merge that made idle prod spend ~600 s of ClickHouse time
+ * an hour. The operator scripts in src/scripts/ and the migrations may use it.
+ */
+describe('app reads do not use FINAL', () => {
+  function appSources(dir: string): string[] {
+    return readdirSync(join(REPO_ROOT, dir), { withFileTypes: true }).flatMap(entry => {
+      const path = `${dir}/${entry.name}`;
+      if (entry.isDirectory()) return path === 'src/scripts' ? [] : appSources(path);
+      if (!/\.tsx?$/.test(entry.name) || /\.test\.tsx?$/.test(entry.name)) return [];
+      return [path];
+    });
+  }
+
+  it('has no `FROM <table> FINAL` anywhere in src/ outside src/scripts', () => {
+    const files = appSources('src');
+    expect(files).toContain('src/db/clickhouse.ts');
+    expect(files).toContain('src/lib/fingerprint.ts');
+    const offenders = files.filter(path =>
+      /\bFROM\s+[\w${}.]+\s+FINAL\b/i.test(readFileSync(join(REPO_ROOT, path), 'utf8'))
+    );
+    expect(offenders).toEqual([]);
+  });
+
+  it('sends an insert_deduplication_token derived from the row ids', () => {
+    const rows = [{ row_id: 'a' }, { row_id: 'b' }];
+    const token = insertDedupToken('events_raw', rows, ['{}', '{}']);
+    expect(token).toMatch(/^[0-9a-f]{64}$/);
+    expect(insertDedupToken('events_raw', rows, ['{"value":1}', '{"value":2}'])).toBe(token);
+    expect(insertDedupToken('metrics_raw', rows, ['{}', '{}'])).not.toBe(token);
+    expect(insertDedupToken('events_raw', [...rows].reverse(), ['{}', '{}'])).not.toBe(token);
+    expect(insertDedupToken('events_raw', [{ row_id: 'a' }], ['{}'])).not.toBe(token);
   });
 });

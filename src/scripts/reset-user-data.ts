@@ -79,6 +79,14 @@ async function resetUserData(username: string, apply: boolean): Promise<void> {
       { userId: user.id },
       { timeoutMs: MUTATION_TIMEOUT_MS }
     );
+    // A DELETE does not forget the insert deduplication log (see insert() in
+    // src/db/clickhouse.ts): a re-import that posts the same batches would be
+    // dropped as retries of the rows just deleted, and the "from scratch" test
+    // would land nothing. Turning the window off and on again empties the log
+    // — verified on 24.3 — at the cost of this table's retry protection, for
+    // the length of two metadata statements.
+    await query(`ALTER TABLE ${table} MODIFY SETTING non_replicated_deduplication_window = 0`);
+    await query(`ALTER TABLE ${table} MODIFY SETTING non_replicated_deduplication_window = 10000`);
   }
 
   await db

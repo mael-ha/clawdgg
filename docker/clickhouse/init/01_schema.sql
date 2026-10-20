@@ -3,8 +3,9 @@
 -- Stores OpenTelemetry metrics and events from Claude Code
 --
 -- ARCHITECTURE:
--- - Raw tables use ReplacingMergeTree for deduplication (handles OTEL retries)
--- - All aggregation happens at query time using FINAL clause
+-- - Identity is enforced at write time: row_id in the sorting key plus an
+--   insert_deduplication_token per batch (see insert() in src/db/clickhouse.ts)
+-- - ReplacingMergeTree's merge remains as a backstop; app reads do not use FINAL
 -- - No materialized views - simpler, more reliable, guaranteed accurate
 --
 -- DEDUPLICATION: every sorting key ends in `row_id`, a SHA-256 of all of the
@@ -87,7 +88,11 @@ PARTITION BY toYYYYMM(timestamp)
 -- expiring silently lowers a number somebody has already read. events_raw never
 -- had one. Re-adding a TTL deletes history — if storage ever becomes the
 -- problem, aggregate into a rollup table first and keep the rollup forever.
-SETTINGS index_granularity = 8192;
+-- non_replicated_deduplication_window: the table remembers the last 10000
+-- insert blocks, so a batch retried with the same insert_deduplication_token
+-- is dropped — see insert() in src/db/clickhouse.ts and
+-- docker/clickhouse/migrations/2026-10-20_insert_dedup_window.sql.
+SETTINGS index_granularity = 8192, non_replicated_deduplication_window = 10000;
 
 -- Raw events from OTel (user_prompt, tool_result, api_request, etc.)
 -- ReplacingMergeTree deduplicates rows with same ORDER BY key on merge
@@ -167,4 +172,5 @@ CREATE TABLE IF NOT EXISTS events_raw (
 ORDER BY (user_id, session_id, event_name, timestamp, tool_name, row_id)
 PARTITION BY toYYYYMM(timestamp)
 -- NO TTL — see metrics_raw above. This table never had one on prod either.
-SETTINGS index_granularity = 8192;
+-- Insert deduplication window — see metrics_raw above.
+SETTINGS index_granularity = 8192, non_replicated_deduplication_window = 10000;

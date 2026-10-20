@@ -74,7 +74,7 @@ const CLICKHOUSE = findClickhouse();
  */
 function schemaDdl(): string {
   const schema = readFileSync(join(REPO_ROOT, 'docker/clickhouse/init/01_schema.sql'), 'utf8');
-  const creates = schema.match(/CREATE TABLE IF NOT EXISTS \w+ \([\s\S]*?SETTINGS index_granularity = 8192;/g);
+  const creates = schema.match(/CREATE TABLE IF NOT EXISTS \w+ \([\s\S]*?SETTINGS index_granularity = 8192[^;]*;/g);
   if (!creates || creates.length !== 2) {
     throw new Error(`expected 2 CREATE TABLE statements in 01_schema.sql, found ${creates?.length}`);
   }

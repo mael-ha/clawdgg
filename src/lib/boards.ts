@@ -634,7 +634,7 @@ async function fetchFigures(
            countIf(${PROMPT_EVENT_SQL}) AS day_prompts
          FROM (
            SELECT user_id, event_name, command_source, prompt_length, ${local.expr} AS ts_local
-           FROM events_raw FINAL
+           FROM events_raw
            WHERE ${window}
          )
          GROUP BY user_id, toDate(ts_local)
@@ -662,7 +662,7 @@ async function fetchFigures(
          -- the same sum, which is why the board and the profile disagreed.
          toUInt64(sumIf(value, metric_name = 'claude_code.token.usage'
                                AND token_type = 'output' AND ${NO_LEGACY_SQL})) AS output_tokens
-       FROM metrics_raw FINAL
+       FROM metrics_raw
        WHERE ${window}
        GROUP BY user_id`,
       { since: chTimestamp(weekStartUtc(now)) }
@@ -782,7 +782,7 @@ async function fetchClassEvidence(
          toUInt64(countIf(event_name = 'claude_code.tool_result')) AS tools
        FROM (
          SELECT user_id, event_name, command_source, ${localTs} AS ts_local
-         FROM events_raw FINAL
+         FROM events_raw
          WHERE user_id IN (${list})
            AND ${NO_LEGACY_SQL}
            AND timestamp >= now() - INTERVAL 70 DAY
@@ -798,7 +798,7 @@ async function fetchClassEvidence(
          toFloat64(sumIf(value, query_source != '')) AS attributed
        FROM (
          SELECT user_id, value, query_source, ${localTs} AS ts_local
-         FROM metrics_raw FINAL
+         FROM metrics_raw
          WHERE user_id IN (${list})
            AND metric_name = 'claude_code.cost.usage'
            AND ${NO_LEGACY_SQL}
@@ -1156,6 +1156,13 @@ const rankingCache = new TtlCache<BoardRanking>(60_000, 16);
 const boardCache = new TtlCache<BoardPage>(60_000, 200);
 const pulseCache = new TtlCache<GlobalPulse>(60_000, 8);
 
+/** Drop every board cache. For tests, which compare one build with another. */
+export function clearBoardCaches(): void {
+  rankingCache.clear();
+  boardCache.clear();
+  pulseCache.clear();
+}
+
 async function getRanking(
   board: BoardKey,
   scope: BoardScope,
@@ -1316,7 +1323,7 @@ async function buildGlobalPulse(now: Date): Promise<GlobalPulse> {
         `SELECT
            toUInt8(toHour(timestamp)) AS hour,
            toUInt64(countIf(${PROMPT_EVENT_SQL})) AS prompts
-         FROM events_raw FINAL
+         FROM events_raw
          WHERE ${window}
            AND ${NO_LEGACY_SQL}
          GROUP BY hour`,
@@ -1324,7 +1331,7 @@ async function buildGlobalPulse(now: Date): Promise<GlobalPulse> {
       ),
       query<{ value_usd: number }>(
         `SELECT toFloat64(sum(value)) AS value_usd
-         FROM metrics_raw FINAL
+         FROM metrics_raw
          WHERE ${window}
            AND metric_name = 'claude_code.cost.usage'`,
         { since }
@@ -1345,7 +1352,7 @@ async function buildGlobalPulse(now: Date): Promise<GlobalPulse> {
            countIf(${PROMPT_EVENT_SQL}) AS day_prompts
          FROM (
            SELECT user_id, event_name, command_source, ${local.expr} AS ts_local
-           FROM events_raw FINAL
+           FROM events_raw
            WHERE ${window}
          )
          GROUP BY user_id, toDate(ts_local)

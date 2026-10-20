@@ -427,6 +427,9 @@ suite('every ClickHouse read resolves against 24.3', () => {
           timezone,
           currentStreak: 3,
           longestStreak: 9,
+          // What the sync job would have written: a board lists only users
+          // whose synced totals say they have usage (LISTED in boards.ts).
+          totalPrompts: 10,
         })
         .onConflictDoNothing();
     }
@@ -786,6 +789,180 @@ suite('every ClickHouse read resolves against 24.3', () => {
       expect(marks.get(USER_A)).toMatch(/^e=35:\d{4}-\d\d-\d\d [\d:.]+\|m=90:\d{4}-/);
       expect(marks.has(USER_B)).toBe(true);
       expect(await sync.fetchSyncWatermarks()).toEqual(marks);
+    });
+  });
+  // ─────────────────────────────────────────────────────────────────────────
+  // Identity at write time: the insert dedup token, and reads without FINAL
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe('insert deduplication', () => {
+    const USER_DEDUP = 'github_ci_reads_dedup';
+
+    async function countFor(table: 'events_raw' | 'metrics_raw'): Promise<number> {
+      const rows = await clickhouse.query<{ n: number }>(
+        `SELECT toUInt64(count()) AS n FROM ${table} WHERE user_id = {userId:String}`,
+        { userId: USER_DEDUP }
+      );
+      return Number(rows[0]?.n) || 0;
+    }
+
+    /** Three months, so the batch is split into three parts — three blocks. */
+    function batch(tag: string): import('./clickhouse').EventRow[] {
+      return [0, 40, 80].map((daysAgo, index) => ({
+        timestamp: at(daysAgo, 10),
+        user_id: USER_DEDUP,
+        session_id: `sess-dedup-${tag}`,
+        event_name: 'claude_code.user_prompt',
+        prompt_length: 100 + index,
+        message_uuid: `msg-dedup-${tag}-${index}`,
+        event_sequence: index,
+      }));
+    }
+
+    it('keeps the window on both tables, as the schema declares', async () => {
+      const rows = await clickhouse.query<{ name: string; create: string }>(
+        `SELECT name, create_table_query AS create FROM system.tables
+         WHERE database = currentDatabase() AND name IN ('events_raw', 'metrics_raw')`
+      );
+      expect(rows.length).toBe(2);
+      for (const row of rows) expect(row.create).toContain('non_replicated_deduplication_window = 10000');
+    });
+
+    it('drops a retried batch and keeps a different one', async () => {
+      const first = batch('a');
+      await clickhouse.insertEvents(first);
+      expect(await countFor('events_raw')).toBe(3);
+
+      // The retry: the same rows again, in the same order — dropped whole,
+      // across all three partitions.
+      await clickhouse.insertEvents(batch('a'));
+      expect(await countFor('events_raw')).toBe(3);
+
+      // A retry of a counter that came back with a different VALUE is still
+      // the same datapoint: the token is over the row ids, not the body.
+      await clickhouse.insertEvents(batch('a').map(row => ({ ...row, prompt_length: 9_999 })));
+      expect(await countFor('events_raw')).toBe(3);
+
+      // Different rows, a different token: they land.
+      await clickhouse.insertEvents(batch('b'));
+      expect(await countFor('events_raw')).toBe(6);
+
+      // The same per-table rule on metrics_raw.
+      const metric: import('./clickhouse').MetricRow = {
+        timestamp: at(0, 10),
+        user_id: USER_DEDUP,
+        session_id: 'sess-dedup-m',
+        metric_name: 'claude_code.cost.usage',
+        value: 0.5,
+        model: 'claude-opus-4-5',
+      };
+      await clickhouse.insertMetrics([metric]);
+      await clickhouse.insertMetrics([metric]);
+      expect(await countFor('metrics_raw')).toBe(1);
+
+      const duplicates = await clickhouse.query<{ dupes: number }>(
+        `SELECT toUInt64(count() - uniqExact(row_id)) AS dupes FROM events_raw`
+      );
+      expect(Number(duplicates[0]!.dupes)).toBe(0);
+    });
+  });
+
+  /**
+   * THE NUMBERS DO NOT MOVE. With no duplicate in the table, a read without
+   * FINAL must answer exactly what it answered with it. `final = 1` is the
+   * server setting that applies FINAL to every table in a query, so the same
+   * functions run twice, once each way, through a fetch that adds it.
+   */
+  describe('reads without FINAL', () => {
+    async function withFinal<T>(read: () => Promise<T>): Promise<T> {
+      const original = globalThis.fetch;
+      globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
+        if (url.origin === new URL(TEST_URL!).origin && !url.searchParams.has('query')) {
+          url.searchParams.set('final', '1');
+        }
+        return original(url.toString(), init);
+      }) as typeof fetch;
+      try {
+        return await read();
+      } finally {
+        globalThis.fetch = original;
+      }
+    }
+
+    it('applies FINAL through the setting, so the comparison is real', async () => {
+      // A cross-batch duplicate: same rows, a token of its own. Only FINAL —
+      // or a merge — collapses it, which is what proves the setting reached
+      // the server.
+      const row = {
+        timestamp: at(0, 11),
+        user_id: 'github_ci_reads_final_probe',
+        session_id: 'sess-final-probe',
+        metric_name: 'claude_code.cost.usage',
+        value: 1,
+        row_id: 'final-probe-row',
+      };
+      await clickhouse.insert('metrics_raw', [row]);
+      await clickhouse.insert('metrics_raw', [row, { ...row, row_id: 'final-probe-other', value: 0 }]);
+      const sql = `SELECT toUInt64(count()) AS n FROM metrics_raw WHERE user_id = 'github_ci_reads_final_probe'`;
+      expect(Number((await clickhouse.query<{ n: number }>(sql))[0]!.n)).toBe(3);
+      expect(Number((await withFinal(() => clickhouse.query<{ n: number }>(sql)))[0]!.n)).toBe(2);
+      await clickhouse.query(
+        `ALTER TABLE metrics_raw DELETE WHERE user_id = 'github_ci_reads_final_probe' SETTINGS mutations_sync = 2`
+      );
+    });
+
+    it('getUserTotals', async () => {
+      const without = await clickhouse.getUserTotals();
+      const withF = await withFinal(() => clickhouse.getUserTotals());
+      expect(without.length).toBeGreaterThanOrEqual(2);
+      const byUser = (rows: typeof without) =>
+        [...rows].sort((a, b) => a.user_id.localeCompare(b.user_id));
+      expect(byUser(without)).toEqual(byUser(withF));
+    });
+
+    it('getFingerprint', async () => {
+      const read = () => {
+        fingerprint.clearPeerCaches();
+        return fingerprint.getFingerprint(USER_A, {
+          username: 'ci-reads-a',
+          timezone: TZ_A,
+          isOwner: true,
+        });
+      };
+      const without = await read();
+      const withF = await withFinal(read);
+      expect(without.anatomy?.allTime.prompts).toBe(10);
+      // generatedAt is the clock at build time, the one field that is not data.
+      const data = (fp: typeof without) => JSON.parse(JSON.stringify({ ...fp, generatedAt: null }));
+      expect(data(without)).toEqual(data(withF));
+    }, 60_000);
+
+    it('getBoardPage, every board × scope, and getGlobalPulse', async () => {
+      const read = async () => {
+        boards.clearBoardCaches();
+        const pages: unknown[] = [];
+        for (const board of boards.BOARD_KEYS) {
+          for (const scope of boards.BOARDS[board].scopes) {
+            pages.push(await boards.getBoardPage({ board, scope, limit: 25, offset: 0, viewerId: USER_A }));
+          }
+        }
+        pages.push(await boards.getGlobalPulse());
+        return JSON.parse(JSON.stringify(pages));
+      };
+      const without = await read();
+      const withF = await withFinal(read);
+      expect(without).toEqual(withF);
+    }, 120_000);
+
+    it('the sync reads', async () => {
+      const read = async () => [
+        await sync.getUserHourlyCounts(USER_A, TZ_A),
+        await sync.getLongestSessionMessages(USER_A),
+        await clickhouse.getUserActiveLocalDays(USER_A, TZ_A, 365),
+        await clickhouse.getUserTotalToolCalls(USER_A),
+      ];
+      expect(await read()).toEqual(await withFinal(read));
     });
   });
 });

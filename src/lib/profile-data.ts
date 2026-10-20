@@ -86,7 +86,7 @@ export async function fetchYearSeries(userId: string, tz: string): Promise<Contr
          -- could put more flags on a day than it held prompts.
          toUInt64(${CAPPED_ULTRATHINKS_SQL}) AS ultrathinks,
          toUInt64(countIf(${PROMPT_EVENT_SQL} AND ${ESTIMATED_SQL})) AS estimated
-       FROM events_raw FINAL
+       FROM events_raw
        WHERE user_id = {userId:String}
          AND toDate(timestamp) >= today() - {days:UInt32}
        GROUP BY date`,
@@ -107,7 +107,7 @@ export async function fetchYearSeries(userId: string, tz: string): Promise<Contr
          toFloat64(sumIf(value, metric_name = 'claude_code.cost.usage')) AS cost,
          toUInt64(sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added')) AS lines_added,
          toFloat64(sumIf(value, metric_name = 'claude_code.cost.usage' AND ${ESTIMATED_SQL})) AS cost_estimated
-       FROM metrics_raw FINAL
+       FROM metrics_raw
        WHERE user_id = {userId:String}
          AND toDate(timestamp) >= today() - {days:UInt32}
        GROUP BY date`,
@@ -257,7 +257,7 @@ export async function fetchCurve(
              ${bucketSql(groupBy)},
              ${CAPPED_ULTRATHINKS_SQL} AS day_total,
              ${cappedUltrathinksSql(ESTIMATED_SQL)} AS day_estimated
-           FROM ${source.table} FINAL
+           FROM ${source.table}
            WHERE user_id = {userId:String} ${dateFilter}
            GROUP BY date, toDate(${LOCAL_TS_SQL})
          )
@@ -268,7 +268,7 @@ export async function fetchCurve(
            ${bucketSql(groupBy)},
            ${source.expr(source.match)} AS total,
            ${source.expr(`${source.match} AND ${ESTIMATED_SQL}`)} AS estimated
-         FROM ${source.table} FINAL
+         FROM ${source.table}
          WHERE user_id = {userId:String} ${dateFilter}
          GROUP BY date
          HAVING total > 0
@@ -329,7 +329,7 @@ export async function fetchToday(userId: string, tz: string): Promise<TodayData>
          -- apply, as a predicate rather than a GROUP BY because it is one day.
          toUInt64(${cappedUltrathinksSql(today)}) AS ultrathinks,
          toString(max(timestamp)) AS last_event
-       FROM events_raw FINAL
+       FROM events_raw
        WHERE user_id = {userId:String}
          AND toDate(timestamp) >= today() - 2`,
       params
@@ -341,7 +341,7 @@ export async function fetchToday(userId: string, tz: string): Promise<TodayData>
       `SELECT
          toFloat64(sumIf(value, metric_name = 'claude_code.cost.usage' AND ${today})) AS cost,
          toUInt64(sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added' AND ${today})) AS lines_added
-       FROM metrics_raw FINAL
+       FROM metrics_raw
        WHERE user_id = {userId:String}
          AND toDate(timestamp) >= today() - 2`,
       params
@@ -381,7 +381,7 @@ export async function fetchPipeline(userId: string): Promise<PipelineData> {
          argMax(app_version, if(app_version != '', timestamp, toDateTime(0))) AS cli_version,
          toString(minOrNull(if(${ESTIMATED_SQL}, toDate(timestamp), NULL))) AS imported_from,
          toString(maxOrNull(if(${ESTIMATED_SQL}, toDate(timestamp), NULL))) AS imported_to
-       FROM events_raw FINAL
+       FROM events_raw
        WHERE user_id = {userId:String}`,
       { userId }
     ),

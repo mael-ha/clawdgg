@@ -215,7 +215,7 @@ export async function getUserHourlyCounts(
       SELECT
         toHour(${LOCAL_TS_SQL}) as hour,
         COUNT(*) as count
-      FROM events_raw FINAL
+      FROM events_raw
       WHERE user_id = {userId:String}
         AND ${PROMPT_EVENT_SQL}
         AND ${NO_LEGACY_SQL}
@@ -249,7 +249,7 @@ export async function getLongestSessionMessages(userId: string): Promise<number>
       SELECT MAX(prompt_count) as max_prompts
       FROM (
         SELECT session_id, COUNT(*) as prompt_count
-        FROM events_raw FINAL
+        FROM events_raw
         WHERE user_id = {userId:String}
           AND ${PROMPT_EVENT_SQL}
           AND session_id != ''

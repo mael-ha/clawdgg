@@ -818,7 +818,7 @@ async function fetchEventTotals(userId: string, tz: string): Promise<EventTotals
        toUInt64(quantileExactIf(0.95)(prompt_length, ${measured} AND ${LAST_30D})) AS p95_30d,
        toUInt64(countIf(event_name = 'claude_code.tool_result')) AS tools_all,
        toUInt64(countIf(event_name = 'claude_code.tool_result' AND ${LAST_30D})) AS tools_30d
-     FROM events_raw FINAL
+     FROM events_raw
      WHERE user_id = {userId:String}
        AND ${CLAUDE_CODE_EVENT_SQL}`,
     { userId, tz }
@@ -830,7 +830,7 @@ async function fetchEventTotals(userId: string, tz: string): Promise<EventTotals
 async function fetchTopTools(userId: string): Promise<ToolCount[]> {
   const rows = await query<{ name: string; count: number }>(
     `SELECT tool_name AS name, toUInt64(count()) AS count
-     FROM events_raw FINAL
+     FROM events_raw
      WHERE user_id = {userId:String}
        AND event_name = 'claude_code.tool_result'
        AND tool_name != ''
@@ -869,7 +869,7 @@ async function fetchUltrathinks(
        SELECT
          toDate(${LOCAL_TS_SQL}) AS day,
          ${CAPPED_ULTRATHINKS_SQL} AS day_flags
-       FROM events_raw FINAL
+       FROM events_raw
        WHERE user_id = {userId:String}
        GROUP BY day
      )`,
@@ -927,7 +927,7 @@ async function fetchMetricTotals(
                              AND token_type = 'output' AND ${NO_LEGACY_SQL})) AS output_tokens,
        toFloat64(sumIf(value, ${value} AND query_source = 'subagent')) AS subagent_value,
        toFloat64(sumIf(value, ${value} AND query_source != '')) AS attributed_value
-     FROM metrics_raw FINAL
+     FROM metrics_raw
      WHERE user_id = {userId:String}`,
     {
       userId,
@@ -956,7 +956,7 @@ async function fetchHourWeekdayGrid(
        toUInt8(toHour(${LOCAL_TS_SQL})) AS hour,
        toUInt8(toDayOfWeek(${LOCAL_TS_SQL})) AS weekday,
        toUInt64(count()) AS prompts
-     FROM events_raw FINAL
+     FROM events_raw
      WHERE user_id = {userId:String}
        AND ${PROMPT_EVENT_SQL}
        AND ${NO_LEGACY_SQL}
@@ -969,12 +969,12 @@ async function fetchHourWeekdayGrid(
 async function fetchLanguages(userId: string): Promise<{ name: string; value: number }[]> {
   const rows = await query<{ name: string; value: number }>(
     `SELECT language AS name, toUInt64(count()) AS value
-     FROM metrics_raw FINAL
+     FROM metrics_raw
      WHERE user_id = {userId:String}
        AND metric_name = 'claude_code.code_edit_tool.decision'
        AND language != ''
      GROUP BY language
-     ORDER BY value DESC
+     ORDER BY value DESC, name ASC
      LIMIT 12`,
     { userId }
   );
@@ -985,12 +985,12 @@ async function fetchLanguages(userId: string): Promise<{ name: string; value: nu
 async function fetchModelValue(userId: string): Promise<{ model: string; value: number }[]> {
   return query<{ model: string; value: number }>(
     `SELECT ${MODEL_ID_SQL} AS model, toFloat64(sum(value)) AS value
-     FROM metrics_raw FINAL
+     FROM metrics_raw
      WHERE user_id = {userId:String}
        AND metric_name = 'claude_code.cost.usage'
        AND model != ''
      GROUP BY model
-     ORDER BY value DESC`,
+     ORDER BY value DESC, model ASC`,
     { userId }
   );
 }
@@ -1005,7 +1005,7 @@ async function fetchMonthlyHours(
        formatDateTime(${LOCAL_TS_SQL}, '%Y-%m') AS month,
        toUInt8(toHour(${LOCAL_TS_SQL})) AS hour,
        toUInt64(count()) AS prompts
-     FROM events_raw FINAL
+     FROM events_raw
      WHERE user_id = {userId:String}
        AND ${PROMPT_EVENT_SQL}
        AND ${NO_LEGACY_SQL}
@@ -1024,7 +1024,7 @@ async function fetchMonthlyEvents(
        formatDateTime(${LOCAL_TS_SQL}, '%Y-%m') AS month,
        toUInt64(countIf(${PROMPT_EVENT_SQL})) AS prompts,
        toUInt64(countIf(event_name = 'claude_code.tool_result')) AS tools
-     FROM events_raw FINAL
+     FROM events_raw
      WHERE user_id = {userId:String}
        AND ${NO_LEGACY_SQL}
      GROUP BY month`,
@@ -1042,7 +1042,7 @@ async function fetchMonthlyValue(
        formatDateTime(${LOCAL_TS_SQL}, '%Y-%m') AS month,
        toFloat64(sumIf(value, query_source = 'subagent')) AS subagent,
        toFloat64(sumIf(value, query_source != '')) AS attributed
-     FROM metrics_raw FINAL
+     FROM metrics_raw
      WHERE user_id = {userId:String}
        AND metric_name = 'claude_code.cost.usage'
        AND ${NO_LEGACY_SQL}
@@ -1069,7 +1069,7 @@ async function fetchDailySeries(userId: string, tz: string): Promise<DailyPoint[
          -- an uncapped day would date "your 1,000th ultrathink" to a day that
          -- did not contain a thousand prompts.
          toUInt64(${CAPPED_ULTRATHINKS_SQL}) AS ultrathinks
-       FROM events_raw FINAL
+       FROM events_raw
        WHERE user_id = {userId:String}
        GROUP BY date`,
       { userId, tz }
@@ -1078,7 +1078,7 @@ async function fetchDailySeries(userId: string, tz: string): Promise<DailyPoint[
       `SELECT
          toString(toDate(${LOCAL_TS_SQL})) AS date,
          toUInt64(sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added')) AS lines
-       FROM metrics_raw FINAL
+       FROM metrics_raw
        WHERE user_id = {userId:String}
        GROUP BY date`,
       { userId, tz }
@@ -1111,7 +1111,7 @@ async function fetchModelFirstUse(
 ): Promise<{ model: string; first_day: string }[]> {
   return query<{ model: string; first_day: string }>(
     `SELECT ${MODEL_ID_SQL} AS model, toString(min(toDate(${LOCAL_TS_SQL}))) AS first_day
-     FROM metrics_raw FINAL
+     FROM metrics_raw
      WHERE user_id = {userId:String}
        AND model != ''
      GROUP BY model`,
@@ -1151,7 +1151,7 @@ async function fetchPeerTotalsUncached(): Promise<{ peers: PeerTotals[]; activeU
            user_id,
            countIf(${PROMPT_EVENT_SQL}) AS day_prompts,
            ${CAPPED_ULTRATHINKS_SQL} AS day_flags
-         FROM events_raw FINAL
+         FROM events_raw
          GROUP BY user_id, toDate(timestamp)
        )
        GROUP BY user_id
@@ -1161,7 +1161,7 @@ async function fetchPeerTotalsUncached(): Promise<{ peers: PeerTotals[]; activeU
       `SELECT
          user_id,
          toUInt64(sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added')) AS lines
-       FROM metrics_raw FINAL
+       FROM metrics_raw
        GROUP BY user_id`
     ),
   ]);
@@ -1204,7 +1204,7 @@ async function countActiveUsers(): Promise<number> {
   return activeUserCache.remember('all', async () => {
     const rows = await query<{ users: number }>(
       `SELECT toUInt64(uniqExact(user_id)) AS users
-       FROM events_raw FINAL
+       FROM events_raw
        WHERE ${PROMPT_EVENT_SQL}`
     );
     return Number(rows[0]?.users) || 0;

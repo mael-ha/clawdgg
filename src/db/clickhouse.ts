@@ -4,7 +4,7 @@
  *
  * ARCHITECTURE:
  * - Raw tables use ReplacingMergeTree for deduplication
- * - All queries use FINAL to get deduplicated results
+ * - Reads do not use FINAL: identity is enforced at write time (see insert())
  * - No materialized views - aggregation happens at query time
  *
  * OTEL NAMING CONVENTION (from Claude Code):
@@ -71,9 +71,9 @@ export interface QueryOptions {
  * HOW MANY READS MAY BE INSIDE CLICKHOUSE AT ONCE. Not a tuning knob — this is
  * what stops a profile render from taking the server down.
  *
- * Every read here is `... FINAL`, which means merging the ReplacingMergeTree
- * parts in memory, and the sorting key now ends in `row_id` (32 hex chars) so
- * the merge carries that column too. One profile query over a 1.5M-event user
+ * Every read here USED TO BE `... FINAL`, which means merging the
+ * ReplacingMergeTree parts in memory, and the sorting key ends in `row_id` (32
+ * hex chars) so the merge carried that column too. One profile query over a 1.5M-event user
  * costs 116–285 MiB, measured from system.query_log. A single profile render
  * fires ~25–30 of them at once through nested `Promise.all`s (src/routes/
  * profile.tsx, src/lib/fingerprint.ts, src/lib/profile-data.ts), and prod's
@@ -255,20 +255,56 @@ function sanitizeRow(row: Record<string, any>): Record<string, any> {
 }
 
 /**
+ * The `insert_deduplication_token` for one insert: a hash of the table and of
+ * the identity of every row in it, in order.
+ *
+ * Over `row_id`, not over the body: an OTLP retry of a cumulative counter can
+ * carry a different VALUE for the same datapoint, and that is still the same
+ * datapoint — hashing the body would let it in twice. A row with no row_id
+ * (nothing in src/ writes one, but `insert` is exported) falls back to its
+ * serialized form, so it is at least never mistaken for a different row.
+ */
+export function insertDedupToken(table: string, rows: Record<string, any>[], body: string[]): string {
+  const hash = createHash('sha256').update(table);
+  rows.forEach((row, index) => {
+    hash.update('\n');
+    hash.update(typeof row.row_id === 'string' && row.row_id !== '' ? row.row_id : body[index]!);
+  });
+  return hash.digest('hex');
+}
+
+/**
  * Insert rows into a ClickHouse table
  *
  * DELIBERATELY NOT under withReadPermit: see the note on
- * DEFAULT_MAX_CONCURRENT_READS. An insert is cheap (no FINAL, no merge) and
- * ingestion must never wait behind a profile render.
+ * DEFAULT_MAX_CONCURRENT_READS. An insert is cheap (no merge) and ingestion
+ * must never wait behind a profile render.
+ *
+ * IDENTITY IS ENFORCED HERE, AT WRITE TIME, which is why no read in src/ uses
+ * FINAL. Two layers:
+ *   - every row carries `row_id`, the hash of what identifies it (see
+ *     metricRowId/eventRowId), at the end of the sorting key;
+ *   - every insert carries an `insert_deduplication_token` derived from those
+ *     row_ids, and both raw tables keep `non_replicated_deduplication_window`
+ *     (docker/clickhouse/migrations/2026-10-20_insert_dedup_window.sql), so a
+ *     retried batch — an OTLP exporter resending after a timeout, a CLI import
+ *     re-posting a batch it never saw acknowledged — is dropped by the server
+ *     instead of landing twice.
+ * ReplacingMergeTree's background merge still collapses equal sorting keys,
+ * as a backstop for a duplicate that arrives in a DIFFERENT batch shape. FINAL
+ * made every read pay to do that merge again in memory — 3x the time and 600x
+ * the bytes on a measured count — for duplicates that were not there.
  */
 export async function insert(table: string, rows: Record<string, any>[]): Promise<void> {
   if (rows.length === 0) return;
 
+  const lines = rows.map(row => JSON.stringify(sanitizeRow(row)));
+  const body = lines.join('\n');
+
   const url = new URL(CLICKHOUSE_URL);
   url.searchParams.set('database', CLICKHOUSE_DATABASE);
   url.searchParams.set('query', `INSERT INTO ${table} FORMAT JSONEachRow`);
-
-  const body = rows.map(row => JSON.stringify(sanitizeRow(row))).join('\n');
+  url.searchParams.set('insert_deduplication_token', insertDedupToken(table, rows, lines));
 
   const response = await fetch(url.toString(), {
     method: 'POST',
@@ -496,7 +532,7 @@ export interface HourlyActivity {
  * nothing that merely measures it.
  *
  * Why it exists: ReplacingMergeTree collapses rows that share the sorting key,
- * and every read uses FINAL. The old keys were
+ * and the reads used FINAL. The old keys were
  *   metrics_raw (user_id, metric_name, token_type, line_type, timestamp)
  *   events_raw  (user_id, session_id, event_name, timestamp, tool_name)
  * but Claude Code emits several datapoints with the SAME timestamp that differ
@@ -901,12 +937,12 @@ export const MODEL_ID_SQL = MODEL_DECORATION_PATTERNS.reduce(
 );
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Query Functions (all use FINAL for deduplication)
+// Query Functions (no FINAL — see insert())
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
  * Get user totals for leaderboard sync
- * Queries raw tables with FINAL for deduplication
+ * Queries the raw tables directly; see insert() for why without FINAL
  *
  * NOTE: user_prompt events = actual user prompts (with prompt_length)
  *       api_request events = all LLM calls (includes tool continuations)
@@ -922,7 +958,7 @@ export async function getUserTotals(userId?: string): Promise<UserTotals[]> {
           countIf(${PROMPT_EVENT_SQL}) as total_prompts,
           sumIf(prompt_length, ${PROMPT_EVENT_SQL} AND prompt_length > 0) as total_prompt_chars,
           countIf(${PROMPT_EVENT_SQL} AND prompt_length > 0) as total_measured_prompts
-        FROM events_raw FINAL
+        FROM events_raw
         ${whereClause ? `${whereClause} AND ${CLAUDE_CODE_EVENT_SQL}` : `WHERE ${CLAUDE_CODE_EVENT_SQL}`}
         GROUP BY user_id
       ),
@@ -939,7 +975,7 @@ export async function getUserTotals(userId?: string): Promise<UserTotals[]> {
           sumIf(value, metric_name = 'claude_code.commit.count') as total_commits,
           sumIf(value, metric_name = 'claude_code.pull_request.count') as total_prs,
           sumIf(value, metric_name = 'claude_code.active_time.total') as total_active_seconds
-        FROM metrics_raw FINAL
+        FROM metrics_raw
         ${whereClause}
         GROUP BY user_id
       )
@@ -984,7 +1020,7 @@ export async function getUserDailyMetrics(userId: string, days: number = 365): P
         SELECT
           toDate(timestamp) as date,
           countIf(${PROMPT_EVENT_SQL}) as prompts
-        FROM events_raw FINAL
+        FROM events_raw
         WHERE user_id = {userId:String}
           AND toDate(timestamp) >= today() - {days:UInt32}
           -- The DATE SET, not just the count: an ultrathink flag on a day with
@@ -1007,7 +1043,7 @@ export async function getUserDailyMetrics(userId: string, days: number = 365): P
           sumIf(value, metric_name = 'claude_code.pull_request.count') as prs,
           sumIf(value, metric_name = 'claude_code.session.count') as sessions,
           sumIf(value, metric_name = 'claude_code.active_time.total') as active_seconds
-        FROM metrics_raw FINAL
+        FROM metrics_raw
         WHERE user_id = {userId:String}
           AND toDate(timestamp) >= today() - {days:UInt32}
         GROUP BY date
@@ -1059,7 +1095,7 @@ export async function getUserActiveLocalDays(
 ): Promise<string[]> {
   const rows = await query<{ date: string }>(
     `SELECT toString(toDate(${LOCAL_TS_SQL})) as date
-     FROM events_raw FINAL
+     FROM events_raw
      WHERE user_id = {userId:String}
        AND toDate(timestamp) >= today() - {days:UInt32}
        AND ${PROMPT_EVENT_SQL}
@@ -1087,7 +1123,7 @@ export async function getUserModelUsage(userId: string, days?: number): Promise<
       toUInt64(sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'input')) as input_tokens,
       toUInt64(sumIf(value, metric_name = 'claude_code.token.usage' AND token_type = 'output')) as output_tokens,
       toFloat64(sumIf(value, metric_name = 'claude_code.cost.usage')) as cost_usd
-    FROM metrics_raw FINAL
+    FROM metrics_raw
     WHERE user_id = {userId:String}
       AND model != ''
       ${dateFilter}
@@ -1113,7 +1149,7 @@ export async function getUserHourlyActivity(
       toUInt8(toHour(${LOCAL_TS_SQL})) as hour,
       toUInt8(toDayOfWeek(${LOCAL_TS_SQL})) as day_of_week,
       toUInt64(${TOTAL_TOKENS_SQL}) as activity
-    FROM metrics_raw FINAL
+    FROM metrics_raw
     WHERE user_id = {userId:String}
       AND ${NO_LEGACY_SQL}
       AND timestamp >= now() - INTERVAL {days:UInt32} DAY
@@ -1158,7 +1194,7 @@ export async function getLeaderboard(
           countIf(${PROMPT_EVENT_SQL}) as total_prompts,
           sumIf(prompt_length, ${PROMPT_EVENT_SQL} AND prompt_length > 0) as total_prompt_chars,
           countIf(${PROMPT_EVENT_SQL} AND prompt_length > 0) as total_measured_prompts
-        FROM events_raw FINAL
+        FROM events_raw
         WHERE ${dateFilter}
           -- The ENTRANT SET: a user whose only row in the period is an
           -- ultrathink flag is not on the leaderboard with zeroes, they are
@@ -1179,7 +1215,7 @@ export async function getLeaderboard(
           sumIf(value, metric_name = 'claude_code.commit.count') as total_commits,
           sumIf(value, metric_name = 'claude_code.pull_request.count') as total_prs,
           sumIf(value, metric_name = 'claude_code.active_time.total') as total_active_seconds
-        FROM metrics_raw FINAL
+        FROM metrics_raw
         WHERE ${dateFilter}
         GROUP BY user_id
       )
@@ -1219,7 +1255,7 @@ export async function getLeaderboard(
   // ones whose only rows are synthetic (an ultrathink flag is not an entrant).
   const countSql = `
     SELECT count(DISTINCT user_id) as total
-    FROM events_raw FINAL
+    FROM events_raw
     WHERE ${dateFilter}
       AND ${PROMPT_EVENT_SQL}
   `;
@@ -1257,7 +1293,7 @@ export async function getUserRank(
         SELECT
           user_id,
           countIf(${PROMPT_EVENT_SQL}) as total_prompts
-        FROM events_raw FINAL
+        FROM events_raw
         WHERE ${dateFilter}
           AND ${CLAUDE_CODE_EVENT_SQL}
         GROUP BY user_id
@@ -1268,7 +1304,7 @@ export async function getUserRank(
           ${TOTAL_TOKENS_SQL} as total_tokens,
           sumIf(value, metric_name = 'claude_code.cost.usage') as total_cost_usd,
           sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added') as total_lines_added
-        FROM metrics_raw FINAL
+        FROM metrics_raw
         WHERE ${dateFilter}
         GROUP BY user_id
       ),
@@ -1326,7 +1362,7 @@ export async function getUserTodayMetrics(userId: string): Promise<TodayMetrics 
         SELECT
           countIf(${PROMPT_EVENT_SQL}) as prompts,
           MAX(timestamp) as lastActivity
-        FROM events_raw FINAL
+        FROM events_raw
         WHERE user_id = {userId:String}
           AND toDate(timestamp) = today()
       ),
@@ -1341,7 +1377,7 @@ export async function getUserTodayMetrics(userId: string): Promise<TodayMetrics 
           sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'removed') as linesRemoved,
           sumIf(value, metric_name = 'claude_code.commit.count') as commits,
           sumIf(value, metric_name = 'claude_code.active_time.total') as activeSeconds
-        FROM metrics_raw FINAL
+        FROM metrics_raw
         WHERE user_id = {userId:String}
           AND toDate(timestamp) = today()
       )
@@ -1399,7 +1435,7 @@ export async function getUserCacheStats(userId: string, days?: number): Promise<
       speed,
       toUInt64(sumIf(value, token_type = 'cacheRead')) as cacheReadTokens,
       toUInt64(sumIf(value, token_type = 'input')) as inputTokens
-    FROM metrics_raw FINAL
+    FROM metrics_raw
     WHERE user_id = {userId:String}
       AND metric_name = 'claude_code.token.usage'
       AND token_type IN ('input', 'cacheRead')
@@ -1457,7 +1493,7 @@ export async function getUserToolBreakdown(userId: string, days: number = 30): P
       toUInt64(SUM(1 - tool_success)) as failureCount,
       toFloat64(if(COUNT(*) > 0, SUM(tool_success) * 100.0 / COUNT(*), 0)) as successRate,
       toFloat64(AVG(tool_duration_ms)) as avgDurationMs
-    FROM events_raw FINAL
+    FROM events_raw
     WHERE user_id = {userId:String}
       AND event_name = 'claude_code.tool_result'
       AND tool_name != ''
@@ -1476,7 +1512,7 @@ export async function getUserToolBreakdown(userId: string, days: number = 30): P
 export async function getUserTotalToolCalls(userId: string): Promise<number> {
   const sql = `
     SELECT COUNT(*) as total
-    FROM events_raw FINAL
+    FROM events_raw
     WHERE user_id = {userId:String}
       AND event_name = 'claude_code.tool_result'
   `;
@@ -1506,7 +1542,7 @@ export async function getActivityHeatmap(
       toUInt8(toDayOfWeek(${LOCAL_TS_SQL})) as dayOfWeek,
       toUInt64(SUM(input_tokens + output_tokens)) as activity,
       toUInt64(COUNT(*)) as promptCount
-    FROM events_raw FINAL
+    FROM events_raw
     WHERE user_id = {userId:String}
       AND ${PROMPT_EVENT_SQL}
       AND ${NO_LEGACY_SQL}
@@ -1536,7 +1572,7 @@ export async function getUserVelocityTrend(userId: string, days: number = 30): P
         SELECT
           toDate(timestamp) as date,
           countIf(${PROMPT_EVENT_SQL}) as prompts
-        FROM events_raw FINAL
+        FROM events_raw
         WHERE user_id = {userId:String}
           AND toDate(timestamp) >= today() - {days:UInt32}
           AND ${CLAUDE_CODE_EVENT_SQL}
@@ -1548,7 +1584,7 @@ export async function getUserVelocityTrend(userId: string, days: number = 30): P
           ${TOTAL_TOKENS_SQL} as tokens,
           sumIf(value, metric_name = 'claude_code.cost.usage') as costUsd,
           sumIf(value, metric_name = 'claude_code.lines_of_code.count' AND line_type = 'added') as lines
-        FROM metrics_raw FINAL
+        FROM metrics_raw
         WHERE user_id = {userId:String}
           AND toDate(timestamp) >= today() - {days:UInt32}
         GROUP BY date
@@ -1585,7 +1621,7 @@ export async function getUserSessionStats(userId: string, days: number = 30): Pr
         session_id,
         COUNT(*) as prompt_count,
         dateDiff('second', MIN(timestamp), MAX(timestamp)) / 60 as duration_minutes
-      FROM events_raw FINAL
+      FROM events_raw
       WHERE user_id = {userId:String}
         AND ${PROMPT_EVENT_SQL}
         AND timestamp >= now() - INTERVAL {days:UInt32} DAY
@@ -1629,7 +1665,7 @@ export async function getUserLanguageStats(userId: string, days?: number): Promi
   const sql = `
     WITH total AS (
       SELECT count(*) as total_edits
-      FROM metrics_raw FINAL
+      FROM metrics_raw
       WHERE user_id = {userId:String}
         AND metric_name = 'claude_code.code_edit_tool.decision'
         AND language != ''
@@ -1643,7 +1679,7 @@ export async function getUserLanguageStats(userId: string, days?: number): Promi
       toFloat64(if(count(*) > 0, countIf(decision = 'accept') * 100.0 / count(*), 0)) as acceptRate,
       toFloat64(if((SELECT total_edits FROM total) > 0,
          count(*) * 100.0 / (SELECT total_edits FROM total), 0)) as percentage
-    FROM metrics_raw FINAL
+    FROM metrics_raw
     WHERE user_id = {userId:String}
       AND metric_name = 'claude_code.code_edit_tool.decision'
       AND language != ''
@@ -1687,7 +1723,7 @@ export async function getUserTrustStyle(userId: string, days?: number): Promise<
           toUInt64(countIf(decision = 'accept')) as acceptedEdits,
           toUInt64(countIf(decision = 'reject')) as rejectedEdits,
           toFloat64(if(count(*) > 0, countIf(decision = 'accept') * 100.0 / count(*), 0)) as editAcceptRate
-        FROM metrics_raw FINAL
+        FROM metrics_raw
         WHERE user_id = {userId:String}
           AND metric_name = 'claude_code.code_edit_tool.decision'
           ${dateFilter}
@@ -1699,7 +1735,7 @@ export async function getUserTrustStyle(userId: string, days?: number): Promise<
           toUInt64(countIf(source = 'user_temporary')) as userTemporary,
           toUInt64(countIf(source = 'user_abort')) as userAbort,
           toUInt64(countIf(source = 'user_reject')) as userReject
-        FROM events_raw FINAL
+        FROM events_raw
         WHERE user_id = {userId:String}
           AND event_name IN ('claude_code.tool_result', 'claude_code.tool_decision')
           AND source != ''
@@ -1747,7 +1783,7 @@ export async function getUserAgenticStats(userId: string, days?: number): Promis
         SELECT
           toUInt64(countIf(event_name = 'claude_code.api_request')) as totalApiCalls,
           toUInt64(countIf(${PROMPT_EVENT_SQL})) as totalPrompts
-        FROM events_raw FINAL
+        FROM events_raw
         WHERE user_id = {userId:String}
           AND ${NO_LEGACY_SQL}
           ${dateFilter}
@@ -1757,7 +1793,7 @@ export async function getUserAgenticStats(userId: string, days?: number): Promis
           session_id,
           countIf(event_name = 'claude_code.api_request') as api_calls,
           countIf(${PROMPT_EVENT_SQL}) as prompts
-        FROM events_raw FINAL
+        FROM events_raw
         WHERE user_id = {userId:String}
           AND session_id != ''
           AND ${NO_LEGACY_SQL}
@@ -1798,7 +1834,7 @@ export async function getUserPromptLengthStats(userId: string, days?: number): P
       toUInt64(max(prompt_length)) as maxLength,
       toUInt64(min(prompt_length)) as minLength,
       toUInt64(count(*)) as totalPrompts
-    FROM events_raw FINAL
+    FROM events_raw
     WHERE user_id = {userId:String}
       AND ${PROMPT_EVENT_SQL}
       AND prompt_length > 0
@@ -1822,7 +1858,7 @@ export async function getTodayLanguages(userId: string): Promise<TodayLanguage[]
   const sql = `
     WITH total AS (
       SELECT count(*) as total_edits
-      FROM metrics_raw FINAL
+      FROM metrics_raw
       WHERE user_id = {userId:String}
         AND metric_name = 'claude_code.code_edit_tool.decision'
         AND toDate(timestamp) = today()
@@ -1833,7 +1869,7 @@ export async function getTodayLanguages(userId: string): Promise<TodayLanguage[]
       toUInt64(count(*)) as count,
       toFloat64(if((SELECT total_edits FROM total) > 0,
          count(*) * 100.0 / (SELECT total_edits FROM total), 0)) as percentage
-    FROM metrics_raw FINAL
+    FROM metrics_raw
     WHERE user_id = {userId:String}
       AND metric_name = 'claude_code.code_edit_tool.decision'
       AND toDate(timestamp) = today()
@@ -1859,7 +1895,7 @@ export async function getUserTerminalStats(userId: string): Promise<TerminalStat
   const sql = `
     WITH total AS (
       SELECT uniqExact(session_id) as total_sessions
-      FROM metrics_raw FINAL
+      FROM metrics_raw
       WHERE user_id = {userId:String}
         AND terminal_type != ''
     )
@@ -1868,7 +1904,7 @@ export async function getUserTerminalStats(userId: string): Promise<TerminalStat
       toUInt64(uniqExact(session_id)) as sessionCount,
       toFloat64(if((SELECT total_sessions FROM total) > 0,
          uniqExact(session_id) * 100.0 / (SELECT total_sessions FROM total), 0)) as percentage
-    FROM metrics_raw FINAL
+    FROM metrics_raw
     WHERE user_id = {userId:String}
       AND terminal_type != ''
     GROUP BY terminal_type
@@ -1907,7 +1943,7 @@ export async function getUserProvenanceBreakdown(userId: string): Promise<Proven
                countIf(${PROMPT_EVENT_SQL}) as prompts,
                toString(min(toDate(timestamp))) as first_day,
                toString(max(toDate(timestamp))) as last_day
-        FROM events_raw FINAL
+        FROM events_raw
         WHERE user_id = {userId:String}
           -- A provenance whose only rows are ultrathink flags contributes no
           -- prompt, no token and no dollar, so listing it as a source of the
@@ -1919,7 +1955,7 @@ export async function getUserProvenanceBreakdown(userId: string): Promise<Proven
         SELECT provenance,
                ${TOTAL_TOKENS_SQL} as tokens,
                sumIf(value, metric_name = 'claude_code.cost.usage') as cost_usd
-        FROM metrics_raw FINAL
+        FROM metrics_raw
         WHERE user_id = {userId:String}
         GROUP BY provenance
       )
@@ -1959,7 +1995,7 @@ export async function getUserTodayMetricsEnhanced(userId: string): Promise<Today
   // Get today's top tool
   const toolSql = `
     SELECT tool_name as topTool
-    FROM events_raw FINAL
+    FROM events_raw
     WHERE user_id = {userId:String}
       AND event_name = 'claude_code.tool_result'
       AND tool_name != ''
@@ -1974,7 +2010,7 @@ export async function getUserTodayMetricsEnhanced(userId: string): Promise<Today
   const editSql = `
     SELECT
       toFloat64(if(count(*) > 0, countIf(decision = 'accept') * 100.0 / count(*), 0)) as editAcceptRate
-    FROM metrics_raw FINAL
+    FROM metrics_raw
     WHERE user_id = {userId:String}
       AND metric_name = 'claude_code.code_edit_tool.decision'
       AND toDate(timestamp) = today()
