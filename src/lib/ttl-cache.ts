@@ -37,6 +37,8 @@
  * it is deliberately not a correctness mechanism: nothing writes through it.
  */
 
+import { untimed } from './request-timing';
+
 interface Entry<T> {
   value: T;
   /** Served as-is until here. */
@@ -136,8 +138,9 @@ export class TtlCache<T> {
 
     if (entry && entry.staleUntil > now) {
       // One rebuild per key, and this caller does not wait for it.
+      // Untimed: nobody is waiting on it, so it is not this request's time.
       if (!this.#inFlight.has(key)) {
-        this.#build(key, build, shouldCache).catch((error) => {
+        untimed(() => this.#build(key, build, shouldCache)).catch((error) => {
           console.error(`[${this.#name}] background rebuild of ${key} failed:`, error);
         });
       }

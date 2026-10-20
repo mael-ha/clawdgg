@@ -31,6 +31,7 @@ import { createHash } from 'node:crypto';
 import { getModelPricing, type PricingMatchQuality } from '../lib/pricing';
 import { DEFAULT_TIMEZONE, normalizeTimezone } from '../lib/timezone';
 import { ULTRATHINK_EVENT_NAME } from '../lib/ultrathink';
+import { recordClickhouse } from '../lib/request-timing';
 
 const CLICKHOUSE_URL = process.env.CLICKHOUSE_URL || 'http://localhost:8123';
 const CLICKHOUSE_DATABASE = process.env.CLICKHOUSE_DATABASE || 'clawd';
@@ -145,6 +146,21 @@ export async function query<T = any>(
   params?: Record<string, any>,
   options?: QueryOptions
 ): Promise<T[]> {
+  // For the Server-Timing header (src/lib/request-timing.ts): from the call to
+  // the answer, permit wait included, because that is what the request paid.
+  const start = performance.now();
+  try {
+    return await runQuery<T>(sql, params, options);
+  } finally {
+    recordClickhouse(performance.now() - start);
+  }
+}
+
+async function runQuery<T>(
+  sql: string,
+  params?: Record<string, any>,
+  options?: QueryOptions
+): Promise<T[]> {
   const url = new URL(CLICKHOUSE_URL);
   url.searchParams.set('database', CLICKHOUSE_DATABASE);
   url.searchParams.set('default_format', 'JSONEachRow');
@@ -196,7 +212,7 @@ export async function query<T = any>(
     // is not already UTC, and only on an error that names a time zone. Anything
     // else throws as before. The write-path probe passes its candidate under a
     // DIFFERENT parameter name for exactly this reason — it needs the truth,
-    // not a fallback. The retry re-enters query() with the permit already
+    // not a fallback. The retry re-enters runQuery() with the permit already
     // released, so it queues like any other read instead of deadlocking
     // against itself.
     if (params?.tz && String(params.tz) !== DEFAULT_TIMEZONE && /time zone/i.test(errorText)) {
@@ -204,7 +220,7 @@ export async function query<T = any>(
         `[ClickHouse] timezone ${params.tz} is unusable; re-reading in ${DEFAULT_TIMEZONE}:`,
         errorText.slice(0, 200)
       );
-      return query<T>(sql, { ...params, tz: DEFAULT_TIMEZONE }, options);
+      return runQuery<T>(sql, { ...params, tz: DEFAULT_TIMEZONE }, options);
     }
 
     console.error('[ClickHouse] Query failed:', { sql: sql.slice(0, 200), error: errorText });

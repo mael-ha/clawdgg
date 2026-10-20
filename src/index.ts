@@ -14,6 +14,7 @@ import profile from './routes/profile';
 import about from './routes/about';
 import { pageRateLimit, rateLimit } from './lib/rate-limit';
 import { optionalAuth } from './lib/auth-middleware';
+import { serverTiming } from './lib/request-timing';
 import { startSyncJob, stopSyncJob } from './jobs/sync-clickhouse';
 import { startWarmJob, stopWarmJob } from './lib/warm';
 import { healthCheck as clickhouseHealthCheck } from './db/clickhouse';
@@ -25,7 +26,8 @@ const app = new Hono();
 let isReady = false;
 let clickhouseHealthy = false;
 
-// Global middleware
+// Global middleware. Server-Timing first, so its `total` covers the rest.
+app.use('*', serverTiming);
 app.use('*', logger());
 app.use(
   '*',
