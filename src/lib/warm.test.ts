@@ -138,22 +138,22 @@ describe('WARM_PROFILES', () => {
     else process.env.WARM_PROFILES = before;
   });
 
-  it('is on by default', () => {
+  it('is off by default', () => {
     delete process.env.WARM_PROFILES;
-    expect(warmingEnabled()).toBe(true);
-    expect(startWarmJob()).toBe(true);
-  });
-
-  it('schedules nothing when set to 0', () => {
-    process.env.WARM_PROFILES = '0';
     expect(warmingEnabled()).toBe(false);
     expect(startWarmJob()).toBe(false);
   });
 
-  it('is only disabled by exactly 0 — anything else is on', () => {
+  it('schedules the job when set to 1', () => {
     process.env.WARM_PROFILES = '1';
     expect(warmingEnabled()).toBe(true);
+    expect(startWarmJob()).toBe(true);
+  });
+
+  it('is only enabled by exactly 1 — anything else is off', () => {
+    process.env.WARM_PROFILES = '0';
+    expect(warmingEnabled()).toBe(false);
     process.env.WARM_PROFILES = 'true';
-    expect(warmingEnabled()).toBe(true);
+    expect(warmingEnabled()).toBe(false);
   });
 });

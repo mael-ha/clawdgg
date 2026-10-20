@@ -32,9 +32,10 @@
  * walk continues: one broken profile must not stop the other hundred being
  * warmed, and the throw was never going to be cached anyway.
  *
- * CHEAP TO TURN OFF: `WARM_PROFILES=0` and nothing is scheduled. This job's
- * whole value is a latency improvement, so it must be possible to take out of
- * the picture without a deploy that changes anything else.
+ * OFF UNLESS ASKED FOR: only `WARM_PROFILES=1` schedules it. With nobody
+ * visiting, this job and the sync job were the whole ClickHouse load — ~600 s
+ * of query time an hour re-reading every history — and visitors queued behind
+ * it. The SWR caches stay; a cold profile pays for its own first view.
  *
  * It warms the PUBLIC view only. An owner's payload carries the sections they
  * have hidden, and nothing but their own request should ever build one.
@@ -87,9 +88,9 @@ export interface WarmOptions {
   log?: (line: string) => void;
 }
 
-/** `WARM_PROFILES=0` and the job is not scheduled at all. */
+/** Only `WARM_PROFILES=1` schedules the job. */
 export function warmingEnabled(): boolean {
-  return process.env.WARM_PROFILES !== '0';
+  return process.env.WARM_PROFILES === '1';
 }
 
 /**
@@ -189,10 +190,10 @@ export async function warmCycle(options: WarmOptions = {}): Promise<WarmReport |
   return report;
 }
 
-/** Schedules the cycle. Returns false when WARM_PROFILES=0. */
+/** Schedules the cycle. Returns false unless WARM_PROFILES=1. */
 export function startWarmJob(): boolean {
   if (!warmingEnabled()) {
-    console.log('[warm] WARM_PROFILES=0 — profile warming disabled');
+    console.log('[warm] profile warming off (WARM_PROFILES=1 to enable)');
     return false;
   }
   if (timer) return true;
