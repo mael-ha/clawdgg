@@ -43,28 +43,37 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 /**
- * The client's address as Caddy saw it — the LAST `X-Forwarded-For` entry.
+ * The visitor's address, as our own proxy established it.
  *
- * Caddy APPENDS the immediate peer to whatever the request already carried, so
- * the list is `<whatever the client claimed>, …, <the real peer>`. Reading the
- * FIRST entry, which this used to do, reads the client's own header: anyone
- * could send `X-Forwarded-For: <random>` and get a fresh budget on every
- * request, which is not a weaker limit but no limit. The last entry is the one
- * hop we trust, because our own proxy wrote it.
+ * X-Real-IP first. Caddy SETS it (`header_up X-Real-IP {client_ip}` in the
+ * Caddyfile), replacing whatever the request carried, to `{client_ip}`: the
+ * CF-Connecting-IP header when the TCP peer is one of Cloudflare's published
+ * ranges (`trusted_proxies`), and the peer itself for anyone else. So a visitor
+ * behind Cloudflare gets their own budget instead of sharing their edge's, and
+ * a request sent straight to the origin with a forged CF-Connecting-IP gets its
+ * own peer address. That last guarantee lives in Caddy, not here: this function
+ * cannot tell a Cloudflare peer from any other, and it trusts X-Real-IP only
+ * because the app is reachable through Caddy alone (port 3000 is loopback).
  *
- * Direct (no proxy, as in `bun run dev`) there is no header and Hono's
- * connection info is the answer.
+ * The LAST `X-Forwarded-For` entry is the fallback, for a proxy that does not
+ * set X-Real-IP. Caddy APPENDS the immediate peer to whatever the request
+ * already carried, so the list is `<whatever the client claimed>, …, <the real
+ * peer>`; the FIRST entry is the client's own claim, and keying on it meant one
+ * fabricated hop per request bought a fresh budget. Behind Cloudflare the last
+ * hop is the edge, which is why it is no longer the first choice.
+ *
+ * Direct (no proxy, as in `bun run dev`) there is no header and every request
+ * shares one bucket.
  */
 export function clientIp(c: Context): string {
+  const real = c.req.header('x-real-ip')?.trim();
+  if (real) return real;
   const forwarded = c.req.header('x-forwarded-for');
   if (forwarded) {
     const hops = forwarded.split(',');
     const peer = hops[hops.length - 1]?.trim();
     if (peer) return peer;
   }
-  // Caddy sets this one to a single address, so it needs no unpicking.
-  const real = c.req.header('x-real-ip')?.trim();
-  if (real) return real;
   return 'unknown';
 }
 

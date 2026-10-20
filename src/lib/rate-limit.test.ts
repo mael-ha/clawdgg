@@ -6,6 +6,12 @@
  * it is talking to, so the first entry is the claim and the last one is the
  * measurement — and a limiter keyed on the claim is not a weaker limit, it is
  * no limit: one fabricated hop per request and every request is a new key.
+ *
+ * Then Cloudflare went in front, and the last hop became the Cloudflare edge:
+ * every visitor one edge serves, one budget. Caddy now resolves the visitor
+ * (CF-Connecting-IP, trusted only from Cloudflare's ranges) and SETS X-Real-IP
+ * to it, and that is what the app reads. The headers below are what Caddy
+ * hands the app in each case, not what the visitor sent.
  */
 
 import { beforeEach, describe, expect, it } from 'bun:test';
@@ -35,7 +41,7 @@ function ipApp() {
 describe('clientIp', () => {
   const read = ipApp();
 
-  it('takes the LAST X-Forwarded-For hop — the one our proxy wrote', async () => {
+  it('takes the LAST X-Forwarded-For hop when there is no X-Real-IP', async () => {
     expect(await read({ 'x-forwarded-for': '203.0.113.7' })).toBe('203.0.113.7');
     // The client claimed 1.1.1.1; Caddy appended what it actually saw.
     expect(await read({ 'x-forwarded-for': '1.1.1.1, 203.0.113.7' })).toBe('203.0.113.7');
@@ -44,8 +50,18 @@ describe('clientIp', () => {
     );
   });
 
-  it('falls back to X-Real-IP, which Caddy writes as one address', async () => {
+  it('prefers X-Real-IP, which Caddy sets to {client_ip}', async () => {
     expect(await read({ 'x-real-ip': '198.51.100.4' })).toBe('198.51.100.4');
+    expect(
+      await read({ 'x-real-ip': ' 198.51.100.4 ', 'x-forwarded-for': '198.51.100.4, 162.158.1.1' })
+    ).toBe('198.51.100.4');
+  });
+
+  it('never reads CF-Connecting-IP itself — only Caddy may, from a Cloudflare peer', async () => {
+    expect(await read({ 'cf-connecting-ip': '192.0.2.99' })).toBe('unknown');
+    expect(await read({ 'cf-connecting-ip': '192.0.2.99', 'x-forwarded-for': '203.0.113.7' })).toBe(
+      '203.0.113.7'
+    );
   });
 
   it('is a single bucket when there is nothing to read', async () => {
@@ -87,6 +103,53 @@ describe('createRateLimit', () => {
     expect((await request({ 'x-forwarded-for': '203.0.113.7' })).status).toBe(200);
     expect((await request({ 'x-forwarded-for': '203.0.113.7' })).status).toBe(429);
     expect((await request({ 'x-forwarded-for': '198.51.100.4' })).status).toBe(200);
+  });
+
+  it('keys a visitor behind Cloudflare on their CF-Connecting-IP', async () => {
+    const read = ipApp();
+    // Visitor A -> Cloudflare edge 162.158.1.1 -> Caddy. Caddy trusts the edge,
+    // takes {client_ip} from CF-Connecting-IP, and appends the edge to XFF.
+    expect(
+      await read({
+        'cf-connecting-ip': '198.51.100.4',
+        'x-real-ip': '198.51.100.4',
+        'x-forwarded-for': '198.51.100.4, 162.158.1.1',
+      })
+    ).toBe('198.51.100.4');
+  });
+
+  /** The launch blocker: one edge used to be one budget for everyone behind it. */
+  it('gives two visitors behind the same Cloudflare edge two budgets', async () => {
+    const request = limited(1);
+    const edge = '162.158.1.1';
+    const via = (visitor: string) => ({
+      'cf-connecting-ip': visitor,
+      'x-real-ip': visitor,
+      'x-forwarded-for': `${visitor}, ${edge}`,
+    });
+
+    expect((await request(via('198.51.100.4'))).status).toBe(200);
+    expect((await request(via('198.51.100.4'))).status).toBe(429);
+    expect((await request(via('203.0.113.7'))).status).toBe(200);
+  });
+
+  /**
+   * Straight to the origin, forging CF-Connecting-IP. Caddy does not trust the
+   * peer, so {client_ip} is the peer and X-Real-IP is overwritten with it: the
+   * forged value never becomes a key. The refusal itself is Caddy's
+   * (trusted_proxies in the Caddyfile); this pins what the app does with it.
+   */
+  it('keys a direct-to-origin request on its peer, not a forged CF-Connecting-IP', async () => {
+    const request = limited(2);
+    const forged = (claim: string) => ({
+      'cf-connecting-ip': claim,
+      'x-real-ip': '203.0.113.7',
+      'x-forwarded-for': '203.0.113.7',
+    });
+
+    expect((await request(forged('spoofed-1'))).status).toBe(200);
+    expect((await request(forged('spoofed-2'))).status).toBe(200);
+    expect((await request(forged('spoofed-3'))).status).toBe(429);
   });
 
   it('gives each scope its own budget', async () => {

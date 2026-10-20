@@ -3,11 +3,36 @@
 
 {
     email admin@clawd.gg
+
+    # clawd.gg is proxied by Cloudflare, so the TCP peer of almost every request
+    # is a Cloudflare edge, shared by everyone that edge serves. Trusting
+    # Cloudflare's ranges, and only those, makes {client_ip} the visitor's
+    # address from CF-Connecting-IP when the peer is Cloudflare, and the peer
+    # itself otherwise: a request straight to the origin cannot name its own
+    # client IP with a forged header, because its peer is not trusted.
+    #
+    # Strict: if X-Forwarded-For is ever the header read, it is read from the
+    # right, skipping trusted hops, so a value the visitor prepended is never it.
+    #
+    # Cloudflare's published ranges as of 2026-10-20, from
+    # https://www.cloudflare.com/ips-v4 and https://www.cloudflare.com/ips-v6.
+    # Recheck them when they change; a missing range makes its visitors share
+    # their edge's budget again, it does not let anyone in.
+    servers {
+        trusted_proxies static 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+        trusted_proxies_strict
+        client_ip_headers CF-Connecting-IP X-Forwarded-For
+    }
 }
 
 clawd.gg {
     # Reverse proxy to the app
-    reverse_proxy app:3000
+    reverse_proxy app:3000 {
+        # The one client address the app trusts (src/lib/rate-limit.ts
+        # clientIp). Set, not appended: whatever X-Real-IP the request carried
+        # is replaced.
+        header_up X-Real-IP {client_ip}
+    }
 
     # Enable compression
     encode gzip zstd
