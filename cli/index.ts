@@ -92,7 +92,7 @@ import {
   type PreviewSplit,
   type PreviewTotals,
 } from "./import-preview";
-import { ImportAbortedError, postImportWithRetry } from "./import-upload";
+import { ImportAbortedError, importBatches, postImportWithRetry } from "./import-upload";
 import { version } from "./version";
 
 // ANSI color codes
@@ -1804,7 +1804,7 @@ async function fetchImportCoverage(
 
 async function postImportBatch(
   token: string,
-  batch: { events: unknown[]; runId: string },
+  batch: { events: unknown[]; openDay: string | null; runId: string },
   // Where a wait for a slot is reported. The default is a dim line; the import
   // passes its progress bar's `status`, so the wait rides on the bar instead of
   // tearing it in half.
@@ -1960,7 +1960,7 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
   const lateFlags = afterCutoff.filter((event) => event.event_name === ULTRATHINK_EVENT_NAME);
   events.push(...lateFlags);
 
-  // Chronological, so one UTC day lands in as few batches as possible: the
+  // Chronological, so importBatches can keep each UTC day in one batch: the
   // server's double-count guard works a whole day at a time.
   events.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
 
@@ -2024,8 +2024,8 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
   // alternative is batch 1 making its own day look "already counted" to batch 2.
   const runId = crypto.randomUUID();
 
-  const batches = Math.ceil(events.length / IMPORT_BATCH_ROWS);
-  const uploading = createProgress({ label: "Uploading", total: batches, unit: "batches" });
+  const batches = importBatches(events, IMPORT_BATCH_ROWS);
+  const uploading = createProgress({ label: "Uploading", total: batches.length, unit: "batches" });
 
   // Ctrl-C mid-upload: stop the request or wait in flight, clear the bar, and
   // say how to pick up again, instead of dying with the bar half drawn.
@@ -2034,9 +2034,13 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
   process.once("SIGINT", onInterrupt);
 
   try {
-    for (let i = 0; i < events.length; i += IMPORT_BATCH_ROWS) {
-      const slice = events.slice(i, i + IMPORT_BATCH_ROWS);
-      const result = await postImportBatch(token, { events: slice, runId }, uploading.status, interrupt.signal);
+    for (const [index, batch] of batches.entries()) {
+      const result = await postImportBatch(
+        token,
+        { events: batch.events, openDay: batch.openDay, runId },
+        uploading.status,
+        interrupt.signal
+      );
 
       totals.inserted += result.inserted;
       totals.rejected += result.rejected;
@@ -2045,7 +2049,7 @@ async function runLocalImport(config: Config, assumeYes: boolean): Promise<boole
       totals.skippedDuplicate += result.skippedDuplicate;
       for (const day of result.skippedDays ?? []) skippedDays.add(day);
 
-      uploading.update(i / IMPORT_BATCH_ROWS + 1);
+      uploading.update(index + 1);
     }
   } catch (error) {
     uploading.finish();

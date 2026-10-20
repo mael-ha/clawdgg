@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
   IMPORT_WAIT_BUDGET_MS,
   ImportAbortedError,
+  importBatches,
   postImportWithRetry,
   retryAfterSeconds,
   sleep,
@@ -169,5 +170,57 @@ describe("sleep", () => {
     const pending = sleep(60_000, controller.signal);
     controller.abort();
     await expect(pending).rejects.toBeInstanceOf(ImportAbortedError);
+  });
+});
+
+describe("importBatches", () => {
+  const rows = (day: string, n: number) =>
+    Array.from({ length: n }, (_, i) => ({ timestamp: `${day} 10:00:${String(i % 60).padStart(2, "0")}.000`, i }));
+  const days = (batch: { events: { timestamp: string }[] }) => [...new Set(batch.events.map((e) => e.timestamp.slice(0, 10)))];
+
+  it("packs whole days up to the cap and never splits one", () => {
+    const all = [...rows("2026-03-01", 3), ...rows("2026-03-02", 4), ...rows("2026-03-03", 2), ...rows("2026-03-04", 5)];
+    const batches = importBatches(all, 8);
+
+    expect(batches.map(days)).toEqual([["2026-03-01", "2026-03-02"], ["2026-03-03", "2026-03-04"]]);
+    expect(batches.map((b) => b.openDay)).toEqual([null, null]);
+    expect(batches.flatMap((b) => b.events)).toEqual(all);
+  });
+
+  it("gives a day over the cap batches of its own, open until its last", () => {
+    const all = [...rows("2026-03-01", 2), ...rows("2026-03-02", 7), ...rows("2026-03-03", 1)];
+    const batches = importBatches(all, 3);
+
+    expect(batches.map((b) => [days(b), b.events.length, b.openDay])).toEqual([
+      [["2026-03-01"], 2, null],
+      [["2026-03-02"], 3, "2026-03-02"],
+      [["2026-03-02"], 3, "2026-03-02"],
+      [["2026-03-02"], 1, null],
+      [["2026-03-03"], 1, null],
+    ]);
+    expect(batches.flatMap((b) => b.events)).toEqual(all);
+  });
+
+  it("treats a day exactly at the cap as whole", () => {
+    const batches = importBatches([...rows("2026-03-01", 3), ...rows("2026-03-02", 3)], 3);
+    expect(batches.map((b) => [days(b), b.openDay])).toEqual([[["2026-03-01"], null], [["2026-03-02"], null]]);
+  });
+
+  it("has no batch for no rows", () => {
+    expect(importBatches([], 5)).toEqual([]);
+  });
+
+  it("no batch ends in a day the next one continues, unless it says so", () => {
+    const all = Array.from({ length: 40 }, (_, d) => rows(`2026-04-${String(d % 28 + 1).padStart(2, "0")}`, (d * 7) % 13 + 1))
+      .flat()
+      .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    const batches = importBatches(all, 10);
+    for (let i = 0; i + 1 < batches.length; i++) {
+      const lastDay = batches[i]!.events.at(-1)!.timestamp.slice(0, 10);
+      const nextDay = batches[i + 1]!.events[0]!.timestamp.slice(0, 10);
+      expect(batches[i]!.openDay).toBe(lastDay === nextDay ? lastDay : null);
+      expect(batches[i]!.events.length).toBeLessThanOrEqual(10);
+    }
+    expect(batches.flatMap((b) => b.events)).toEqual(all);
   });
 });

@@ -131,3 +131,55 @@ export async function postImportWithRetry<T>(deps: UploadDeps): Promise<T> {
     await wait(seconds * 1000, signal);
   }
 }
+
+export interface ImportBatch<T> {
+  events: T[];
+  /**
+   * The UTC day this batch leaves unfinished, because it continues in the next
+   * batch; null when every day in it is whole. The server keeps such a day open
+   * to a later run, so an import that stops between the two can still finish it.
+   */
+  openDay: string | null;
+}
+
+/**
+ * Cut chronological rows into batches of at most `maxRows` that never split a
+ * UTC day — the server's double-count guard skips a day it already holds, so a
+ * day cut in two would lose its second half to a run that stops in between.
+ *
+ * Whole days are packed together up to the cap. A day bigger than the cap gets
+ * batches of its own, each but the last marked with that day as `openDay`.
+ * `rows` must already be sorted by timestamp ('YYYY-MM-DD HH:MM:SS.sss', UTC).
+ */
+export function importBatches<T extends { timestamp: string }>(
+  rows: T[],
+  maxRows: number
+): ImportBatch<T>[] {
+  const batches: ImportBatch<T>[] = [];
+  let current: T[] = [];
+  const flush = () => {
+    if (current.length > 0) batches.push({ events: current, openDay: null });
+    current = [];
+  };
+
+  for (let start = 0; start < rows.length; ) {
+    const day = rows[start]!.timestamp.slice(0, 10);
+    let end = start + 1;
+    while (end < rows.length && rows[end]!.timestamp.slice(0, 10) === day) end++;
+    const size = end - start;
+
+    if (size > maxRows) {
+      flush();
+      for (let i = start; i < end; i += maxRows) {
+        const last = i + maxRows >= end;
+        batches.push({ events: rows.slice(i, Math.min(i + maxRows, end)), openDay: last ? null : day });
+      }
+    } else {
+      if (current.length + size > maxRows) flush();
+      current.push(...rows.slice(start, end));
+    }
+    start = end;
+  }
+  flush();
+  return batches;
+}
