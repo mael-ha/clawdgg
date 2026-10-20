@@ -128,7 +128,7 @@ export async function getVisibility(userId: string, database: AppDb = db): Promi
 
 /**
  * What a visitor does not get to see — the list that is part of every public
- * cache key. One read, so the page, the card, the API and the warmer cannot
+ * cache key. One read, so the page, the card, the API and the refresh job cannot
  * disagree about which list a payload was filtered by.
  */
 export async function hiddenFor(

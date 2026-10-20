@@ -861,8 +861,8 @@ export const CLAUDE_CODE_EVENT_SQL = `startsWith(event_name, 'claude_code.')`;
  *
  * It is a per-(user, day) AGGREGATE expression, not a whole query, because the
  * grouping is the caller's: the profile groups by the user's own local day, the
- * boards by each user's local day via a multiIf offset, and the cross-user
- * rarity comparison by UTC day (one query cannot hold a hundred zones). All
+ * boards by each user's local day too (one SELECT per zone through LOCAL_TS_SQL,
+ * see src/lib/boards.ts), and the cross-user rarity comparison by UTC day. All
  * three read the same expression — see fetchPeerTotals for why the UTC variant
  * differs only for an abuser.
  *
