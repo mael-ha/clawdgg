@@ -13,6 +13,7 @@ import { eq } from 'drizzle-orm';
 import { db } from '../db';
 import { users } from '../db/schema';
 import { requireBearerAuth } from '../lib/auth-middleware';
+import { markImportDays, reopenedImportDays } from '../lib/import-days';
 import {
   listDeviceTokens,
   renameDeviceToken,
@@ -227,6 +228,9 @@ cli.post('/logout', requireBearerAuth, async (c) => {
 //      timestamps outside [2025-02-01, cutoff) are refused.
 //   6. the cutoff is min(users.otel_setup_at, first live event), computed here.
 //   7. a UTC day that already holds rows of ANY provenance is skipped whole.
+//      Except the import's own days: the current run's, and one an earlier run
+//      left half written — those are let through, minus every row already
+//      stored (importForRun, src/lib/import-days.ts).
 //   8. ULTRATHINK FLAGS ANSWER TO A DIFFERENT CUTOFF — see ImportDeps.flagCutoffMs.
 
 export const MAX_IMPORT_BODY_SIZE = 8 * 1024 * 1024; // 8MB
@@ -365,6 +369,19 @@ export interface ImportDeps {
    * never be filled in for anyone's existing history.
    */
   ultrathinkDays: Set<string>;
+  /**
+   * Days let through although they are held — the run's own, and days an
+   * earlier run left half written (src/lib/import-days.ts). Rows on them whose
+   * identity is already stored are dropped, via `storedRowIds`, rather than
+   * inserted a second time.
+   */
+  reopenedDays?: Set<string>;
+  /** The row_ids already stored on these days, events and metrics alike. */
+  storedRowIds?(days: string[]): Promise<Set<string>>;
+  /** Called with every day about to receive rows, before the insert. */
+  beforeInsert?(days: string[]): Promise<void>;
+  /** Called with the same days once the insert has succeeded. */
+  afterInsert?(days: string[]): Promise<void>;
   insertEvents(rows: EventRow[]): Promise<void>;
   insertMetrics(rows: MetricRow[]): Promise<void>;
 }
@@ -649,8 +666,28 @@ export async function runImport(
   const events = dropDuplicates([...eventDays.kept, ...flagDays.kept], eventRowId);
   const metrics = dropDuplicates(metricDays.kept, metricRowId);
 
+  const dayOf = (row: { timestamp: string }) => row.timestamp.slice(0, 10);
+  const days = [...new Set([...events.kept, ...metrics.kept].map(dayOf))].sort();
+
+  // A reopened day may already hold some of these rows: a run that stopped
+  // halfway through it, or this run's own batch sent again.
+  const reopened = days.filter((day) => deps.reopenedDays?.has(day));
+  if (reopened.length > 0 && deps.storedRowIds) {
+    const stored = await deps.storedRowIds(reopened);
+    const isNew = (id: string, row: { timestamp: string }) =>
+      !(stored.has(id) && deps.reopenedDays!.has(dayOf(row)));
+    const keptEvents = events.kept.filter((row) => isNew(eventRowId(row), row));
+    const keptMetrics = metrics.kept.filter((row) => isNew(metricRowId(row), row));
+    events.skipped += events.kept.length - keptEvents.length;
+    metrics.skipped += metrics.kept.length - keptMetrics.length;
+    events.kept = keptEvents;
+    metrics.kept = keptMetrics;
+  }
+
+  if (days.length > 0) await deps.beforeInsert?.(days);
   if (events.kept.length > 0) await deps.insertEvents(events.kept);
   if (metrics.kept.length > 0) await deps.insertMetrics(metrics.kept);
+  if (days.length > 0) await deps.afterInsert?.(days);
 
   return {
     accepted: sanitized.events.length + sanitized.metrics.length,
@@ -799,10 +836,10 @@ async function fetchUltrathinkDays(userId: string): Promise<Set<string>> {
 /**
  * The covered-day set, cached for the life of one `clawdgg import` run.
  *
- * It has to be: a full history is more rows than one request carries, and the
- * FIRST batch inserts rows that would make its own day "covered" for the
- * second. The run id makes the snapshot stable across the batches of one run,
- * while a later run recomputes it and so inserts nothing.
+ * A CACHE, and nothing more: it saves the two full scans per batch. What lets a
+ * run's later batches onto the days its earlier ones wrote is the import_days
+ * table (see importForRun), so an entry that expired after 30 minutes or was
+ * lost to a restart costs one recomputation, never a day.
  */
 const IMPORT_RUN_TTL_MS = 30 * 60 * 1000;
 const RUN_ID_RE = /^[0-9a-zA-Z-]{1,64}$/;
@@ -839,6 +876,84 @@ async function coveredDaysForRun(userId: string, runId: unknown): Promise<RunCov
   const coverage = await fetchRunCoverage(userId);
   importRuns.set(key, { coverage, expiresAt: now + IMPORT_RUN_TTL_MS });
   return coverage;
+}
+
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** The row_ids this user already has stored on these UTC days, in both raw tables. */
+async function fetchStoredRowIds(userId: string, days: string[]): Promise<Set<string>> {
+  const params: Record<string, string> = { userId };
+  const list = days
+    .filter((day) => DAY_RE.test(day))
+    .map((day, index) => {
+      params[`d${index}`] = day;
+      return `{d${index}:Date}`;
+    });
+  const ids = new Set<string>();
+  if (list.length === 0) return ids;
+
+  for (const table of ['events_raw', 'metrics_raw'] as const) {
+    const rows = await query<{ row_id: string }>(
+      `SELECT row_id FROM ${table}
+       WHERE user_id = {userId:String} AND toDate(timestamp) IN (${list.join(', ')})`,
+      params
+    );
+    for (const row of rows) ids.add(row.row_id);
+  }
+  return ids;
+}
+
+export interface RunDeps {
+  cutoffMs: number;
+  flagCutoffMs: number;
+  /** The covered days as of this run's first batch, or as of now. */
+  coverage: RunCoverage;
+  storedRowIds(days: string[]): Promise<Set<string>>;
+  insertEvents(rows: EventRow[]): Promise<void>;
+  insertMetrics(rows: MetricRow[]): Promise<void>;
+  database?: typeof db;
+}
+
+/**
+ * One batch of one run: rule 7, with the run's own days and any day an earlier
+ * run left open let through (src/lib/import-days.ts).
+ *
+ * `coverage` may be the snapshot from the run's first batch or a fresh one —
+ * after a restart, or a run longer than the cache — and the answer is the same
+ * either way: a fresh one also holds the days this run wrote, and those are
+ * exactly the days import_days gives back to it.
+ */
+export async function importForRun(
+  userId: string,
+  body: unknown,
+  deps: RunDeps
+): Promise<ImportResult> {
+  const payload = (body ?? {}) as { runId?: unknown; openDay?: unknown };
+  const runId = typeof payload.runId === 'string' && RUN_ID_RE.test(payload.runId) ? payload.runId : null;
+  const openDay = typeof payload.openDay === 'string' && DAY_RE.test(payload.openDay) ? payload.openDay : null;
+  const database = deps.database ?? db;
+
+  const reopened = await reopenedImportDays(userId, runId, database);
+  const without = (days: Set<string>) => new Set([...days].filter((day) => !reopened.has(day)));
+
+  return runImport(userId, body, {
+    cutoffMs: deps.cutoffMs,
+    flagCutoffMs: deps.flagCutoffMs,
+    coveredDays: without(deps.coverage.days),
+    ultrathinkDays: without(deps.coverage.ultrathinkDays),
+    reopenedDays: reopened,
+    storedRowIds: deps.storedRowIds,
+    // With no run id there is no run to own a day, so nothing is recorded: the
+    // batch is judged as it always was.
+    beforeInsert: runId
+      ? (days) => markImportDays(userId, runId, days, () => true, database)
+      : undefined,
+    afterInsert: runId
+      ? (days) => markImportDays(userId, runId, days, (day) => day === openDay, database)
+      : undefined,
+    insertEvents: deps.insertEvents,
+    insertMetrics: deps.insertMetrics,
+  });
 }
 
 /**
@@ -1083,11 +1198,11 @@ cli.post(
           coveredDaysForRun(user.id, payload.runId),
         ]);
 
-        const result = await runImport(user.id, body, {
+        const result = await importForRun(user.id, body, {
           cutoffMs,
           flagCutoffMs,
-          coveredDays: coverage.days,
-          ultrathinkDays: coverage.ultrathinkDays,
+          coverage,
+          storedRowIds: (days) => fetchStoredRowIds(user.id, days),
           insertEvents,
           insertMetrics,
         });

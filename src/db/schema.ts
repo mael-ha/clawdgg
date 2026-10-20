@@ -262,6 +262,30 @@ export const profileSettings = sqliteTable('profile_settings', {
     .default(sql`(unixepoch())`),
 });
 
+// One row per user per UTC day that `clawdgg import` has written: which run
+// wrote it last, and whether that run left it unfinished.
+//
+// The import skips a day the server already holds rows for, so it has to know
+// which of those rows are the CURRENT run's own — a day the run is still in the
+// middle of — and which day an interrupted run left half written, so a later
+// run can finish it rather than skip it. That used to live in a 30-minute map
+// in memory, which a restart or a long run lost; here it survives both. See
+// src/lib/import-days.ts.
+export const importDays = sqliteTable('import_days', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  userId: text('user_id')
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  day: text('day').notNull(), // YYYY-MM-DD, UTC
+  runId: text('run_id').notNull(),
+  open: integer('open', { mode: 'boolean' }).notNull(),
+  updatedAt: integer('updated_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, (table) => ({
+  userDayIdx: uniqueIndex('import_days_user_day_idx').on(table.userId, table.day),
+}));
+
 // Export types
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
@@ -277,3 +301,4 @@ export type RankSnapshot = typeof rankSnapshots.$inferSelect;
 export type NewRankSnapshot = typeof rankSnapshots.$inferInsert;
 export type ProfileSettings = typeof profileSettings.$inferSelect;
 export type NewProfileSettings = typeof profileSettings.$inferInsert;
+export type ImportDay = typeof importDays.$inferSelect;
