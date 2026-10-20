@@ -779,5 +779,13 @@ suite('every ClickHouse read resolves against 24.3', () => {
     it('getLongestSessionMessages', async () => {
       expect(await sync.getLongestSessionMessages(USER_A)).toBeGreaterThan(0);
     });
+
+    it('fetchSyncWatermarks', async () => {
+      const marks = await sync.fetchSyncWatermarks();
+      // Seven events and fifteen metrics a day, on five days.
+      expect(marks.get(USER_A)).toMatch(/^e=35:\d{4}-\d\d-\d\d [\d:.]+\|m=90:\d{4}-/);
+      expect(marks.has(USER_B)).toBe(true);
+      expect(await sync.fetchSyncWatermarks()).toEqual(marks);
+    });
   });
 });

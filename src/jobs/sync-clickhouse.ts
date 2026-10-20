@@ -40,6 +40,69 @@ import { eq } from 'drizzle-orm';
 let isSyncing = false;
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Change Watermarks
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * WHY A WATERMARK. Recomputing every user's totals every five minutes re-read
+ * each whole history (1.2–1.9M rows for the heaviest) whether or not anything
+ * had arrived — with nobody visiting, this job and the profile warmer were
+ * ~600 s of ClickHouse time an hour, and visitors queued behind them. Most
+ * users send nothing in most five-minute windows, so most of that work
+ * recomputed the number already stored.
+ *
+ * So each pass first asks ClickHouse, in two cheap GROUP BY user_id scans,
+ * what each user's rows look like right now, and skips a user whose answer
+ * matches the one their last successful sync saw.
+ *
+ * `count()` AND `max(timestamp)`, not the latest timestamp alone: an import
+ * lands history with OLD timestamps, which moves the count but not the max, and
+ * a reset deletes rows, which can move either. The scan reads those two
+ * columns and nothing else — tens of MB for the whole table. No FINAL — a
+ * background merge collapsing a duplicate moves the count too, which costs one
+ * extra recompute and is never wrong in the other direction.
+ *
+ * The rest of the key is what the stored figures depend on that ClickHouse
+ * does not: the user's zone and today's date in it (the streak decays at their
+ * midnight with no new row), and their OG rank (the badges read it).
+ *
+ * In memory, deliberately: after a restart the first pass recomputes everyone,
+ * once, which is exactly what this job always did.
+ */
+const lastSyncedKey = new Map<string, string>();
+
+/** Per-user `count:max(timestamp)` over both raw tables. */
+export async function fetchSyncWatermarks(): Promise<Map<string, string>> {
+  const watermarkSql = (table: string) => `
+    SELECT user_id, toString(count()) AS n, toString(max(timestamp)) AS ts
+    FROM ${table}
+    GROUP BY user_id
+  `;
+  const [events, metrics] = await Promise.all([
+    query<{ user_id: string; n: string; ts: string }>(watermarkSql('events_raw')),
+    query<{ user_id: string; n: string; ts: string }>(watermarkSql('metrics_raw')),
+  ]);
+
+  const eventMarks = new Map(events.map((row) => [row.user_id, `${row.n}:${row.ts}`]));
+  const metricMarks = new Map(metrics.map((row) => [row.user_id, `${row.n}:${row.ts}`]));
+  const marks = new Map<string, string>();
+  for (const userId of new Set([...eventMarks.keys(), ...metricMarks.keys()])) {
+    marks.set(userId, `e=${eventMarks.get(userId) ?? '-'}|m=${metricMarks.get(userId) ?? '-'}`);
+  }
+  return marks;
+}
+
+/** Everything a user's stored figures depend on. Exported for the test. */
+export function syncKey(watermark: string, timezone: string, today: string, rank: number): string {
+  return `${watermark}|tz=${timezone}|today=${today}|rank=${rank}`;
+}
+
+/** Exported for the tests, which run passes back to back. */
+export function resetSyncWatermarks(): void {
+  lastSyncedKey.clear();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Streak Calculation
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -211,11 +274,20 @@ export async function getLongestSessionMessages(userId: string): Promise<number>
  * Sync all OTel-enabled users from ClickHouse to SQLite
  * This populates the users.total_* columns that the leaderboard queries
  */
-export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors: number }> {
+export interface SyncResult {
+  synced: number;
+  errors: number;
+  /** Users whose rows had not changed since their last successful sync. */
+  unchanged: number;
+}
+
+export async function syncClickHouseToSqlite(
+  options: { force?: boolean } = {}
+): Promise<SyncResult> {
   // Check if a sync is already running
   if (isSyncing) {
     console.log('[sync] Previous sync still running, skipping this run');
-    return { synced: 0, errors: 0 };
+    return { synced: 0, errors: 0, unchanged: 0 };
   }
 
   isSyncing = true;
@@ -226,6 +298,18 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
 
     let synced = 0;
     let errors = 0;
+    let unchanged = 0;
+
+    // A failed watermark read is not a reason to skip the pass: without one,
+    // every user is recomputed, which is what this job did before it had any.
+    let watermarks: Map<string, string> | null = null;
+    if (!options.force) {
+      try {
+        watermarks = await fetchSyncWatermarks();
+      } catch (error) {
+        console.error('[sync] Watermark read failed; syncing every user:', error);
+      }
+    }
 
     // Every user, not only the OTel-enabled ones: imported pre-OTEL history
     // lives in ClickHouse now, and a user who never ran `clawdgg setup` would
@@ -257,6 +341,22 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         currentFirstSessionDate,
         timezone,
       } = user;
+
+      // Get user rank from pre-calculated lookup
+      const userRank = rankLookup.get(userId) ?? allUsers.length;
+
+      let key: string | null = null;
+      if (watermarks) {
+        const watermark = watermarks.get(userId);
+        // No row in either table: getUserTotals would answer nothing and the
+        // loop below would `continue` — the same outcome, without the read.
+        if (watermark === undefined) continue;
+        key = syncKey(watermark, timezone, localDate(new Date(), timezone), userRank);
+        if (lastSyncedKey.get(userId) === key) {
+          unchanged++;
+          continue;
+        }
+      }
 
       try {
         // Get totals from ClickHouse — the only source there is.
@@ -309,9 +409,6 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         const finalFirstSessionDate =
           currentFirstSessionDate || (activeDates.length > 0 ? [...activeDates].sort()[0] : undefined);
 
-        // Get user rank from pre-calculated lookup
-        const userRank = rankLookup.get(userId) ?? allUsers.length;
-
       // Totals are ClickHouse's answer, rounded. Nothing is added on top.
       const totalPrompts = Math.round(userTotals.total_prompts);
       const totalTokens = Math.round(userTotals.total_tokens);
@@ -360,6 +457,7 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
         })
         .where(eq(users.id, userId));
 
+        if (key) lastSyncedKey.set(userId, key);
         synced++;
         console.log(
           `[sync] Updated user ${userId}: ${totalPrompts} prompts, $${(totalCostCents / 100).toFixed(2)}`
@@ -398,10 +496,10 @@ export async function syncClickHouseToSqlite(): Promise<{ synced: number; errors
 
     const duration = Date.now() - startTime;
     console.log(
-      `[sync] Sync complete: ${synced} users synced, ${errors} errors, ${duration}ms`
+      `[sync] Sync complete: ${synced} users synced, ${unchanged} unchanged, ${errors} errors, ${duration}ms`
     );
 
-    return { synced, errors };
+    return { synced, errors, unchanged };
   } finally {
     isSyncing = false;
   }
@@ -448,8 +546,9 @@ export function stopSyncJob(): void {
 }
 
 /**
- * Manual trigger for sync (useful for API endpoint)
+ * Manual trigger for sync (useful for API endpoint). Recomputes every user:
+ * someone asking by hand wants the figures rebuilt, not a watermark compared.
  */
-export async function triggerSync(): Promise<{ synced: number; errors: number }> {
-  return syncClickHouseToSqlite();
+export async function triggerSync(): Promise<SyncResult> {
+  return syncClickHouseToSqlite({ force: true });
 }

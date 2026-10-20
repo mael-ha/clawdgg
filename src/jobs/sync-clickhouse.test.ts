@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { calculateStreaks } from './sync-clickhouse';
+import { calculateStreaks, syncKey } from './sync-clickhouse';
 import { localDate } from '../lib/timezone';
 
 /** What the broken version used: the UTC calendar day of the instant. */
@@ -114,5 +114,24 @@ describe('calculateStreaks · a non-UTC user', () => {
     expect(
       calculateStreaks(['2028-02-28', '2028-02-29', '2028-03-01'], '2028-03-01')
     ).toEqual({ currentStreak: 3, longestStreak: 3 });
+  });
+});
+
+describe('syncKey · what makes an unchanged user worth recomputing', () => {
+  const base = syncKey('e=10:2026-10-20 10:00:00.000|m=5:2026-10-20 10:00:00.000', 'Europe/Paris', '2026-10-20', 3);
+
+  it('is stable for the same inputs', () => {
+    expect(syncKey('e=10:2026-10-20 10:00:00.000|m=5:2026-10-20 10:00:00.000', 'Europe/Paris', '2026-10-20', 3)).toBe(base);
+  });
+
+  it('moves with a new row, an old-timestamped import, a new day, a new zone and a new rank', () => {
+    const variants = [
+      syncKey('e=11:2026-10-20 10:05:00.000|m=5:2026-10-20 10:00:00.000', 'Europe/Paris', '2026-10-20', 3),
+      syncKey('e=12:2026-10-20 10:00:00.000|m=5:2026-10-20 10:00:00.000', 'Europe/Paris', '2026-10-20', 3),
+      syncKey('e=10:2026-10-20 10:00:00.000|m=5:2026-10-20 10:00:00.000', 'Europe/Paris', '2026-10-21', 3),
+      syncKey('e=10:2026-10-20 10:00:00.000|m=5:2026-10-20 10:00:00.000', 'Asia/Tokyo', '2026-10-20', 3),
+      syncKey('e=10:2026-10-20 10:00:00.000|m=5:2026-10-20 10:00:00.000', 'Europe/Paris', '2026-10-20', 2),
+    ];
+    for (const variant of variants) expect(variant).not.toBe(base);
   });
 });

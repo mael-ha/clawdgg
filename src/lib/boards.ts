@@ -899,6 +899,9 @@ export function boardSnapshotSentinel(): string {
   return boardMetricName(board, BOARDS[board].defaultScope);
 }
 
+/** The UTC day each database last had its board figures scanned for. */
+const boardSnapshotAttempted = new WeakMap<AppDb, string>();
+
 /**
  * Write today's ranks for all five boards, both scopes, unless today is already
  * on record.
@@ -918,6 +921,7 @@ export async function snapshotBoardRanks(
   database: AppDb = db
 ): Promise<number> {
   const day = utcDay(now);
+  if (boardSnapshotAttempted.get(database) === day) return 0;
   const sentinel = boardSnapshotSentinel();
 
   const existing = await database
@@ -935,6 +939,11 @@ export async function snapshotBoardRanks(
     fetchFigures('week', boardUsers, now),
     fetchFigures('all', boardUsers, now),
   ]);
+  // Once the figures are in hand, today counts as done whatever gets written.
+  // The sentinel is one board's default scope, so a day on which that board
+  // ranks nobody writes no sentinel, and without this the sync job would pay
+  // for both full-table figure scans again every five minutes until midnight.
+  boardSnapshotAttempted.set(database, day);
 
   const values: { userId: string; day: string; metric: string; rank: number; value: number }[] = [];
   for (const board of BOARD_KEYS) {
