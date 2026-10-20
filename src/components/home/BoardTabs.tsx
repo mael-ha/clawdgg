@@ -1,8 +1,8 @@
 import type { FC } from 'hono/jsx';
-import { BOARDS, BOARD_KEYS, SCOPE_LABELS, type BoardKey, type BoardScope } from '../../lib/boards';
+import { BOARDS, BOARD_KEYS, SCOPE_LABELS, tabScope, type BoardKey, type BoardScope } from '../../lib/boards';
 
 /**
- * Which board, and over what — as two GET forms.
+ * Which board, and over what — as GET forms: one per board tab, one for the scope.
  *
  * NO JAVASCRIPT. The selection lives in the URL (`/?board=streak&scope=all`),
  * which makes every board a link someone can send; and because the controls are
@@ -33,40 +33,38 @@ interface BoardTabsProps {
 
 export const BoardTabs: FC<BoardTabsProps> = ({ board, scope, resetIn }) => (
   <div class="flex flex-wrap items-center justify-between gap-3.5">
-    <form
-      method="get"
-      action="/"
-      role="tablist"
-      aria-label="Boards"
-      class="flex flex-wrap gap-1.5"
-    >
-      <input type="hidden" name="scope" value={scope} />
+    {/* One form PER TAB, so each carries the scope that is valid for ITS
+        board (tabScope) — a single shared hidden input sent the 🔥 board's
+        `current` to the four boards that have no such scope. */}
+    <div role="tablist" aria-label="Boards" class="flex flex-wrap gap-1.5">
       {BOARD_KEYS.map((key) => {
         const active = key === board;
         return (
-          <button
-            key={key}
-            type="submit"
-            name="board"
-            value={key}
-            role="tab"
-            aria-selected={active ? 'true' : 'false'}
-            aria-controls={BOARD_PANEL_ID}
-            class={`${TAB_BASE} ${active ? TAB_ON : TAB_OFF}`}
-          >
-            {key === 'ultrathinks' ? (
-              <span class={`font-extrabold ${RAINBOW}`}>
-                {BOARDS[key].emoji} {BOARDS[key].label}
-              </span>
-            ) : (
-              <>
-                {BOARDS[key].emoji} {BOARDS[key].label}
-              </>
-            )}
-          </button>
+          <form key={key} method="get" action="/" class="contents">
+            <input type="hidden" name="scope" value={tabScope(key, scope)} />
+            <button
+              type="submit"
+              name="board"
+              value={key}
+              role="tab"
+              aria-selected={active ? 'true' : 'false'}
+              aria-controls={BOARD_PANEL_ID}
+              class={`${TAB_BASE} ${active ? TAB_ON : TAB_OFF}`}
+            >
+              {key === 'ultrathinks' ? (
+                <span class={`font-extrabold ${RAINBOW}`}>
+                  {BOARDS[key].emoji} {BOARDS[key].label}
+                </span>
+              ) : (
+                <>
+                  {BOARDS[key].emoji} {BOARDS[key].label}
+                </>
+              )}
+            </button>
+          </form>
         );
       })}
-    </form>
+    </div>
 
     <div class="flex flex-wrap items-center gap-3 font-mono text-xs text-[#8a91a0]">
       {/* The pair differs per board: 💎 🌈 ⚡ switch between windows of time,

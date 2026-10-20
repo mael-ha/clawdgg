@@ -200,6 +200,20 @@ export function parseScope(raw: string | undefined, board: BoardKey = BOARD_KEYS
   return scopes.includes(raw as BoardScope) ? (raw as BoardScope) : defaultScope;
 }
 
+/**
+ * The scope a link to `target` should carry from a page on `current`: the same
+ * one when the target board has it, else the target's own default.
+ *
+ * A tab must never send a scope its board does not have. The server would
+ * normalise it (parseScope), but the URL would not be — `/?scope=current&
+ * board=value` is a page that says one thing and links another — and the
+ * shared tab form used to send exactly that from the 🔥 board to all four
+ * others.
+ */
+export function tabScope(target: BoardKey, current: BoardScope): BoardScope {
+  return parseScope(current, target);
+}
+
 /** True when the scope is a time window over ClickHouse rows, not a lifetime figure. */
 function isWeekWindow(scope: BoardScope): boolean {
   return scope === 'week';
@@ -1128,58 +1142,110 @@ export function clampBoardOffset(raw: number, total: number): number {
 }
 
 /**
- * The ranking, which is the whole cost of a board, cached per BOARD AND SCOPE.
+ * The FIGURES, which are the whole cost of a board, cached per WINDOW — not per
+ * board, and not per scope.
  *
- * Ten keys in total — five boards, two scopes each — and not one per page,
- * which is what the cache used to hold. Pagination is a SLICE of this, so a
- * request for page 400 of a board nobody has 400 pages of now costs a slice of
- * a list that is already in memory instead of the fan-out that built it.
+ * One fetchFigures pass computes every board's figure for every user over one
+ * window (two full scans: 1.7M events and 2M metrics rows for 'all', measured
+ * at 1.4 s and 1.5 s on prod). The cache used to be per (board, scope), so
+ * switching from 💎 to ⚡ on the same "all time" ran both scans again for the
+ * figures that had just been computed. There are only two windows — the
+ * current UTC week and all time (which the 🔥 board's two lifetime scopes read
+ * too) — so every tab in a window is a hit once one of them has been opened.
+ *
+ * STALE-WHILE-REVALIDATE. Fresh for 60 s — the board's freshness target. After
+ * that the last figures are still served while one rebuild runs behind them,
+ * so a visitor only ever waits on a scan when there is nothing at all to show:
+ * the first view after a restart, and the first view of a new week. Refreshed
+ * by traffic rather than by a timer, deliberately: a timer would put two full
+ * scans a minute back onto an idle server, which is the load this exists to
+ * remove. The stale window bounds how old a page can be for the first visitor
+ * after a long quiet spell; the one after them sees the rebuild.
+ *
+ * What the figures cannot carry is anything SQLite owns: the user list, their
+ * visibility and their 🔥 streaks are read fresh for every ranking (one SQLite
+ * query) and laid over the cached figures, so a section somebody just hid is
+ * not ranked on for another minute and a streak is the synced one.
  */
+type FigureWindow = 'week' | 'all';
+
+const FIGURES_TTL_MS = 60_000;
+const FIGURES_STALE_MS = 6 * 60 * 60_000;
+
+const figuresCache = new TtlCache<Map<string, BoardFigures>>(FIGURES_TTL_MS, 4, {
+  staleMs: FIGURES_STALE_MS,
+  name: 'board-figures',
+});
+
+function figureWindow(scope: BoardScope): FigureWindow {
+  return isWeekWindow(scope) ? 'week' : 'all';
+}
+
+/**
+ * The week's key names its Monday, so the first request of a new week cannot be
+ * served last week's figures as "stale" — it is a different key, and it waits.
+ */
+function figuresKey(window: FigureWindow, now: Date): string {
+  return window === 'week' ? `week|${utcDay(weekStartUtc(now))}` : 'all';
+}
+
+async function getFigures(
+  scope: BoardScope,
+  boardUsers: BoardUser[],
+  now: Date
+): Promise<Map<string, BoardFigures>> {
+  const window = figureWindow(scope);
+  return figuresCache.remember(figuresKey(window, now), () =>
+    fetchFigures(window, boardUsers, now)
+  );
+}
+
+/**
+ * Class and clock evidence for EVERY listed user, cached as one set.
+ *
+ * It does not depend on the board or the scope — it is each user's current
+ * local month — so a per-page fetch was two ClickHouse queries on every tab
+ * switch for the same 25 people read a different way. Built for the whole list
+ * at once instead, in the same two queries, under the same SWR policy as the
+ * figures.
+ */
+const evidenceCache = new TtlCache<Map<string, ClassEvidence>>(FIGURES_TTL_MS, 2, {
+  staleMs: FIGURES_STALE_MS,
+  name: 'board-evidence',
+});
+
+function getClassEvidence(boardUsers: BoardUser[], now: Date): Promise<Map<string, ClassEvidence>> {
+  return evidenceCache.remember('all', () => fetchClassEvidence(boardUsers, now));
+}
+
+/** A board's ranking. Cheap now: SQLite plus the cached figures. */
 interface BoardRanking {
   ranked: RankedEntry[];
   usersById: Map<string, BoardUser>;
   figures: Map<string, BoardFigures>;
   weekStart: string;
-  /** False when a figures query failed — never cached, see getRanking. */
+  /** False when the figures were unavailable — see buildRanking. */
   complete: boolean;
 }
 
-// 60s: long enough that a burst of homepage loads costs one query fan-out,
-// short enough that a board feels live. Errors are never cached (see `complete`).
-const rankingCache = new TtlCache<BoardRanking>(60_000, 16);
 /**
  * The DECORATED page — the ranking's slice plus each row's clock, class and
- * arrow. Still per (board, scope, limit, offset), because the decoration is
- * per page, but a miss here is now two queries for 25 users rather than the
- * whole board: the expensive part is in rankingCache above.
+ * arrow. Per (board, scope, limit, offset), because the slice is per page; a
+ * miss is SQLite only (the arrows), everything from ClickHouse being cached
+ * above.
  */
 const boardCache = new TtlCache<BoardPage>(60_000, 200);
-const pulseCache = new TtlCache<GlobalPulse>(60_000, 8);
+const pulseCache = new TtlCache<GlobalPulse>(FIGURES_TTL_MS, 8, {
+  staleMs: FIGURES_STALE_MS,
+  name: 'board-pulse',
+});
 
 /** Drop every board cache. For tests, which compare one build with another. */
 export function clearBoardCaches(): void {
-  rankingCache.clear();
+  figuresCache.clear();
+  evidenceCache.clear();
   boardCache.clear();
   pulseCache.clear();
-}
-
-async function getRanking(
-  board: BoardKey,
-  scope: BoardScope,
-  now: Date
-): Promise<BoardRanking> {
-  // The UTC DAY is in the key as well as the board and the scope. Two reasons:
-  // the weekly scope's window is a function of `now`, so a request either side
-  // of Monday 00:00 UTC must not be served a ranking built for the week that
-  // ended (the 60-second TTL alone would serve it for a minute into the new
-  // week, with the old week's figures and the old `weekStart`); and a caller
-  // that passes an explicit `now` — a test — gets its own key rather than
-  // whatever the last call left behind.
-  return rankingCache.remember(
-    `${board}|${scope}|${utcDay(now)}`,
-    () => buildRanking(board, scope, now),
-    (built) => built.complete
-  );
 }
 
 async function buildRanking(
@@ -1193,13 +1259,24 @@ async function buildRanking(
   // read from SQLite and stays correct, and the other four come out empty
   // rather than wrong. `complete` goes false either way, so the page says so
   // and nothing is cached.
-  let figures = new Map<string, BoardFigures>();
+  let cached = new Map<string, BoardFigures>();
   let complete = true;
   try {
-    figures = await fetchFigures(scope, boardUsers, now);
+    cached = await getFigures(scope, boardUsers, now);
   } catch (error) {
     console.error('[boards] figures unavailable:', error);
     complete = false;
+  }
+
+  // SQLite's half, fresh: the streaks are the synced ones, and a user the
+  // cached figures predate gets empty figures rather than none.
+  const figures = new Map<string, BoardFigures>();
+  for (const user of boardUsers) {
+    figures.set(user.userId, {
+      ...(cached.get(user.userId) ?? emptyFigures(user)),
+      streak: user.streak,
+      longestStreak: user.longestStreak,
+    });
   }
 
   return {
@@ -1216,9 +1293,9 @@ export async function getBoardPage(options: BoardQuery): Promise<BoardPage> {
   const now = options.now ?? new Date();
   const limit = clampBoardLimit(options.limit);
 
-  // The ranking first, because it is what the offset is bounded by — and it is
-  // the cached part, so asking for it costs nothing the next caller repeats.
-  const ranking = await getRanking(board, scope, now);
+  // The ranking first, because it is what the offset is bounded by. It is one
+  // SQLite read over the cached figures, so building it per request is cheap.
+  const ranking = await buildRanking(board, scope, now);
   const offset = clampBoardOffset(options.offset, ranking.ranked.length);
 
   const page = await boardCache.remember(
@@ -1255,14 +1332,11 @@ async function decorateBoardPage(
   };
 
   const slice = ranked.slice(offset, offset + limit);
-  const pageUsers = slice
-    .map((entry) => usersById.get(entry.userId))
-    .filter((user): user is BoardUser => !!user);
 
   let complete = ranking.complete;
   let evidence = new Map<string, ClassEvidence>();
   try {
-    evidence = await fetchClassEvidence(pageUsers, now);
+    evidence = await getClassEvidence([...usersById.values()], now);
   } catch (error) {
     // The class and the clock are the decoration on a row, not its figure: a
     // board with the numbers and no clocks is worth serving, but it is not
@@ -1302,8 +1376,10 @@ async function decorateBoardPage(
  * not that. Nothing here can be attributed back to one person.
  */
 export async function getGlobalPulse(now: Date = new Date()): Promise<GlobalPulse> {
+  // Keyed by the week the strip sums, like the figures: a new week is a new
+  // key, so it is never served the last one's totals as stale.
   return pulseCache.remember(
-    utcDay(now),
+    utcDay(weekStartUtc(now)),
     () => buildGlobalPulse(now),
     (pulse) => pulse.complete
   );

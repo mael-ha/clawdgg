@@ -713,6 +713,49 @@ suite('every ClickHouse read resolves against 24.3', () => {
       }
     }, 120_000);
 
+    /**
+     * The figures are cached per WINDOW, so once one tab of a window is built
+     * every other board in it is served without asking ClickHouse anything —
+     * not the figures, not the class evidence, not the pulse.
+     */
+    it('switches boards within a scope with no ClickHouse query at all', async () => {
+      const original = globalThis.fetch;
+      let calls = 0;
+      globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+        if (url.startsWith(TEST_URL!)) calls++;
+        return original(input, init);
+      }) as typeof fetch;
+      try {
+        boards.clearBoardCaches();
+        const page = (board: import('../lib/boards').BoardKey, scope: import('../lib/boards').BoardScope) =>
+          boards.getBoardPage({ board, scope, limit: 25, offset: 0, viewerId: null });
+
+        await page('leverage', 'all');
+        await boards.getGlobalPulse();
+        expect(calls).toBeGreaterThan(0);
+
+        calls = 0;
+        await page('value', 'all');
+        await page('tokens', 'all');
+        await page('ultrathinks', 'all');
+        // 🔥's two scopes are lifetime figures: the same 'all' window.
+        await page('streak', 'current');
+        await page('streak', 'best');
+        await boards.getGlobalPulse();
+        expect(calls).toBe(0);
+
+        await page('leverage', 'week');
+        calls = 0;
+        await page('value', 'week');
+        await page('tokens', 'week');
+        await page('ultrathinks', 'week');
+        expect(calls).toBe(0);
+      } finally {
+        globalThis.fetch = original;
+      }
+    }, 60_000);
+
     it('getGlobalPulse', async () => {
       const pulse = await boards.getGlobalPulse();
       expect(typeof pulse.devs).toBe('number');

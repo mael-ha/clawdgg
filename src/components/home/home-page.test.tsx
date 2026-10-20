@@ -182,3 +182,31 @@ describe('the tabs', () => {
     expect(html).toContain('🪙 tokens');
   });
 });
+
+describe('board tabs carry only a scope their board has', () => {
+  /** Each tab's form, as (board, scope) pairs, in tab order. */
+  function tabTargets(html: string): [string, string][] {
+    const forms = html.match(/<form[^>]*class="contents"[^>]*>[\s\S]*?<\/form>/g) ?? [];
+    return forms.map((form) => [
+      /name="board" value="([a-z]+)"/.exec(form)?.[1] ?? '',
+      /name="scope" value="([a-z]+)"/.exec(form)?.[1] ?? '',
+    ]);
+  }
+
+  it('sends the 🔥 board’s `current` to none of the others', () => {
+    const html = render(<HomePage view={view({ board: 'streak', scope: 'current' })} />);
+    const targets = tabTargets(html);
+    expect(targets.map(([board]) => board)).toEqual([...BOARD_KEYS]);
+    for (const [board, scope] of targets) {
+      expect(BOARDS[board as BoardKey].scopes).toContain(scope as never);
+      expect(scope).toBe(board === 'streak' ? 'current' : BOARDS[board as BoardKey].defaultScope);
+    }
+  });
+
+  it('keeps a scope the target board has', () => {
+    const html = render(<HomePage view={view({ board: 'value', scope: 'all' })} />);
+    for (const [board, scope] of tabTargets(html)) {
+      expect(scope).toBe(board === 'streak' ? BOARDS.streak.defaultScope : 'all');
+    }
+  });
+});
