@@ -1,6 +1,6 @@
 {
   "name": "clawdgg",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Track your Claude Code usage — leaderboard, stats, and real-time counting",
   "type": "module",
   "bin": {
