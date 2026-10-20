@@ -127,8 +127,14 @@ fi
 
 say "the live compose file and Caddyfile → $HOST:$REMOTE_DIR/   (itemized)"
 echo "    a line below means the server's copy differs from this repo's."
+# Only the Caddyfile is written --inplace: Caddy's container bind-mounts that
+# one file, and rsync's usual write-a-temp-then-rename leaves the container on
+# the old inode, so a `caddy reload` would reload the stale config. The compose
+# file is read fresh from the host by every compose command, so a rename is fine.
 rsync "${RSYNC_FLAGS[@]}" --itemize-changes \
   "$COMPOSE_FILE" \
+  "$HOST:$REMOTE_DIR/"
+rsync "${RSYNC_FLAGS[@]}" --itemize-changes --inplace \
   Caddyfile \
   "$HOST:$REMOTE_DIR/"
 
@@ -149,6 +155,9 @@ $(printf '\033[1;32m✓\033[0m') Image built on $HOST. NOTHING IS LIVE YET.
 
   Roll it out when you're ready:
     ssh $HOST 'cd $REMOTE_DIR && docker compose -f $COMPOSE_FILE up -d --no-deps app'
+
+  If the Caddyfile changed (a line under it above), load it — no restart:
+    ssh $HOST 'docker exec clawdgg-caddy-1 caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile'
 
   Then check it:
     curl -fsS https://clawd.gg/health
